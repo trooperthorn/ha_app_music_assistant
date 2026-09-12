@@ -62,3 +62,15 @@ def test_merge_config_keeps_own_keys_and_follows_upstream() -> None:
 def test_changelog_entry_lists_every_change() -> None:
     entry = sync.changelog_entry(["a", "b"])
     assert entry.count("\n- ") == 2
+
+
+def test_prepend_changelog_merges_into_todays_heading() -> None:
+    today = sync.date.today().strftime("%Y-%m-%d")
+    existing = f"# Changelog\n\n## {today}\n\n- first\n\n## 2020-01-01\n\n- old\n"
+    merged = sync.prepend_changelog(existing, ["second"])
+    assert merged.count(f"## {today}") == 1
+    assert merged.index("- second") < merged.index("- first")
+
+    older = "# Changelog\n\n## 2020-01-01\n\n- old\n"
+    fresh = sync.prepend_changelog(older, ["new"])
+    assert fresh.startswith(f"# Changelog\n\n## {today}\n\n- new\n\n## 2020-01-01")
