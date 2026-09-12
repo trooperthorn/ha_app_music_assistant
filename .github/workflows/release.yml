@@ -1,0 +1,108 @@
+# A merge to main is the release trigger; see docs/operations.md.
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  validate:
+    uses: ./.github/workflows/validate.yml
+    permissions:
+      contents: read
+
+  release:
+    if: github.ref == 'refs/heads/main'
+    needs: [tests, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate the release version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 scripts/build_release_artifacts.py --validate-only)"
+          PREFIX="$(python3 -c 'import json; print(json.load(open(".release.json")).get("tag_prefix", "v"))')"
+          TAG="${PREFIX}${VERSION}"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+
+          RELEASE_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [ "$RELEASE_DRAFT" = "false" ]; then
+            echo "Published release $TAG already exists; nothing to do."
+            printf 'publish=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$RELEASE_DRAFT" = "true" ]; then
+            echo "Resuming incomplete draft release $TAG."
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
+            if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $TAG already points to $TAG_COMMIT, not $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+          printf 'publish=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and publish the release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            gh api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+              --field "ref=refs/tags/$TAG" --field "sha=$GITHUB_SHA" >/dev/null
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "::error::Release $TAG was published during this run."
+              exit 1
+            fi
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$TAG" --generate-notes --verify-tag
+          fi
+
+      - name: Publish verification instructions
+        if: steps.version.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          {
+            echo '### Release verification'
+            echo
+            echo "Published \`$TAG\` from \`$GITHUB_SHA\`."
+            echo
+            echo 'Supervisor builds this app on the host from the pinned upstream server image'
+            echo 'and the pinned fork frontend wheel; see music_assistant_lm/Dockerfile. There is no'
+            echo 'downloadable archive to check against a checksum.'
+          } >> "$GITHUB_STEP_SUMMARY"

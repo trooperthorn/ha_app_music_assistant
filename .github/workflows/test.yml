@@ -1,0 +1,52 @@
+# Script tests, config validation and an image build; release.yml calls it so the same checks gate every release.
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Scripts and config (Python 3.14)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install test requirements
+        run: pip install -r requirements-test.txt
+      - name: Lint
+        run: ruff check scripts tests
+      - name: Unit tests
+        run: pytest -q
+      - name: Validate YAML and the release version
+        run: |
+          python -c "
+          import yaml
+          for f in ['music_assistant_lm/config.yaml', 'music_assistant_lm/translations/en.yaml', 'repository.yaml']:
+              with open(f, encoding='utf-8') as fh:
+                  yaml.safe_load(fh)
+              print(f, 'OK')
+          "
+          python scripts/build_release_artifacts.py --validate-only
+
+  image-build:
+    name: App image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the app image
+        run: |
+          VERSION="$(python3 scripts/build_release_artifacts.py --validate-only)"
+          docker build --build-arg "BUILD_VERSION=$VERSION" --build-arg BUILD_ARCH=amd64 \
+            --tag "local/music_assistant_lm:${{ github.sha }}" music_assistant_lm
+      - name: Report what the image serves
+        run: |
+          docker run --rm --entrypoint /app/venv/bin/python "local/music_assistant_lm:${{ github.sha }}" \
+            -c "import importlib.metadata as m, music_assistant_frontend as f; print('server', m.version('music-assistant')); print('frontend', m.version('music-assistant-frontend'), f.where())"

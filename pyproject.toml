@@ -1,0 +1,18 @@
+[tool.ruff]
+# the shared release scripts are kept identical to the ha-dev templates
+line-length = 140
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+# S101 asserts in tests; S310 fixed https hosts; S603/S607 git on PATH in the shared scripts
+ignore = ["S101", "S310", "S603", "S607"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# shared ha-dev templates, kept byte-identical across repositories
+"scripts/release_config.py" = ["E501"]
+"scripts/set_version.py" = ["E501"]
+"scripts/build_release_artifacts.py" = ["E501"]

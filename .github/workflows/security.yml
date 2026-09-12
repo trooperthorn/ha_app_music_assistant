@@ -1,0 +1,64 @@
+# Static and image security checks on every push, pull request, and weekly; see docs/security.md.
+name: Security
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          languages: python
+          build-mode: none
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          category: "/language:python"
+
+  python-security:
+    name: Python static security checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install pinned scanner
+        run: pip install "bandit==1.8.6"
+      - name: Bandit medium/high findings
+        run: bandit -q -r scripts -ll
+
+  app-image-security:
+    name: App image build and vulnerability report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the app image
+        run: docker build --tag local/music_assistant_lm:${{ github.sha }} music_assistant_lm
+      # The OS layer is upstream's Debian server image; findings there are
+      # reported, not gated, because this repository cannot fix them. See
+      # docs/decisions.md.
+      - name: Scan installed OS packages
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: local/music_assistant_lm:${{ github.sha }}
+          fail-build: false
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+          grype-version: v0.110.0

@@ -1,0 +1,5 @@
+# Security-sensitive runtime and delivery surfaces require owner review.
+/music_assistant_lm/ @trooperthorn
+/scripts/ @trooperthorn
+/.github/workflows/ @trooperthorn
+/SECURITY.md @trooperthorn

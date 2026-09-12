@@ -1,0 +1,8 @@
+{
+  "tag_prefix": "v",
+  "timezone": "America/Chicago",
+  "release_paths": ["music_assistant_lm"],
+  "version_fields": [
+    {"path": "music_assistant_lm/config.yaml", "kind": "regex", "pattern": "^version:\\s*\"([^\"]+)\"", "template": "version: \"{version}\""}
+  ]
+}

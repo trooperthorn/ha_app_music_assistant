@@ -1,0 +1,164 @@
+# Turns release-bearing changes on protected main into a tested CalVer bump PR; see docs/operations.md.
+name: Prepare release
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+concurrency:
+  group: prepare-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current main and all release tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide whether main contains unpublished product changes
+        id: decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_VERSION="$(python3 scripts/build_release_artifacts.py --validate-only)"
+          LATEST_TAG="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" \
+            --jq .tag_name 2>/dev/null || true)"
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No published release exists; preparing the initial automated release."
+            printf 'prepare=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git rev-parse --verify --quiet "${LATEST_TAG}^{commit}" >/dev/null; then
+            echo "::error::Latest release tag $LATEST_TAG is not present in the checkout"
+            exit 1
+          fi
+
+          LATEST_VERSION="${LATEST_TAG#v}"
+          if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+            echo "Version $CURRENT_VERSION is already ahead of published $LATEST_VERSION; release is pending."
+            printf 'prepare=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --quiet "$LATEST_TAG"..HEAD -- music_assistant_lm; then
+            echo "No release-bearing changes exist after $LATEST_TAG."
+            printf 'prepare=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf 'prepare=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Verify release-automation credentials are configured
+        if: steps.decision.outputs.prepare == 'true'
+        env:
+          APP_CLIENT_ID: ${{ vars.RELEASE_AUTOMATION_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.RELEASE_AUTOMATION_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Configure RELEASE_AUTOMATION_CLIENT_ID and RELEASE_AUTOMATION_PRIVATE_KEY, or bump the version manually; see this workflow's header comment."
+            exit 1
+          fi
+
+      - name: Create short-lived release-automation token
+        if: steps.decision.outputs.prepare == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_AUTOMATION_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_AUTOMATION_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Resolve the GitHub App commit identity
+        if: steps.decision.outputs.prepare == 'true'
+        id: app-identity
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_USER_ID="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          printf 'name=%s[bot]\n' "$APP_SLUG" >> "$GITHUB_OUTPUT"
+          printf 'email=%s+%s[bot]@users.noreply.github.com\n' \
+            "$APP_USER_ID" "$APP_SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: Re-check out main with release-automation credentials
+        if: steps.decision.outputs.prepare == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update the controlled release branch
+        if: steps.decision.outputs.prepare == 'true'
+        id: version
+        env:
+          BRANCH: automation/calver-release
+          BOT_EMAIL: ${{ steps.app-identity.outputs.email }}
+          BOT_NAME: ${{ steps.app-identity.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REMOTE_SHA="$(git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}')"
+          git switch --force-create "$BRANCH" origin/main
+
+          VERSION="$(python3 scripts/set_version.py \
+            --next-from-tags --timezone America/Chicago)"
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add -- music_assistant_lm/config.yaml
+          git commit -m "Release v${VERSION}"
+
+          if [ -z "$REMOTE_SHA" ]; then
+            git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
+          else
+            git push \
+              --force-with-lease="refs/heads/$BRANCH:$REMOTE_SHA" \
+              origin "HEAD:refs/heads/$BRANCH"
+          fi
+          printf 'value=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create or refresh the protected release PR
+        if: steps.decision.outputs.prepare == 'true'
+        env:
+          BRANCH: automation/calver-release
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="Release v${VERSION}"
+          BODY="Automated CalVer synchronization for release-bearing changes already merged to main. The protected-branch checks must pass before this PR auto-merges; release.yml will then publish the tag and GitHub Release."
+          PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" --base main --state open \
+            --json number --jq '.[0].number // empty')"
+          if [ -z "$PR_NUMBER" ]; then
+            PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
+              --head "$BRANCH" --base main --title "$TITLE" --body "$BODY")"
+            PR_NUMBER="${PR_URL##*/}"
+          else
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --body "$BODY"
+          fi
+          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch \
+            --repo "$GITHUB_REPOSITORY"
