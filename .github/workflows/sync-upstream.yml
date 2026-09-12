@@ -108,11 +108,11 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="Sync upstream pins"
-          BODY="Automated refresh of the upstream server, fork frontend and app definition pins.
+          BODY="$(printf '%s
 
-$SUMMARY
+%s
 
-The protected-branch checks must pass before this PR auto-merges; the release automation then publishes a new app version."
+%s' \n            "Automated refresh of the upstream server, fork frontend and app definition pins." \n            "$SUMMARY" \n            "The protected-branch checks must pass before this PR auto-merges; the release automation then publishes a new app version.")"
           PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" \
             --head "$BRANCH" --base main --state open \
             --json number --jq '.[0].number // empty')"
