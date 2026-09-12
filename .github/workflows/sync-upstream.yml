@@ -82,6 +82,7 @@ jobs:
           BOT_EMAIL: ${{ steps.app-identity.outputs.email }}
           BOT_NAME: ${{ steps.app-identity.outputs.name }}
           TOKEN: ${{ steps.app-token.outputs.token }}
+          SUMMARY: ${{ steps.sync.outputs.summary }}
         shell: bash
         run: |
           set -euo pipefail
@@ -91,7 +92,7 @@ jobs:
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
           git add -- music_assistant_lm
-          git commit -m "Sync upstream pins" -m "${{ steps.sync.outputs.summary }}"
+          git commit -m "Sync upstream pins" -m "$SUMMARY"
           if [ -z "$REMOTE_SHA" ]; then
             git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
           else
@@ -108,11 +109,10 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="Sync upstream pins"
-          BODY="$(printf '%s
-
-%s
-
-%s' \n            "Automated refresh of the upstream server, fork frontend and app definition pins." \n            "$SUMMARY" \n            "The protected-branch checks must pass before this PR auto-merges; the release automation then publishes a new app version.")"
+          BODY="$(printf '%s\n\n%s\n\n%s' \
+            "Automated refresh of the upstream server, fork frontend and app definition pins." \
+            "$SUMMARY" \
+            "The protected-branch checks must pass before this PR auto-merges; the release automation then publishes a new app version.")"
           PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" \
             --head "$BRANCH" --base main --state open \
             --json number --jq '.[0].number // empty')"
