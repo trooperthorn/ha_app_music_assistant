@@ -29,3 +29,27 @@ one carries.
 `name`, `version`, `slug`, `description` and `url` are this app's; every
 other key follows upstream verbatim so a change in upstream privileges or
 options arrives with the next sync PR, where it is visible in the diff.
+
+## Base images are pinned by digest, not only by tag (2026-09-13)
+
+`FROM` and `COPY --from` carry `:<version>@sha256:...`. A tag is mutable, so
+pinning only the version means an upstream re-push changes every rebuild with
+no diff to review. `sync_upstream.py` resolves the multi-arch index digest for
+both images on every run — not only when the version moves — so a re-publish
+over the same version becomes a change in its own right and lands in a sync PR.
+
+The tags stay alongside the digests. The daemon ignores them when a digest is
+present, but they keep the file readable and the changelog meaningful.
+
+This is also the only mitigation available for upstream's `aiolibdatachannel`
+branch dependency (see security.md): the digest cannot make that pin
+reproducible, but it fixes which build of it this app ships.
+
+## backup_exclude is appended to, not owned (2026-09-13)
+
+`webrtc_private_key.pem` has to be excluded from backups, but adding
+`backup_exclude` to `OWN_KEYS` would freeze the whole list and stop upstream's
+future additions arriving. Instead `EXTRA_LIST_ITEMS` appends this app's
+entries to the upstream list during the merge, so upstream still owns the
+contents and this app only adds. The merge is idempotent and the entry is
+re-added if upstream ever drops the key.

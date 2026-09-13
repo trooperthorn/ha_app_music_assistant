@@ -2,12 +2,21 @@
 #
 # The upstream Music Assistant server image with this fork's frontend
 # installed over the upstream music-assistant-frontend package. The three
-# FRONTEND_* arguments and SERVER_VERSION are maintained by
-# scripts/sync_upstream.py; the app version comes from config.yaml.
+# FRONTEND_* arguments, the two image versions and their digests are all
+# maintained by scripts/sync_upstream.py; the app version comes from
+# config.yaml.
+#
+# Every base image is pinned by digest as well as tag. A tag is mutable: the
+# same server:2.10.3 can be re-published and every rebuild would then ship
+# different bytes with nothing to show for it. The digest fixes the bytes, and
+# because sync_upstream.py re-resolves it on every run, an upstream re-push
+# surfaces as a digest change in the sync PR instead of a silent swap. Both
+# are multi-arch index digests, so amd64 and aarch64 resolve from one pin.
 #
 # hadolint ignore=DL3006
 ARG SERVER_VERSION="2.10.3"
-FROM ghcr.io/music-assistant/server:${SERVER_VERSION}
+ARG SERVER_DIGEST="sha256:885872224fa541c0faefc936625c939ba705a00e89c180f89e877f58448ea5d5"
+FROM ghcr.io/music-assistant/server:${SERVER_VERSION}@${SERVER_DIGEST}
 
 # release tag on trooperthorn/HA_int_MA-UI, the wheel it carries and its
 # sha256; empty FRONTEND_WHEEL keeps the upstream frontend (bootstrap only)
@@ -16,7 +25,9 @@ ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.13.2-py3-none-any.whl"
 ARG FRONTEND_SHA256="3be2f14227dec4acb4f09542c36ff79bafaf5756085a3457690bbd348cd854c7"
 
 # the final server image ships a venv without pip; uv installs into it
-COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /bin/uv
+ARG UV_VERSION="0.12.13"
+ARG UV_DIGEST="sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6"
+COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION}@${UV_DIGEST} /uv /bin/uv
 
 ENV VIRTUAL_ENV=/app/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"

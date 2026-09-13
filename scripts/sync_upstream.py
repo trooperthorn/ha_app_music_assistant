@@ -39,7 +39,12 @@ import yaml
 
 API = "https://api.github.com"
 RAW = "https://raw.githubusercontent.com"
+REGISTRY = "https://ghcr.io"
 SERVER_REPO = "music-assistant/server"
+# registry paths, which happen to match the GitHub repo for the server but are
+# looked up on ghcr.io rather than the API and need not stay identical
+SERVER_IMAGE = "music-assistant/server"
+UV_IMAGE = "astral-sh/uv"
 FRONTEND_REPO = "trooperthorn/HA_int_MA-UI"
 ADDON_REPO = "music-assistant/home-assistant-addon"
 ADDON_DIR = "music_assistant"
@@ -49,10 +54,30 @@ APP_DIR = "music_assistant_lm"
 OWN_KEYS = ("name", "version", "slug", "description", "url")
 # upstream keys that must not be copied (the image is built locally)
 DROP_KEYS = ("image",)
+# Entries this app appends to an upstream list, instead of owning the key.
+# backup_exclude is upstream's to grow, but the WebRTC DTLS private key is
+# written into the data directory whether or not remote access is enabled
+# (the server derives the Remote ID from it at startup either way) and an
+# unencrypted ten-year key does not belong in a Home Assistant backup.
+EXTRA_LIST_ITEMS: dict[str, tuple[str, ...]] = {
+    "backup_exclude": ("webrtc_private_key.pem",),
+}
+
+# Accept header that asks a registry for the multi-arch index rather than one
+# platform's manifest, so the digest pinned below covers amd64 and aarch64.
+MANIFEST_ACCEPT = ", ".join(
+    (
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    )
+)
 
 STABLE_TAG = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 FORK_TAG = re.compile(r"^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$")
 WHEEL = re.compile(r"^music_assistant_frontend-.*\.whl$")
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def fetch(url: str, *, binary: bool = False) -> bytes | str:
@@ -64,6 +89,38 @@ def fetch(url: str, *, binary: bool = False) -> bytes | str:
     with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
         data = response.read()
     return data if binary else data.decode("utf-8")
+
+
+def image_digest(image: str, tag: str) -> str:
+    """
+    Resolve an image tag to the digest of its multi-arch index.
+
+    A tag is mutable: the same `server:2.10.3` can be re-pushed and every
+    rebuild then silently ships different bytes. Pinning `tag@sha256:...` in
+    the Dockerfile fixes the bytes and turns an upstream re-push into a
+    visible digest change in the next sync PR.
+
+    :param image: Registry path, e.g. "music-assistant/server".
+    :param tag: Tag to resolve.
+    :return: The "sha256:..." digest of the manifest the tag points at.
+    """
+    token_url = f"{REGISTRY}/token?service=ghcr.io&scope=repository:{image}:pull"
+    # fixed https hosts only
+    with urllib.request.urlopen(token_url, timeout=60) as response:  # noqa: S310
+        token = json.load(response)["token"]
+    request = urllib.request.Request(
+        f"{REGISTRY}/v2/{image}/manifests/{tag}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": MANIFEST_ACCEPT,
+            "User-Agent": "ha_app_music_assistant sync",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+        digest = response.headers.get("Docker-Content-Digest", "")
+    if not DIGEST.match(digest):
+        raise RuntimeError(f"{image}:{tag} returned no usable digest ({digest!r})")
+    return digest
 
 
 def latest_release(repo: str, tag_ok) -> dict:
@@ -129,7 +186,16 @@ def merge_config(ours: str, upstream: str) -> str:
     for key, value in theirs.items():
         if key in OWN_KEYS or key in DROP_KEYS:
             continue
+        extra = EXTRA_LIST_ITEMS.get(key)
+        if extra and isinstance(value, list):
+            # append rather than own the key, so upstream's own additions to
+            # the list keep arriving with the next sync
+            value = list(value) + [item for item in extra if item not in value]
         merged[key] = value
+    for key, extra in EXTRA_LIST_ITEMS.items():
+        # upstream dropped the key entirely; this app's entries still apply
+        if key not in merged:
+            merged[key] = list(extra)
     header = "\n".join(line for line in ours.splitlines() if line.startswith("#"))
     body = yaml.safe_dump(merged, sort_keys=False, allow_unicode=True, width=100)
     # the version stays a quoted string for the release scripts
@@ -170,6 +236,25 @@ def main() -> int:
     if current.get("SERVER_VERSION") != server["tag_name"]:
         wanted["SERVER_VERSION"] = server["tag_name"]
         changes.append(f"Music Assistant server {current.get('SERVER_VERSION')} -> {server['tag_name']}")
+
+    # Digests are resolved every run, not only when the version moves: a tag
+    # re-pushed over the same version is exactly the case a digest pin exists
+    # to catch, and it has to surface as a change of its own.
+    for arg, image, version, version_arg in (
+        ("SERVER_DIGEST", SERVER_IMAGE, wanted.get("SERVER_VERSION") or current.get("SERVER_VERSION", ""), "SERVER_VERSION"),
+        ("UV_DIGEST", UV_IMAGE, current.get("UV_VERSION", ""), "UV_VERSION"),
+    ):
+        if not version:
+            raise RuntimeError(f"Dockerfile has no {version_arg} to resolve {arg} against")
+        digest = image_digest(image, version)
+        if current.get(arg) == digest:
+            continue
+        wanted[arg] = digest
+        if version_arg in wanted:
+            # the version moved this run, and its changelog line already says so
+            continue
+        previous = current.get(arg) or "unpinned"
+        changes.append(f"{image}:{version} re-published: digest {previous} -> {digest}")
 
     try:
         frontend = latest_release(FRONTEND_REPO, FORK_TAG.match)
