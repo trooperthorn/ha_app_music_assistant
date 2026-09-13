@@ -53,3 +53,18 @@ future additions arriving. Instead `EXTRA_LIST_ITEMS` appends this app's
 entries to the upstream list during the merge, so upstream still owns the
 contents and this app only adds. The merge is idempotent and the entry is
 re-added if upstream ever drops the key.
+
+## The server's frontend pin is recorded, not enforced (2026-09-13)
+
+The fork wheel is installed over `music-assistant-frontend` with `--no-deps`,
+so the version the server pinned for itself is gone by the time the image runs
+and nothing notices the two drifting apart. `sync_upstream.py` now resolves
+that pin from the server release and writes it as `SERVER_EXPECTS_FRONTEND`.
+
+It is deliberately informational. Enforcing it is not possible from here: the
+fork uses CalVer and does not record which upstream frontend release it was
+built from, so there is no version to compare against. What this buys is
+visibility — the pair appears in the build log, and the server's expectation
+moving shows up as a line in the sync PR, which is the point at which the fork
+may need a rebase. Making it enforceable means the fork publishing its upstream
+base alongside the wheel; that is work for `HA_int_MA-UI`, not here.

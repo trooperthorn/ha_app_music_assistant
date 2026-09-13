@@ -34,6 +34,15 @@ ARG FRONTEND_RELEASE="v2026.09.13.2"
 ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.13.2-py3-none-any.whl"
 ARG FRONTEND_SHA256="3be2f14227dec4acb4f09542c36ff79bafaf5756085a3457690bbd348cd854c7"
 
+# The frontend version this server release pins for itself. The fork wheel is
+# installed over that package with --no-deps, so the server's own expectation
+# is gone by the time the image runs and nothing would otherwise notice the
+# two drifting apart. Informational, not enforced: the fork is CalVer and does
+# not carry the upstream release it was built from, so this cannot prove
+# compatibility -- it keeps the pair in the build log and makes the server's
+# expectation move visibly in a sync diff.
+ARG SERVER_EXPECTS_FRONTEND="2.17.297"
+
 COPY --from=uv /uv /bin/uv
 
 ENV VIRTUAL_ENV=/app/venv
@@ -47,7 +56,8 @@ RUN set -eu \
         && echo "${FRONTEND_SHA256}  /tmp/${FRONTEND_WHEEL}" | sha256sum --check - \
         && uv pip install --no-cache --no-deps --force-reinstall --link-mode=copy "/tmp/${FRONTEND_WHEEL}" \
         && rm -f "/tmp/${FRONTEND_WHEEL}" \
-        && "$VIRTUAL_ENV/bin/python" -c "import music_assistant_frontend as f; import importlib.metadata as m; p = f.where(); assert (p / 'index.html').is_file(); print('frontend', m.version('music-assistant-frontend'), p)"; \
+        && "$VIRTUAL_ENV/bin/python" -c "import music_assistant_frontend as f; import importlib.metadata as m; p = f.where(); assert (p / 'index.html').is_file(); print('frontend', m.version('music-assistant-frontend'), p)" \
+        && echo "frontend: fork wheel installed over the ${SERVER_EXPECTS_FRONTEND} this server release pins"; \
     else \
         echo "No fork frontend pinned; the upstream frontend stays installed"; \
     fi \
