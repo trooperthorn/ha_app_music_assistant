@@ -142,6 +142,16 @@ def changelog_entry(lines: list[str]) -> str:
     return f"## {date.today():%Y-%m-%d}\n\n{items}\n"
 
 
+def prepend_changelog(text: str, lines: list[str]) -> str:
+    """Add the lines under today's heading, merging into it when it already leads."""
+    head, sep, rest = text.partition("\n\n")
+    heading = f"## {date.today():%Y-%m-%d}\n\n"
+    if rest.startswith(heading):
+        items = "".join(f"- {line}\n" for line in lines)
+        return head + sep + heading + items + rest[len(heading) :]
+    return head + sep + changelog_entry(lines) + rest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="report without writing")
@@ -189,9 +199,8 @@ def main() -> int:
         for path, text in writes.items():
             path.write_text(text, encoding="utf-8", newline="\n")
         changelog = app / "CHANGELOG.md"
-        head, _, rest = changelog.read_text(encoding="utf-8").partition("\n\n")
         changelog.write_text(
-            head + "\n\n" + changelog_entry(changes) + rest,
+            prepend_changelog(changelog.read_text(encoding="utf-8"), changes),
             encoding="utf-8",
             newline="\n",
         )
