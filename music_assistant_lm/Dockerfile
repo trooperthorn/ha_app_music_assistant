@@ -11,9 +11,9 @@ FROM ghcr.io/music-assistant/server:${SERVER_VERSION}
 
 # release tag on trooperthorn/HA_int_MA-UI, the wheel it carries and its
 # sha256; empty FRONTEND_WHEEL keeps the upstream frontend (bootstrap only)
-ARG FRONTEND_RELEASE="v2026.09.12.5"
-ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.12.5-py3-none-any.whl"
-ARG FRONTEND_SHA256="cf2448509276fb0d0ed43482c57ec04d5709efd4bf6b4c5a5ebaae0ac9fb29bf"
+ARG FRONTEND_RELEASE="v2026.09.13.1"
+ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.13.1-py3-none-any.whl"
+ARG FRONTEND_SHA256="e3923fd8eb2970de80d2f4e67b63d226ca5fe2927fbaba0ea23817db18fe13bc"
 
 # the final server image ships a venv without pip; uv installs into it
 COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /bin/uv
