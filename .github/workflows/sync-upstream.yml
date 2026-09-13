@@ -7,6 +7,15 @@ on:
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:
+  # The frontend fork asks for a sync as soon as it publishes a wheel, so a
+  # release does not sit until the next scheduled run. It sends this rather
+  # than a workflow_dispatch because dispatching a workflow needs an Actions
+  # write permission, and the release App holds only Contents and Pull
+  # requests -- repository_dispatch is reachable with the Contents write it
+  # already has. See docs/operations.md.
+  repository_dispatch:
+    types:
+      - fork-frontend-published
 
 concurrency:
   group: sync-upstream-${{ github.repository }}
