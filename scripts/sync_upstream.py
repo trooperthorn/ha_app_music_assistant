@@ -78,6 +78,8 @@ STABLE_TAG = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 FORK_TAG = re.compile(r"^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$")
 WHEEL = re.compile(r"^music_assistant_frontend-.*\.whl$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+# the server's own pin of the package this app replaces
+FRONTEND_PIN = re.compile(r'"music-assistant-frontend==([0-9][^"]*)"')
 
 
 def fetch(url: str, *, binary: bool = False) -> bytes | str:
@@ -121,6 +123,25 @@ def image_digest(image: str, tag: str) -> str:
     if not DIGEST.match(digest):
         raise RuntimeError(f"{image}:{tag} returned no usable digest ({digest!r})")
     return digest
+
+
+def server_frontend_pin(version: str) -> str:
+    """
+    Read the frontend version the server release pins for itself.
+
+    The fork wheel is force-installed over `music-assistant-frontend` with
+    --no-deps, so whatever the server declared is gone by the time the image
+    runs and nothing would otherwise notice the two drifting apart. The fork
+    uses CalVer, so its own version says nothing about which upstream frontend
+    it was built from; recording the server's expectation is what makes the
+    pair visible in the build log and in a sync diff.
+
+    :param version: Server release tag, e.g. "2.10.3".
+    :return: The pinned frontend version, e.g. "2.17.297", or "" if absent.
+    """
+    pyproject = str(fetch(f"{RAW}/{SERVER_REPO}/{version}/pyproject.toml"))
+    found = FRONTEND_PIN.search(pyproject)
+    return found.group(1) if found else ""
 
 
 def latest_release(repo: str, tag_ok) -> dict:
@@ -255,6 +276,21 @@ def main() -> int:
             continue
         previous = current.get(arg) or "unpinned"
         changes.append(f"{image}:{version} re-published: digest {previous} -> {digest}")
+
+    # What the server expects of the package this app replaces. Recorded, not
+    # enforced: the fork is CalVer and does not say which upstream frontend it
+    # was built from, so this cannot prove compatibility -- it makes the pair
+    # visible in the build log and moves in a sync diff when the server's
+    # expectation changes, which is the point at which the fork needs a rebase.
+    server_version = wanted.get("SERVER_VERSION") or current.get("SERVER_VERSION", "")
+    expects = server_frontend_pin(server_version)
+    if expects and current.get("SERVER_EXPECTS_FRONTEND") != expects:
+        wanted["SERVER_EXPECTS_FRONTEND"] = expects
+        previous = current.get("SERVER_EXPECTS_FRONTEND") or "unrecorded"
+        changes.append(
+            f"Server {server_version} expects frontend {previous} -> {expects}; "
+            "rebase the fork on that upstream release if the UI misbehaves"
+        )
 
     try:
         frontend = latest_release(FRONTEND_REPO, FORK_TAG.match)

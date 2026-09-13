@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -124,3 +125,27 @@ def test_dockerfile_pins_every_base_image_by_digest() -> None:
     for line in dockerfile.splitlines():
         if line.startswith("FROM ") and "@${" not in line:
             raise AssertionError(f"unpinned image reference: {line}")
+
+
+def test_server_frontend_pin_extracts_the_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    pyproject = 'dependencies = [\n  "aiohttp==3.14.3",\n  "music-assistant-frontend==2.17.297",\n]\n'
+    monkeypatch.setattr(sync, "fetch", lambda url, **kw: pyproject)
+    assert sync.server_frontend_pin("2.10.3") == "2.17.297"
+
+
+def test_server_frontend_pin_is_empty_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sync, "fetch", lambda url, **kw: 'dependencies = ["aiohttp==3.14.3"]\n')
+    assert sync.server_frontend_pin("2.10.3") == ""
+
+
+def test_server_frontend_pin_ignores_a_non_version_specifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    # a git or url form carries no version to record, and must not half-match
+    pyproject = 'dependencies = ["music-assistant-frontend @ git+https://example.invalid/x"]\n'
+    monkeypatch.setattr(sync, "fetch", lambda url, **kw: pyproject)
+    assert sync.server_frontend_pin("2.10.3") == ""
+
+
+def test_dockerfile_records_what_the_server_expects() -> None:
+    dockerfile = (Path(__file__).resolve().parents[1] / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    recorded = sync.read_args(dockerfile)["SERVER_EXPECTS_FRONTEND"]
+    assert re.match(r"^[0-9]+\.[0-9]+\.[0-9]+$", recorded), recorded

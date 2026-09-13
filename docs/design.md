@@ -22,6 +22,12 @@ One app, `music_assistant_lm`, whose Dockerfile is:
    installed with `--no-deps --force-reinstall` over the upstream package.
 4. The server's own entrypoint, unchanged.
 
+The build also records `SERVER_EXPECTS_FRONTEND`, the frontend version the
+server release pins for itself, and prints it beside the installed fork
+version. Because the install uses `--no-deps`, that expectation is otherwise
+invisible once the image is built; see decisions.md for why it is recorded
+rather than enforced.
+
 Supervisor builds this image on the Home Assistant host when the app is
 installed or updated (there is no `image:` key), so no registry, image
 signing or multi-arch publishing is needed on this side. The cost is a few
