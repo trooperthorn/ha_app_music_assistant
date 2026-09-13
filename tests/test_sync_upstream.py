@@ -116,4 +116,11 @@ def test_dockerfile_pins_every_base_image_by_digest() -> None:
         assert sync.DIGEST.match(args[name]), f"{name} is not a sha256 digest"
     # every image reference carries its digest argument, not just the tag
     assert "FROM ghcr.io/music-assistant/server:${SERVER_VERSION}@${SERVER_DIGEST}" in dockerfile
-    assert "COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION}@${UV_DIGEST}" in dockerfile
+    # BuildKit refuses variable expansion in COPY --from, so uv is named as a
+    # stage and the pin lives on that stage's FROM
+    assert "FROM ghcr.io/astral-sh/uv:${UV_VERSION}@${UV_DIGEST} AS uv" in dockerfile
+    assert "COPY --from=uv " in dockerfile
+    # and no image is reached by a bare tag anywhere in the file
+    for line in dockerfile.splitlines():
+        if line.startswith("FROM ") and "@${" not in line:
+            raise AssertionError(f"unpinned image reference: {line}")
