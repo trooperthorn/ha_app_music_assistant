@@ -7,7 +7,7 @@
 | `test.yml` | push, PR, call | ruff, pytest on the scripts, YAML and version validation, a full image build that prints the server and frontend versions it serves |
 | `validate.yml` | push, PR, weekly | app definition sanity, an upstream drift report (`sync_upstream.py --check`), hadolint |
 | `security.yml` | push, PR, weekly | CodeQL and bandit on the scripts, an image vulnerability report (not a gate, see decisions.md) |
-| `sync-upstream.yml` | daily 09:17 UTC, manual | applies the upstream pins; if anything changed, pushes `automation/upstream-sync` with the release App and opens an auto-merging PR |
+| `sync-upstream.yml` | daily 09:17 UTC, manual, and dispatched by the fork's `publish-fork.yml` right after it releases a wheel | applies the upstream pins; if anything changed, pushes `automation/upstream-sync` with the release App and opens an auto-merging PR |
 | `release.yml` | push to main | runs tests and validate, then tags `v<version>` and publishes the GitHub release |
 | `prepare-release.yml` | after a successful Release on main | when `music_assistant_lm/` changed since the last release and the version was not bumped, bumps CalVer on `automation/calver-release` and opens an auto-merging PR |
 
