@@ -38,6 +38,31 @@ Everything else in `music_assistant_lm/` is the upstream app definition:
 `config.yaml` (with this app's own `name`, `slug`, `description`, `url` and
 `version`), `apparmor.txt` and `translations/en.yaml`.
 
+## Build-time edits of the server
+
+`music_assistant_lm/patches/` holds small Python scripts that edit the
+installed server in place while the image builds, one script per change,
+each documenting what it changes and why. The Dockerfile runs every script
+after the frontend wheel is installed. A script is a list of exact upstream
+lines and their replacements; it refuses to run when an anchor is missing or
+ambiguous, so a server release that reshapes the edited module fails the
+image build and the sync pull request instead of shipping without the change.
+Each script is a no-op on a module it already edited.
+
+Today there is one:
+
+- `hass_source_select.py`: the Home Assistant player provider mirrors the
+  wrapped entity's `source_list` as selectable player sources (which gives
+  the player `select_source` on the server side), mirrors its `source` as
+  `extra_attributes.hass_source`, and implements `select_source` as
+  `media_player.select_source`. The fork frontend's routing view (`/flow`)
+  switches receiver and amplifier zones to the Chromecast feed input with it.
+
+`tests/test_patches.py` applies each script to a copy of the upstream module
+kept under `tests/fixtures/` and pins the copy to the server version in the
+Dockerfile, so a server bump is the moment the fixture and the anchors are
+re-checked.
+
 ## Two upstreams and one fork
 
 `scripts/sync_upstream.py` reads three things and writes the pins:

@@ -18,6 +18,10 @@ Settings, Apps, App store, Repositories.
   genre / artist / album browser, dense sortable track grid, queue and
   selected-item panes, keyboard commands, settings tree). Guide:
   [LIBRARY-MANAGER.md](https://github.com/trooperthorn/HA_int_MA-UI/blob/main/docs/LIBRARY-MANAGER.md).
+- One build-time edit of the server: the Home Assistant player provider can
+  select an input on the wrapped entity, which the fork's routing view at
+  `/flow` uses to send receiver and amplifier zones to the Chromecast feed.
+  See [docs/design.md](docs/design.md).
 - The same options, ports, ingress, discovery and AppArmor profile as the
   official app.
 
