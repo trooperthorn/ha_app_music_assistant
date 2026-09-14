@@ -97,3 +97,18 @@ names, keeps it on the queue items as `extra_attributes.preferred_provider`
 the queue), and puts it ahead of the quality order at stream time. The
 frontend only has to name the source's own item in the uri it sends.
 
+## Opus bitrate is a build-time edit of aiosendspin too (2026-09-14)
+
+Network-aware playback (Music Assistant discussion 5264) has no upstream
+code yet; the maintainers point at future Sendspin work. The fork frontend
+builds its own adaptive mode on what exists: the server already changes a
+player's codec in place through the preferred-format setting, the browser
+player reports resyncs and sync error, and aiosendspin's transformer pool
+already carries codec options. The only missing piece was the Opus
+encoder ignoring those options and no setting to feed them, which is a
+small anchored edit of a dependency inside the image, handled exactly like
+the server edits. A fork of aiosendspin would mean owning its release
+train for three lines. Fixtures are pinned to the aiosendspin version the
+server release pins, so a server bump that moves aiosendspin re-checks
+the anchors the same way.
+

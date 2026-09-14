@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are two:
+Today there are three:
 
 - `hass_source_select.py`: the Home Assistant player provider mirrors the
   wrapped entity's `source_list` as selectable player sources (which gives
@@ -67,6 +67,16 @@ Today there are two:
   and on disk streams from Spotify even from the Filesystem listing. The
   fork frontend's library manager sends such uris for a listing narrowed to
   one source.
+- `sendspin_opus_bitrate.py`: a per-player `sendspin_opus_bitrate` setting
+  (bits per second, 0 for the encoder default) for Sendspin players. It
+  edits aiosendspin as well as the server: the Opus encoder applies the
+  `bit_rate` codec option it already accepts, the player role passes the
+  option to the transformer pool and the stream requirements and
+  re-announces the stream when it changes, and the provider exposes and
+  applies the setting next to the preferred format. The fork frontend's
+  web player uses it as the lower rungs of its adaptive mode and from the
+  phone layout's menu. Its fixtures are pinned to the aiosendspin release
+  the server pins (9.1.1 for 2.10.3).
 
 `tests/test_patches.py` applies each script to a copy of the upstream modules
 kept under `tests/fixtures/` and pins the copies to the server version in the
