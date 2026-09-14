@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there is one:
+Today there are two:
 
 - `hass_source_select.py`: the Home Assistant player provider mirrors the
   wrapped entity's `source_list` as selectable player sources (which gives
@@ -57,10 +57,20 @@ Today there is one:
   `extra_attributes.hass_source`, and implements `select_source` as
   `media_player.select_source`. The fork frontend's routing view (`/flow`)
   switches receiver and amplifier zones to the Chromecast feed input with it.
+- `play_source_steer.py`: a play request whose uri names a provider instance
+  (`filesystem_local--xyz://track/...`) marks the queue items it produces with
+  `extra_attributes.preferred_provider`, and stream resolution tries that
+  provider before the quality order (the same way the playback user's
+  provider filter already is), falling back to the others when it cannot
+  serve the item. Without it every uri resolves to the library item and the
+  stream comes from the best-quality provider, so a track that is on Spotify
+  and on disk streams from Spotify even from the Filesystem listing. The
+  fork frontend's library manager sends such uris for a listing narrowed to
+  one source.
 
-`tests/test_patches.py` applies each script to a copy of the upstream module
-kept under `tests/fixtures/` and pins the copy to the server version in the
-Dockerfile, so a server bump is the moment the fixture and the anchors are
+`tests/test_patches.py` applies each script to a copy of the upstream modules
+kept under `tests/fixtures/` and pins the copies to the server version in the
+Dockerfile, so a server bump is the moment the fixtures and the anchors are
 re-checked.
 
 ## Two upstreams and one fork

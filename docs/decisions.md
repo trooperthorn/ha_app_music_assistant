@@ -84,3 +84,16 @@ apply blindly. The unit test applies the script to a vendored copy of the
 upstream module pinned to the Dockerfile's server version, so the fixture
 and the script move together with every server bump.
 
+## Playback steers to the browsed source through the same mechanism (2026-09-14)
+
+Playing from the Filesystem listing still streamed from Spotify: the server
+resolves every uri to the library item and orders the stream candidates by
+quality, with the playback user's provider filter as the only preference.
+That filter is an account-wide access restriction, so setting it from a
+listing toggle was out, and a per-play hint has no place in the API. The
+`play_source_steer.py` edit reads the provider from the uri a play request
+names, keeps it on the queue items as `extra_attributes.preferred_provider`
+(the field the server already uses for playback speed, so it persists with
+the queue), and puts it ahead of the quality order at stream time. The
+frontend only has to name the source's own item in the uri it sends.
+
