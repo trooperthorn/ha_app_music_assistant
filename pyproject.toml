@@ -16,3 +16,5 @@ testpaths = ["tests"]
 "scripts/release_config.py" = ["E501"]
 "scripts/set_version.py" = ["E501"]
 "scripts/build_release_artifacts.py" = ["E501"]
+# an upstream module kept byte-identical to the pinned server release
+"tests/fixtures/*.py" = ["ALL"]

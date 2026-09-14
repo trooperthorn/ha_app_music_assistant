@@ -68,3 +68,19 @@ visibility — the pair appears in the build log, and the server's expectation
 moving shows up as a line in the sync PR, which is the point at which the fork
 may need a rebase. Making it enforceable means the fork publishing its upstream
 base alongside the wheel; that is work for `HA_int_MA-UI`, not here.
+
+## Server changes ship as anchored build-time edits, not a fork (2026-09-14)
+
+The routing view needs the Home Assistant player provider to select inputs
+on receiver zones, which upstream does not do. Contributing it upstream is out
+(the Open Home Foundation AI policy and this repository's own rule), and
+forking the server would mean owning its release train. Instead the change is
+a script under `music_assistant_lm/patches/` that rewrites exact upstream
+lines in the installed module during the image build. Anchoring on exact
+lines is the point: when the server release changes the module, the anchor
+is gone, the build fails, and the sync pull request shows it. A `patch(1)`
+file would need the tool in the image and give worse errors; a sed would
+apply blindly. The unit test applies the script to a vendored copy of the
+upstream module pinned to the Dockerfile's server version, so the fixture
+and the script move together with every server bump.
+

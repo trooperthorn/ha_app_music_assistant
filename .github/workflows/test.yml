@@ -50,3 +50,6 @@ jobs:
         run: |
           docker run --rm --entrypoint /app/venv/bin/python "local/music_assistant_lm:${{ github.sha }}" \
             -c "import importlib.metadata as m, music_assistant_frontend as f; print('server', m.version('music-assistant')); print('frontend', m.version('music-assistant-frontend'), f.where())"
+      - name: Check the server patches took
+        run: |
+          docker run --rm --entrypoint /app/venv/bin/python "local/music_assistant_lm:${{ github.sha }}"             -c "import inspect; from music_assistant.providers.hass_players.player import HomeAssistantPlayer as P; assert 'select_source' in P.__dict__, 'hass_source_select patch missing'; print('patches: hass_source_select present')"
