@@ -18,12 +18,14 @@ Settings, Apps, App store, Repositories.
   genre / artist / album browser, dense sortable track grid, queue and
   selected-item panes, keyboard commands, settings tree). Guide:
   [LIBRARY-MANAGER.md](https://github.com/trooperthorn/HA_int_MA-UI/blob/main/docs/LIBRARY-MANAGER.md).
-- Two build-time edits of the server: the Home Assistant player provider can
-  select an input on the wrapped entity, which the fork's routing view at
-  `/flow` uses to send receiver and amplifier zones to the Chromecast feed;
-  and a play request can name the source to stream from, which the fork's
+- Three build-time edits of the server: the Home Assistant player provider
+  can select an input on the wrapped entity, which the fork's routing view
+  at `/flow` uses to send receiver and amplifier zones to the Chromecast
+  feed; a play request can name the source to stream from, which the fork's
   library manager uses so a listing narrowed to one source plays through
-  that source. See [docs/design.md](docs/design.md).
+  that source; and Sendspin players get an Opus bitrate setting, which the
+  fork's web player uses for its adaptive mode on poor links. See
+  [docs/design.md](docs/design.md).
 - The same options, ports, ingress, discovery and AppArmor profile as the
   official app.
 

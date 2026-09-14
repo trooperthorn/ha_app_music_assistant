@@ -13,11 +13,16 @@ sys.path.insert(0, str(ROOT / "music_assistant_lm" / "patches"))
 
 import hass_source_select as patch  # noqa: E402
 import play_source_steer as steer  # noqa: E402
+import sendspin_opus_bitrate as opus  # noqa: E402
 
 # the modules exactly as the pinned server release ships them
 UPSTREAM = ROOT / "tests" / "fixtures" / "hass_player_2_10_3.py"
 QUEUE_LOADER = ROOT / "tests" / "fixtures" / "queue_loader_2_10_3.py"
 STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_3.py"
+# aiosendspin as server 2.10.3 pins it (aiosendspin[server]==9.1.1)
+AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
+AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
+SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_3.py"
 
 
 def test_the_fixture_matches_the_pinned_server_release() -> None:
@@ -95,6 +100,47 @@ def test_steer_main_patches_both_files_once(tmp_path: Path) -> None:
     assert (loader.read_bytes(), audio.read_bytes()) == first
     with pytest.raises(SystemExit, match="expected 2 paths"):
         steer.main(["x", str(loader)])
+
+
+def test_opus_bitrate_reaches_the_encoder_and_the_config() -> None:
+    codecs = opus.apply(AIOSENDSPIN_CODECS.read_text(encoding="utf-8"), opus.EDITS[opus.CODECS])
+    role = opus.apply(AIOSENDSPIN_PLAYER_V1.read_text(encoding="utf-8"), opus.EDITS[opus.PLAYER_ROLE])
+    provider = opus.apply(SENDSPIN_PLAYER.read_text(encoding="utf-8"), opus.EDITS[opus.PROVIDER])
+    for text in (codecs, role, provider):
+        ast.parse(text)
+
+    # the encoder reads the option once it opens its context
+    assert "self._encoder.bit_rate = int(bit_rate)" in codecs
+    assert codecs.index('self._encoder.format = "s16"') < codecs.index("self._encoder.bit_rate = int(bit_rate)")
+    # the role hands the option to the pool and to the stream requirements
+    role_tree = ast.parse(role)
+    names = {node.name for node in ast.walk(role_tree) if isinstance(node, ast.FunctionDef)}
+    assert {"set_opus_bit_rate", "_opus_options"} <= names
+    assert "options=self._opus_options()," in role
+    assert "transform_options=(" in role
+    # the provider exposes and applies the setting on every config update
+    assert "key=CONF_SENDSPIN_OPUS_BITRATE" in provider
+    assert provider.index("self._apply_opus_bitrate()") < provider.index("await self._apply_preferred_format()")
+
+
+def test_opus_bitrate_is_idempotent_and_refuses_a_moved_module() -> None:
+    once = opus.apply(AIOSENDSPIN_CODECS.read_text(encoding="utf-8"), opus.EDITS[opus.CODECS])
+    assert opus.apply(once, opus.EDITS[opus.CODECS]) == once
+    with pytest.raises(SystemExit, match="anchor found 0 times"):
+        opus.apply("class OpusEncoder:\n    pass\n", opus.EDITS[opus.CODECS])
+
+
+def test_opus_bitrate_main_patches_all_three_once(tmp_path: Path) -> None:
+    targets = []
+    for fixture in (AIOSENDSPIN_CODECS, AIOSENDSPIN_PLAYER_V1, SENDSPIN_PLAYER):
+        target = tmp_path / fixture.name
+        target.write_bytes(fixture.read_bytes())
+        targets.append(target)
+    assert opus.main(["x", *map(str, targets)]) == 0
+    first = [target.read_bytes() for target in targets]
+    assert all(opus.MARKER.encode() in text and b"\r\n" not in text for text in first)
+    assert opus.main(["x", *map(str, targets)]) == 0
+    assert [target.read_bytes() for target in targets] == first
 
 
 def test_main_writes_once_and_keeps_line_endings(tmp_path: Path) -> None:
