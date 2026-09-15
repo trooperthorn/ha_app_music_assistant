@@ -6,7 +6,16 @@ Identical to the official Music Assistant app, because `config.yaml` is
 synced from it: `host_network`, `SYS_ADMIN` and `DAC_READ_SEARCH`
 capabilities, audio, `media:rw`, `ssl:ro`, the Home Assistant and auth
 APIs, ingress on 8094, the upstream AppArmor profile. This repository adds
-no privilege.
+`share:rw` (the drive backup task writes there), `udev` (read-only access
+to the host's device database, for the drive's label and type) and
+`kernel_modules` (the host's modules read-only plus `SYS_MODULE`, so the
+drive's filesystem driver can be loaded by name), and an optional
+`music_drive` device option through which Supervisor grants one partition
+to the container. Mounting itself needs nothing new: the upstream profile
+already permits `mount` and `umount` for the SMB provider. Protection mode
+stays on; `full_access` is not used. See "The music drive" in design.md
+for what the wrapper does and does not do with the drive, in particular
+that it never writes without an explicit one-off task.
 
 ## What is verified
 

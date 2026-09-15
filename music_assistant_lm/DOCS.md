@@ -6,6 +6,26 @@ Same options as the official app:
 | --- | --- |
 | `log_level` | Global log level; keep `info` unless debugging. |
 | `safe_mode` | Start with only the core controllers, no providers, to troubleshoot. |
+| `music_drive` | A partition of the Home Assistant server that holds music. The app mounts it at `/music/<label>` for itself only. |
+| `music_drive_task` | A one-off job at the next start: `backup`, `verify`, `restore` or `repair` (see below). Set it back to `none` afterwards. |
+
+## The music drive
+
+Pick the partition in **Music drive** and restart the app. The log shows the
+mount, the label and, for exFAT, whether the volume is clean. Then add a
+**Filesystem (local disk)** provider in Music Assistant and use its Browse
+button to pick a folder under the mount (the fork frontend's picker; the
+path can still be typed). Point the provider at a folder on the drive, not
+at the mount itself, so an unmounted drive makes the provider unavailable
+rather than emptying the library.
+
+An exFAT drive that was not cleanly ejected is mounted read-only. The tasks
+exist so that repairing it never risks data: run `backup` (the drive is
+copied to `/share/music-drive-backup/<label>` with a checksum manifest),
+then `repair`, then `verify` (a report of anything the repair changed) and,
+if the report lists files, `restore` (copies them back from the backup).
+Each task runs once at the next start and the log tells you when to set
+the option back to `none`.
 
 The library manager is at `/library` in the app's own interface ("Library
 manager" in the navigation). Its user guide lives in the frontend fork:

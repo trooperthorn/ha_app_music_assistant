@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "music_assistant_lm" / "patches"))
 
+import browse_path as browse  # noqa: E402
 import hass_source_select as patch  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
@@ -23,6 +24,7 @@ STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_3.py"
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_3.py"
+CONFIG_PROVIDERS = ROOT / "tests" / "fixtures" / "config_providers_2_10_3.py"
 
 
 def test_the_fixture_matches_the_pinned_server_release() -> None:
@@ -141,6 +143,38 @@ def test_opus_bitrate_main_patches_all_three_once(tmp_path: Path) -> None:
     assert all(opus.MARKER.encode() in text and b"\r\n" not in text for text in first)
     assert opus.main(["x", *map(str, targets)]) == 0
     assert [target.read_bytes() for target in targets] == first
+
+
+def test_browse_path_adds_a_scoped_command_inside_the_roots() -> None:
+    patched = browse.apply(CONFIG_PROVIDERS.read_text(encoding="utf-8"))
+
+    tree = ast.parse(patched)
+    methods = {
+        node.name
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef)
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    assert "get_provider_config_entries" in methods
+    assert "browse_path" in methods
+    assert 'api_command("config/providers/browse_path", required_scope=Scope.CONFIG_PROVIDERS_WRITE)' in patched
+    assert "from music_assistant.helpers.security import is_safe_path" in patched
+    assert 'entry.name.startswith(".")' in patched
+    assert "folders[:500]" in patched
+    assert browse.apply(patched) == patched
+    with pytest.raises(SystemExit, match="anchor found 0 times"):
+        browse.apply("class ProvidersController:\n    pass\n")
+
+
+def test_browse_path_main_patches_the_module_once(tmp_path: Path) -> None:
+    target = tmp_path / "providers.py"
+    target.write_text(CONFIG_PROVIDERS.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+    assert browse.main(["browse_path.py", str(target)]) == 0
+    once = target.read_bytes()
+    assert b"\r\n" not in once
+    assert browse.main(["browse_path.py", str(target)]) == 0
+    assert target.read_bytes() == once
 
 
 def test_main_writes_once_and_keeps_line_endings(tmp_path: Path) -> None:

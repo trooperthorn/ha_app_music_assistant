@@ -47,6 +47,17 @@ COPY --from=uv /uv /bin/uv
 # build-time edits of the upstream server: see patches/*.py for what each one
 # changes and why; every one fails the build when its anchors are gone
 COPY patches/ /tmp/patches/
+# the entrypoint wrapper that mounts the music drive (docs/design.md)
+COPY rootfs/ /
+
+# exfatprogs: the read-only check (and the explicit repair task) for an exFAT
+# music drive; rsync: the backup task. Debian's versions move with the base
+# image, which is pinned by digest above.
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends exfatprogs rsync \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod 0755 /usr/local/bin/mass_with_drive.py
 
 ENV VIRTUAL_ENV=/app/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
@@ -64,7 +75,7 @@ RUN set -eu \
     else \
         echo "No fork frontend pinned; the upstream frontend stays installed"; \
     fi \
-    && "$VIRTUAL_ENV/bin/python" /tmp/patches/hass_source_select.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/play_source_steer.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/sendspin_opus_bitrate.py     && rm -rf /tmp/patches     && chmod -R a+rX "$VIRTUAL_ENV/lib"
+    && "$VIRTUAL_ENV/bin/python" /tmp/patches/hass_source_select.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/play_source_steer.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/sendspin_opus_bitrate.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/browse_path.py     && rm -rf /tmp/patches     && chmod -R a+rX "$VIRTUAL_ENV/lib"
 
 ARG BUILD_VERSION
 ARG BUILD_ARCH
@@ -76,4 +87,6 @@ LABEL \
     io.hass.description="Music Assistant server with the trooperthorn library-manager frontend" \
     org.opencontainers.image.source="https://github.com/trooperthorn/ha_app_music_assistant"
 
-# the server image's entrypoint (jemalloc preload, --data-dir /data) is inherited
+# the server image's entrypoint (jemalloc preload, --data-dir /data) runs as the
+# child of the wrapper, which mounts the music drive first and unmounts it after
+ENTRYPOINT ["/app/venv/bin/python", "/usr/local/bin/mass_with_drive.py", "--data-dir", "/data", "--cache-dir", "/data/.cache"]

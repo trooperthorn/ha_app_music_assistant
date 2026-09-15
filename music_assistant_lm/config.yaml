@@ -26,6 +26,7 @@ apparmor: true
 map:
 - media:rw
 - ssl:ro
+- share:rw
 init: false
 backup_exclude:
 - cache.db
@@ -37,9 +38,14 @@ tmpfs: true
 options:
   log_level: info
   safe_mode: false
+  music_drive_task: none
 schema:
   log_level: list(debug|info|warning|error)
   safe_mode: bool
+  music_drive: device(subsystem=block)?
+  music_drive_task: list(none|backup|verify|restore|repair)
+udev: true
+kernel_modules: true
 privileged:
 - SYS_ADMIN
 - DAC_READ_SEARCH
