@@ -5,9 +5,3 @@ configuration:
   safe_mode:
     name: Safe mode
     description: "Start the Music Assistant server in safe mode where only the core controllers are started without any providers, to troubleshoot issues"
-  music_drive:
-    name: Music drive
-    description: "A partition inside or attached to the Home Assistant server that holds music. The app mounts it at /music/<label> for itself only; point a Filesystem provider at a folder under it. exFAT, FAT, NTFS, ext4, btrfs and xfs are mounted; a not-cleanly-ejected exFAT volume is mounted read-only."
-  music_drive_task:
-    name: Music drive task
-    description: "A one-off job run at the next start, each writing to /share/music-drive-backup/<label>: backup (copy the drive there with a checksum manifest), verify (compare the drive with the manifest), restore (copy back what verify found missing or changed), repair (the exFAT check with repair, refused without a backup manifest). Set it back to none afterwards."
