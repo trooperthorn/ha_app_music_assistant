@@ -44,8 +44,8 @@ schema:
   safe_mode: bool
   music_drive: device(subsystem=block)?
   music_drive_task: list(none|backup|verify|restore|repair)
-udev: true
-kernel_modules: true
 privileged:
 - SYS_ADMIN
 - DAC_READ_SEARCH
+udev: true
+kernel_modules: true
