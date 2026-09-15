@@ -2,6 +2,8 @@
 
 ## 2026-09-14
 
+- Music drive: an app option mounts a partition of the server inside this app at /music/<label> (exFAT, FAT, NTFS, ext4, btrfs, xfs), read-only when an exFAT volume was not cleanly ejected, with one-off backup, verify, restore and repair tasks under /share
+- browse_path: a config/providers/browse_path command for the fork frontend's folder picker in the Filesystem provider setup
 - Fork frontend v2026.09.14.5 -> v2026.09.14.7
 - Fork frontend v2026.09.14.3 -> v2026.09.14.5
 - Fork frontend v2026.09.14.2 -> v2026.09.14.3

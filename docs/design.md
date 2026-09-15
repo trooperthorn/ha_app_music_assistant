@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are three:
+Today there are four:
 
 - `hass_source_select.py`: the Home Assistant player provider mirrors the
   wrapped entity's `source_list` as selectable player sources (which gives
@@ -77,11 +77,56 @@ Today there are three:
   web player uses it as the lower rungs of its adaptive mode and from the
   phone layout's menu. Its fixtures are pinned to the aiosendspin release
   the server pins (9.1.1 for 2.10.3).
+- `browse_path.py`: a `config/providers/browse_path` command on the
+  providers config controller that lists the folders under the app's
+  music roots (`/music`, the drive this app mounts; `/media`; `/share`),
+  each path checked with the server's own `is_safe_path` against those
+  roots so nothing else in the container can be listed, under the same
+  scope that saves a provider config. The fork frontend's folder picker
+  calls it from the Filesystem provider's setup and reconfigure flows, so
+  the path is picked rather than typed. The server has no directory
+  listing of its own outside a configured provider.
 
 `tests/test_patches.py` applies each script to a copy of the upstream modules
 kept under `tests/fixtures/` and pins the copies to the server version in the
 Dockerfile, so a server bump is the moment the fixtures and the anchors are
 re-checked.
+
+## The music drive
+
+`music_drive` (an app option of schema type `device(subsystem=block)`, a
+drop-down of the host's partitions) names a drive that holds music.
+Supervisor binds the host's `/dev` into every app and grants access to the
+chosen partition through a cgroup rule, and the app's AppArmor profile
+(upstream's, needed for the SMB provider's own in-container mounts)
+already permits `mount` and `umount` with `SYS_ADMIN`. So the drive is
+mounted inside this container only, natively through the host kernel's
+driver (HAOS ships exFAT, NTFS, FAT, ext4, btrfs and xfs as modules, loaded
+by the kernel on the first mount), with no re-export and no other app
+seeing it.
+
+`rootfs/usr/local/bin/mass_with_drive.py` is the image's entrypoint. With
+no drive configured it hands over to the server image's own entrypoint
+unchanged. With one it waits for the node, reads the filesystem type and
+label from the superblock, mounts the partition at `/music/<label>`
+(`nosuid,nodev,noexec,relatime`, plus `umask=000,iocharset=utf8` for
+filesystems without ownership), runs the server entrypoint as a child,
+forwards the stop signal, and unmounts after the server exits. A mount
+failure or a missing drive is logged and the server starts without it. A
+Filesystem provider is meant to point at a folder under the mount, so an
+unmounted drive makes the provider unavailable instead of presenting an
+empty library that would mark every track missing.
+
+Nothing writes to the drive on its own. An exFAT volume gets a read-only
+check at every start; one that was not cleanly ejected is mounted read-only
+and the log says so. Writes happen only through `music_drive_task`, one
+task per start, each reporting under `/share/music-drive-backup/<label>`:
+`backup` (rsync copy plus a size-and-SHA-256 manifest), `verify` (the drive
+against the manifest, a report of missing, changed and new files),
+`restore` (the reported files copied back from the backup) and `repair`
+(the exFAT check with repair, run before the mount and refused without a
+manifest, so a backup always precedes it). The wrapper is tested in
+`tests/test_drive_wrapper.py` with the host commands stubbed.
 
 ## Two upstreams and one fork
 

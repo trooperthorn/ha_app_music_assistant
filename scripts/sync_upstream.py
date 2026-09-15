@@ -61,7 +61,23 @@ DROP_KEYS = ("image",)
 # unencrypted ten-year key does not belong in a Home Assistant backup.
 EXTRA_LIST_ITEMS: dict[str, tuple[str, ...]] = {
     "backup_exclude": ("webrtc_private_key.pem",),
+    # the backup task writes under /share
+    "map": ("share:rw",),
 }
+# Entries this app adds to an upstream mapping (options and their schema), so
+# upstream's own additions keep arriving while ours stay: the music drive the
+# entrypoint wrapper mounts and its one-off tasks (rootfs/usr/local/bin).
+EXTRA_DICT_ITEMS: dict[str, dict[str, object]] = {
+    "options": {"music_drive_task": "none"},
+    "schema": {
+        "music_drive": "device(subsystem=block)?",
+        "music_drive_task": "list(none|backup|verify|restore|repair)",
+    },
+}
+# Keys this app sets when upstream has no opinion; upstream's value wins when
+# it appears. udev lets the wrapper read the drive's label and type, and
+# kernel_modules loads its filesystem driver by name.
+EXTRA_KEYS: dict[str, object] = {"udev": True, "kernel_modules": True}
 
 # Accept header that asks a registry for the multi-arch index rather than one
 # platform's manifest, so the digest pinned below covers amd64 and aarch64.
@@ -212,11 +228,19 @@ def merge_config(ours: str, upstream: str) -> str:
             # append rather than own the key, so upstream's own additions to
             # the list keep arriving with the next sync
             value = list(value) + [item for item in extra if item not in value]
+        extra_items = EXTRA_DICT_ITEMS.get(key)
+        if extra_items and isinstance(value, dict):
+            value = {**value, **{k: v for k, v in extra_items.items() if k not in value}}
         merged[key] = value
     for key, extra in EXTRA_LIST_ITEMS.items():
         # upstream dropped the key entirely; this app's entries still apply
         if key not in merged:
             merged[key] = list(extra)
+    for key, extra_items in EXTRA_DICT_ITEMS.items():
+        if key not in merged:
+            merged[key] = dict(extra_items)
+    for key, default in EXTRA_KEYS.items():
+        merged.setdefault(key, default)
     header = "\n".join(line for line in ours.splitlines() if line.startswith("#"))
     body = yaml.safe_dump(merged, sort_keys=False, allow_unicode=True, width=100)
     # the version stays a quoted string for the release scripts

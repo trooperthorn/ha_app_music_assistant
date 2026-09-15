@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -86,6 +87,24 @@ def test_merge_config_appends_this_apps_backup_exclusions() -> None:
     assert excluded == ["cache.db", "collage_images/*", "webrtc_private_key.pem"]
     # and a second pass over the result does not duplicate it
     assert sync.merge_config(merged, upstream) == merged
+
+
+def test_merge_config_keeps_the_drive_option_and_privileges() -> None:
+    upstream = (
+        "name: Music Assistant\nslug: music_assistant\nmap:\n- media:rw\n"
+        "options:\n  log_level: info\nschema:\n  log_level: list(debug|info)\n"
+    )
+    ours = 'name: Ours\nslug: music_assistant_lm\nversion: "1"\n'
+    merged = yaml.safe_load(sync.merge_config(ours, upstream))
+    assert merged["map"] == ["media:rw", "share:rw"]
+    assert merged["options"] == {"log_level": "info", "music_drive_task": "none"}
+    assert merged["schema"]["music_drive"] == "device(subsystem=block)?"
+    assert merged["schema"]["log_level"] == "list(debug|info)"
+    assert merged["udev"] is True
+    assert merged["kernel_modules"] is True
+    # upstream's own value for a key we only default wins
+    merged = yaml.safe_load(sync.merge_config(ours, upstream + "udev: false\n"))
+    assert merged["udev"] is False
 
 
 def test_merge_config_adds_the_key_when_upstream_drops_it() -> None:
