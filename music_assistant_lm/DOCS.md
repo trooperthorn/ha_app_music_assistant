@@ -27,6 +27,13 @@ if the report lists files, `restore` (copies them back from the backup).
 Each task runs once at the next start and the log tells you when to set
 the option back to `none`.
 
+The fork frontend's Duplicates page can move lesser copies and orphaned CUE
+sheets into a trash folder on the drive (`.music-assistant-trash/` at the
+root of the provider's folder, keeping each file's path). That is a rename
+on the same drive: nothing is copied and nothing is deleted until you empty
+the trash from that page, and every file can be restored from there until
+then. It does not need the backup task.
+
 The library manager is at `/library` in the app's own interface ("Library
 manager" in the navigation). Its user guide lives in the frontend fork:
 https://github.com/trooperthorn/HA_int_MA-UI/blob/main/docs/LIBRARY-MANAGER.md

@@ -86,6 +86,18 @@ Today there are four:
   calls it from the Filesystem provider's setup and reconfigure flows, so
   the path is picked rather than typed. The server has no directory
   listing of its own outside a configured provider.
+- `music_trash.py`: four `music/trash/*` commands on the music controller
+  (`move`, `list`, `restore`, `empty`) that give the fork frontend's
+  Duplicates page one reversible step past removing a library row. `move`
+  renames a file of a Filesystem provider into `.music-assistant-trash/` at
+  the root of that provider's folder, keeping its relative path; same
+  filesystem, so no copy is made and the sync skips the dot folder. `restore`
+  renames it back and refuses when the original path is taken again. `empty`
+  is the only command that deletes anything. Every path is checked with the
+  server's own `is_safe_path` against the provider's folder, the provider
+  must have a `base_path` (the Filesystem family), and the commands carry
+  the scope that already guards provider mappings (`LIBRARY_MANAGE`). The
+  server itself never touches files on disk.
 
 `tests/test_patches.py` applies each script to a copy of the upstream modules
 kept under `tests/fixtures/` and pins the copies to the server version in the
