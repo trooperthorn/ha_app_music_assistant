@@ -2,6 +2,7 @@
 
 ## 2026-09-15
 
+- Fork frontend v2026.09.14.9 -> v2026.09.15.1
 - Fork frontend v2026.09.14.8 -> v2026.09.14.9
 - Upstream app config.yaml refreshed
 - Upstream app translations/en.yaml refreshed
