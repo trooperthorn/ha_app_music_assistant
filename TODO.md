@@ -63,19 +63,66 @@ Documented here so they can be revisited if wrong.
   actually-left-docked bar was meant, open a follow-up issue in
   `HA_int_MA-UI` with a screenshot.
 
-## 3. Explicitly deferred (not started)
+## 3. Deferred features — scoped 2026-09-19, split by feasibility
 
 Per prior scoping conversation, these are bigger features, not workflow
-fixes, and were intentionally left out of the 2026-09-19 UI fix pass:
+fixes, and were intentionally left out of the 2026-09-19 UI fix pass. A
+scoping pass on 2026-09-19 found both need to be split; see below.
 
-- Import Spotify playlists into a local playlist file (MusicBrainz-assisted
-  matching).
-- Equalizer control (including an equalizer bar option) plus streaming
-  quality/delay settings.
+### 3a. Import Spotify playlists into a local playlist file
 
-Both should get their own scoping pass and PR(s) in `HA_int_MA-UI` (and
-possibly `ha_app_music_assistant` if server-side config is needed for the
-equalizer/streaming settings) when prioritized.
+**Blocked upstream on `music-assistant-server`.** `HA_int_MA-UI` already has
+generic playlist-import/matching RPCs (`API.importPlaylist`,
+`API.migratePlaylist` with `PlaylistMatchPolicy` —
+`src/plugins/api/index.ts`), but those take an m3u file as input, not "read
+playlist directly from a connected provider." No RPC exists anywhere to list
+or read a user's Spotify playlists by ID; that has to be added to
+`music-assistant-server`'s Spotify provider first, then consumed here. Not
+safely buildable as an `ha_app_music_assistant` patch either — the existing
+patches (`play_source_steer.py`, `sendspin_opus_bitrate.py`) are narrow,
+single-anchor-point edits; a Spotify playlist-read integration (OAuth scope,
+pagination, rate limits, track matching) is a much larger surface that would
+fight every upstream Spotify provider release.
+
+**Needs verification in `music-assistant-server` (Sean, in progress):**
+- Does the Spotify provider already fetch the user's own playlists
+  internally for any reason, even if not exposed over RPC today?
+- Does MA's Spotify integration use a shared app client ID, or does each
+  user need their own Spotify developer app? This determines feasibility
+  under Spotify's Extension Quota Mode restrictions on new API access.
+
+**Status**: blocked, pending upstream investigation.
+
+### 3b. Equalizer + streaming quality + delay settings
+
+Split into three independent pieces by actual buildability:
+
+- **EQ quick-access button (buildable now, UI-only)**: the full DSP/EQ
+  system already exists server-side and in the frontend
+  (`src/views/settings/EditPlayerDsp.vue`, `src/components/dsp/DSPParametricEQ.vue`
+  and siblings), including a visual EQ-style component
+  (`src/components/MiniEqualizer.vue`, currently just a decorative waveform
+  on queue rows, not a control). The gap is only a quick-access entry point:
+  there's no EQ button on the player OSD/controls, only a path buried in
+  Settings → per-player → DSP. **In progress in `HA_int_MA-UI`** as of
+  2026-09-19: adding an OSD button that opens the existing DSP editor.
+- **Streaming quality control**: `AudioQuality` (`LOW/STANDARD/LOSSLESS/HI_RES`)
+  and stream format fields already exist but are read-only/diagnostic
+  today. One precedent patch,
+  `music_assistant_lm/patches/sendspin_opus_bitrate.py` in this repo, adds a
+  per-player bitrate setting but only for Sendspin/Opus players. Needs
+  checking whether `music-assistant-server`'s RPC already accepts a
+  quality/output-format override more generically (then it's UI-only, add a
+  field to `EditPlayerOptions.vue`) or needs a new patch modeled on the
+  Sendspin one for other player types. **Status: needs upstream server
+  investigation before scoping further.**
+- **Playback delay/sync compensation**: no capability found anywhere in the
+  frontend's API model (no `sync_offset`/`group_delay`/`latency_comp`
+  fields). Likely a genuine gap in `music-assistant-server` too, not just
+  unexposed. **Status: needs upstream server investigation** — flag during
+  the same `music-assistant-server` review as 3a and the streaming-quality
+  question above, since all three are "does the server already do more than
+  it exposes over RPC" questions.
 
 ## Related PRs/issues
 
