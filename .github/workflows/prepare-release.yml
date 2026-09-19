@@ -160,5 +160,21 @@ jobs:
             gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --title "$TITLE" --body "$BODY"
           fi
-          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch \
-            --repo "$GITHUB_REPOSITORY"
+          # Auto-merge can only be enabled once GitHub has registered the
+          # PR's required checks; right after gh pr create/edit that has not
+          # always happened yet, and enablePullRequestAutoMerge fails with
+          # "Pull request is in unstable status". Retry with a short sleep
+          # instead of failing outright, so a green PR never silently sits
+          # without auto-merge enabled -- but still fail loudly if every
+          # attempt is exhausted, so a genuine problem is not hidden.
+          ATTEMPTS=6
+          DELAY=10
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if gh pr merge "$PR_NUMBER" --auto --squash --delete-branch --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            echo "::warning::Enabling auto-merge on PR #$PR_NUMBER failed (attempt $attempt/$ATTEMPTS); checks may not have registered yet, retrying in ${DELAY}s."
+            sleep "$DELAY"
+          done
+          echo "::error::Failed to enable auto-merge on PR #$PR_NUMBER after $ATTEMPTS attempts. The PR is open but will not auto-merge; enable it manually with 'gh pr merge $PR_NUMBER --auto --squash --delete-branch --repo $GITHUB_REPOSITORY' or investigate why it stays unstable."
+          exit 1
