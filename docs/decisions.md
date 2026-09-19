@@ -293,3 +293,48 @@ identical to upstream's user-context-aware check and is recorded as the
 plugin's weakest remaining point in
 [playlist-bridge-vs-upstream.md](playlist-bridge-vs-upstream.md), rather
 than presented as equivalent.
+
+## `browse_path` moves from an anchor patch to a plugin (2026-09-19)
+
+`browse_path.py` used to be an anchor patch: it string-replaced exact lines
+in the installed `music_assistant.controllers.config.providers` module to
+add a `config/providers/browse_path` command listing the folders under the
+app's music roots for the fork frontend's folder picker. Reading the code
+it injected made clear the anchor bought nothing: the handler had zero
+`self.` references and needed nothing from that controller beyond a place
+to be registered from. The anchor's only real job was delivery, and an
+anchor is the fragile way to deliver something with no dependency on the
+file it edits -- any upstream reshape of that module would break the build
+even though the feature itself has nothing to do with the shape of that
+module.
+
+`folder_browser.py` replaces it with a plugin provider, following the same
+shape `playlist_bridge.py` established: a `DOMAIN` constant, string
+constants for `manifest.json`, `strings.json` and `__init__.py`, a
+`locate()` that resolves the installed `music_assistant.providers` package,
+a `write_provider()` that compile/json-validates before writing, and a
+`main()` accepting an optional path override for tests. Music Assistant
+discovers providers by listing directories under its providers path at
+runtime, not through a registry, so this is purely additive and cannot
+conflict with a future upstream diff the way the anchor could.
+
+The command name (`config/providers/browse_path`) and required scope
+(`Scope.CONFIG_PROVIDERS_WRITE`) carried over unchanged, so nothing
+downstream had to move: `mass.register_api_command` accepts any command
+string with no namespace ownership, so the fork frontend's folder picker
+needed no change at all. The manifest sets `builtin: true` and
+`allow_disable: false`, because this backs the Filesystem provider's
+folder-picker setup flow and a user disabling it would silently break that
+flow rather than fail loudly.
+
+`register_api_command` raises `RuntimeError` if a command is already
+registered, so the old anchor patch and this plugin can never both ship --
+duplicate registration would fail the server at load. That same tripwire is
+also what protects this plugin going forward: if a future upstream release
+ever adds its own `config/providers/browse_path` command, loading this
+plugin on top of it fails loudly instead of silently shadowing or
+conflicting with upstream's own implementation.
+
+This is step 1 of moving the remaining anchor-shaped-but-anchor-independent
+patches to plugins; `music_trash.py`'s `library_trash` migration is next
+and follows this same template.

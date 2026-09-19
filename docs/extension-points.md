@@ -3,13 +3,14 @@
 `music_assistant_lm/patches/*.py` has two genuinely different shapes:
 
 - **Anchor edits** (`hass_source_select.py`, `play_source_steer.py`,
-  `sendspin_opus_bitrate.py`, `browse_path.py`, `music_trash.py`): rewrite an
+  `sendspin_opus_bitrate.py`, `music_trash.py`): rewrite an
   exact line in an already-existing installed file. Necessary when the
   behavior lives inside a file we don't own, but fragile by construction —
   every server release that reshapes that file breaks the anchor, and the
   build (and the sync PR) fails loudly rather than shipping silently broken.
-- **New providers** (`playlist_bridge.py`, see `docs/decisions.md`'s
-  "Migrate Playlist ships as a new provider" entry): drop a brand-new,
+- **New providers** (`playlist_bridge.py`, `folder_browser.py`, see
+  `docs/decisions.md`'s "Migrate Playlist ships as a new provider" and
+  "browse_path moves from an anchor patch to a plugin" entries): drop a brand-new,
   self-contained directory under the installed `music_assistant/providers/`
   package. Music Assistant discovers providers by listing directories at
   runtime (`os.listdir(PROVIDERS_PATH)` in `music_assistant/mass.py`), not
@@ -102,7 +103,9 @@ playlists, new commands plus event subscriptions), `music_quiz`,
 `loaded_in_mass()` + `register_api_command` + `get_config_entries()`.
 
 **What we've already built this way**: `playlist_bridge` (cross-provider
-playlist migration, see `docs/decisions.md`).
+playlist migration, see `docs/decisions.md`), `folder_browser` (the
+`config/providers/browse_path` command backing the Filesystem provider's
+folder picker, migrated from an anchor patch, see `docs/decisions.md`).
 
 **Where this could extend HA_int_MA-UI further, without a server patch**:
 any "the frontend needs the server to do X" request that isn't a change to

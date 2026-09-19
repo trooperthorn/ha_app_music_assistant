@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "music_assistant_lm" / "patches"))
 
-import browse_path as browse  # noqa: E402
+import folder_browser as folders  # noqa: E402
 import hass_source_select as patch  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
@@ -38,7 +38,6 @@ STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_4.py"
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
-CONFIG_PROVIDERS = ROOT / "tests" / "fixtures" / "config_providers_2_10_4.py"
 
 
 def test_the_fixture_matches_the_pinned_server_release() -> None:
@@ -221,36 +220,59 @@ def test_opus_bitrate_main_patches_all_three_once(tmp_path: Path) -> None:
     assert [target.read_bytes() for target in targets] == first
 
 
-def test_browse_path_adds_a_scoped_command_inside_the_roots() -> None:
-    patched = browse.apply(CONFIG_PROVIDERS.read_text(encoding="utf-8"))
+def test_folder_browser_manifest_and_module_are_valid() -> None:
+    import json
 
-    tree = ast.parse(patched)
-    methods = {
-        node.name
-        for cls in tree.body
-        if isinstance(cls, ast.ClassDef)
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-    assert "get_provider_config_entries" in methods
+    manifest = json.loads(folders.MANIFEST_JSON)
+    assert manifest["type"] == "plugin"
+    assert manifest["domain"] == "folder_browser"
+    assert manifest["codeowners"] == ["@trooperthorn"]
+    # this backs the Filesystem provider's folder-picker setup flow; a user
+    # disabling it would silently break that flow, so it must not be
+    # disableable
+    assert manifest["builtin"] is True
+    assert manifest["allow_disable"] is False
+    compile(folders.INIT_PY, "folder_browser/__init__.py", "exec")
+
+    tree = ast.parse(folders.INIT_PY)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FolderBrowserProvider")
+    methods = {node.name for node in provider.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
     assert "browse_path" in methods
-    assert 'api_command("config/providers/browse_path", required_scope=Scope.CONFIG_PROVIDERS_WRITE)' in patched
-    assert "from music_assistant.helpers.security import is_safe_path" in patched
-    assert 'entry.name.startswith(".")' in patched
-    assert "folders[:500]" in patched
-    assert browse.apply(patched) == patched
-    with pytest.raises(SystemExit, match="anchor found 0 times"):
-        browse.apply("class ProvidersController:\n    pass\n")
+    assert "loaded_in_mass" in methods
+    assert "unload" in methods
+
+    # the command name and scope are a contract with the fork frontend's
+    # folder picker; carried over unchanged from the retired browse_path.py
+    # anchor patch
+    assert '"config/providers/browse_path"' in folders.INIT_PY
+    assert "required_scope=Scope.CONFIG_PROVIDERS_WRITE" in folders.INIT_PY
+    assert "from music_assistant.helpers.security import is_safe_path" in folders.INIT_PY
+    # the same roots, safety check and listing behavior as the anchor patch
+    assert '{"path": "/music", "label": "Music drive"}' in folders.INIT_PY
+    assert '{"path": "/media", "label": "Media"}' in folders.INIT_PY
+    assert '{"path": "/share", "label": "Share"}' in folders.INIT_PY
+    assert 'entry.name.startswith(".")' in folders.INIT_PY
+    assert "folders[:500]" in folders.INIT_PY
+
+    strings = json.loads(folders.STRINGS_JSON)
+    assert strings["manifest"]["description"] == manifest["description"]
 
 
-def test_browse_path_main_patches_the_module_once(tmp_path: Path) -> None:
-    target = tmp_path / "providers.py"
-    target.write_text(CONFIG_PROVIDERS.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
-    assert browse.main(["browse_path.py", str(target)]) == 0
-    once = target.read_bytes()
-    assert b"\r\n" not in once
-    assert browse.main(["browse_path.py", str(target)]) == 0
-    assert target.read_bytes() == once
+def test_folder_browser_main_writes_once_and_is_idempotent(tmp_path: Path) -> None:
+    providers_dir = tmp_path / "providers"
+    providers_dir.mkdir()
+    assert folders.main(["folder_browser.py", str(providers_dir)]) == 0
+    provider_dir = providers_dir / "folder_browser"
+    manifest_once = (provider_dir / "manifest.json").read_bytes()
+    strings_once = (provider_dir / "strings.json").read_bytes()
+    init_once = (provider_dir / "__init__.py").read_bytes()
+    assert b"\r\n" not in manifest_once
+    assert b"\r\n" not in strings_once
+    assert b"\r\n" not in init_once
+    assert folders.main(["folder_browser.py", str(providers_dir)]) == 0
+    assert (provider_dir / "manifest.json").read_bytes() == manifest_once
+    assert (provider_dir / "strings.json").read_bytes() == strings_once
+    assert (provider_dir / "__init__.py").read_bytes() == init_once
 
 
 def test_main_writes_once_and_keeps_line_endings(tmp_path: Path) -> None:

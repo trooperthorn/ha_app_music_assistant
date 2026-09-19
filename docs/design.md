@@ -77,15 +77,18 @@ Today there are four:
   web player uses it as the lower rungs of its adaptive mode and from the
   phone layout's menu. Its fixtures are pinned to the aiosendspin release
   the server pins (9.1.1 for 2.10.3).
-- `browse_path.py`: a `config/providers/browse_path` command on the
-  providers config controller that lists the folders under the app's
-  music roots (`/music`, the drive this app mounts; `/media`; `/share`),
-  each path checked with the server's own `is_safe_path` against those
-  roots so nothing else in the container can be listed, under the same
-  scope that saves a provider config. The fork frontend's folder picker
-  calls it from the Filesystem provider's setup and reconfigure flows, so
-  the path is picked rather than typed. The server has no directory
-  listing of its own outside a configured provider.
+- `folder_browser.py`: a plugin provider registering a
+  `config/providers/browse_path` command that lists the folders under the
+  app's music roots (`/music`, the drive this app mounts; `/media`;
+  `/share`), each path checked with the server's own `is_safe_path` against
+  those roots so nothing else in the container can be listed, under the
+  same scope that saves a provider config. The fork frontend's folder
+  picker calls it from the Filesystem provider's setup and reconfigure
+  flows, so the path is picked rather than typed. The server has no
+  directory listing of its own outside a configured provider. Originally an
+  anchor patch on the providers config controller; moved to a plugin
+  because the handler had no dependency on that controller (see
+  `docs/decisions.md`).
 - `music_trash.py`: four `music/trash/*` commands on the music controller
   (`move`, `list`, `restore`, `empty`) that give the fork frontend's
   Duplicates page one reversible step past removing a library row. `move`
