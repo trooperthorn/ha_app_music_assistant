@@ -2,7 +2,7 @@
 # scripts/sync_upstream.py refreshes every key except name, version, slug,
 # description and url, which are this app's own.
 name: Music Assistant (Library Manager)
-version: "2026.09.19.5"
+version: "2026.09.19.6"
 slug: music_assistant_lm
 description: Music Assistant server with the trooperthorn library-manager frontend (desktop source tree,
   browser strip, dense track grid, queue and selected-item panes). Tracks the upstream server release.
