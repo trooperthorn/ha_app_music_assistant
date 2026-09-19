@@ -122,6 +122,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
 )
 
+from music_assistant.helpers.security import is_safe_name
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.models.plugin import PluginProvider
 
@@ -175,23 +176,52 @@ class PlaylistBridgeProvider(PluginProvider):
         provider instance outside the caller's own configuration. This is
         the fix for the scope-escape bug flagged on the closed upstream PR.
         """
-        for provider in self.mass.music.providers:
-            if provider.instance_id != destination_provider and provider.domain != destination_provider:
-                continue
-            if not isinstance(provider, MusicProvider):
-                msg = f"{destination_provider} is not a music provider"
-                raise InvalidDataError(msg)
-            # mirror the core create_playlist check exactly: PLAYLIST_CREATE is
-            # deprecated in favour of PLAYLIST_CREATE_TRACKS but some providers
-            # (filesystem_local among them) still declare only the old one, and
-            # the core controller accepts either for a track playlist. Requiring
-            # the new flag on its own would reject destinations core allows.
-            if not any(feature in provider.supported_features for feature in PLAYLIST_CREATE_FEATURES):
-                msg = f"{provider.name} does not support creating playlists"
-                raise InvalidDataError(msg)
-            return provider
-        msg = f"{destination_provider} is not one of your configured providers"
-        raise ProviderUnavailableError(msg)
+        # mirrors upstream #5989: self.mass.music.providers only applies user
+        # scope filtering, so an unavailable instance would otherwise be
+        # selected here and only fail once the background task actually
+        # runs. Exclude unavailable instances before matching, preserving
+        # instance_id-then-domain precedence.
+        available_providers = [item for item in self.mass.music.providers if item.available]
+        provider = next(
+            (item for item in available_providers if item.instance_id == destination_provider),
+            None,
+        ) or next(
+            (item for item in available_providers if item.domain == destination_provider),
+            None,
+        )
+        if provider is None:
+            msg = f"{destination_provider} is not one of your configured providers"
+            raise ProviderUnavailableError(msg)
+        if not isinstance(provider, MusicProvider):
+            msg = f"{destination_provider} is not a music provider"
+            raise InvalidDataError(msg)
+        # mirrors upstream #5989: migration destinations are limited to Music
+        # Assistant itself or an actual streaming provider, so a migration
+        # cannot silently duplicate into a fixed local catalog it doesn't own.
+        if provider.domain != "builtin" and not provider.is_streaming_provider:
+            msg = "Playlists can only be migrated to Music Assistant or a streaming provider"
+            raise InvalidDataError(msg)
+        # mirror the core create_playlist check exactly: PLAYLIST_CREATE is
+        # deprecated in favour of PLAYLIST_CREATE_TRACKS but some providers
+        # (filesystem_local among them) still declare only the old one, and
+        # the core controller accepts either for a track playlist. Requiring
+        # the new flag on its own would reject destinations core allows.
+        if not any(feature in provider.supported_features for feature in PLAYLIST_CREATE_FEATURES):
+            msg = f"{provider.name} does not support creating playlists"
+            raise InvalidDataError(msg)
+        # mirrors upstream #5989: creating a playlist is not enough, the
+        # destination must also support editing it afterwards to add tracks.
+        if ProviderFeature.PLAYLIST_TRACKS_EDIT not in provider.supported_features:
+            msg = f"{provider.name} does not support editing playlists"
+            raise InvalidDataError(msg)
+        # mirrors upstream #5989: some providers can create playlists but
+        # cannot actually serve track-type media (e.g. podcast/audiobook-only
+        # providers), so reject those explicitly rather than fail deep inside
+        # the migration task.
+        if MediaType.TRACK not in provider.supported_media_types:
+            msg = f"{provider.name} does not support track playlists"
+            raise InvalidDataError(msg)
+        return provider
 
     async def migrate_playlist(
         self,
@@ -206,22 +236,58 @@ class PlaylistBridgeProvider(PluginProvider):
         :param db_playlist_id: Library playlist id to migrate.
         :param destination_provider: Instance id or domain of a provider the
             caller is configured to use.
-        :param match_policy: Accepted for frontend compatibility. The
-            already-merged upstream matching pipeline this plugin calls into
-            does not yet expose a confidence knob, so every policy value
-            currently gets the same best-effort metadata match; a real
-            policy distinction is a follow-up once upstream's matcher
-            exposes one, not something this plugin should fabricate.
+        :param match_policy: ACCEPTED FOR FRONTEND REQUEST-SHAPE COMPATIBILITY
+            ONLY. IT HAS NO EFFECT IN THIS BRIDGE. Upstream's own
+            ``migrate_playlist`` (server PR #5989, shipping in server
+            2.11.0) implements this for real as a typed
+            ``PlaylistMatchPolicy`` defaulting to ``SAME_RECORDING``. The
+            already-merged matching pipeline this plugin calls into
+            (``import_playlist`` / ``match_imported_playlist_tracks``)
+            exposes no confidence knob, so every value passed here currently
+            produces the same best-effort metadata match regardless of what
+            the caller asked for. Do not treat this parameter as honoured;
+            a real policy distinction only exists once the server pin
+            reaches 2.11.0, at which point this bridge is retired (see
+            docs/playlist-bridge-vs-upstream.md). Disabling the policy
+            selector in the frontend UI is a separate change in a different
+            repository, not something this plugin can or should fake.
         :param name: Optional name for the new playlist; defaults to the
             source playlist's name.
         """
         # resolve and validate before scheduling any work
         destination = self._resolve_destination(destination_provider)
         playlist = await self.mass.music.playlists.get_library_item(int(db_playlist_id))
-        del match_policy  # accepted, not yet actionable; see docstring
+        # mirrors upstream #5989: a dynamic (smart) playlist has no fixed
+        # track list to export, so migrating it does not make sense.
+        if playlist.is_dynamic:
+            msg = "Dynamic playlists can not be migrated"
+            raise InvalidDataError(msg)
+        # mirrors upstream #5989's intent (there enforced via
+        # allowed_provider_instances / get_current_user): the SOURCE
+        # playlist's own provider must also be one of the caller's
+        # available, configured providers, not merely the destination.
+        # self.mass.music.providers is already scoped to the caller for
+        # this fork's purposes (see _resolve_destination above); "builtin"
+        # is always allowed since library playlists live there regardless
+        # of provider scope.
+        available_instance_ids = {p.instance_id for p in self.mass.music.providers if p.available}
+        if not any(
+            mapping.provider_domain == "builtin" or mapping.provider_instance in available_instance_ids
+            for mapping in playlist.provider_mappings
+        ):
+            msg = f"{playlist.name} is not available from one of your configured providers"
+            raise ProviderUnavailableError(msg)
+        destination_name = name or playlist.name
+        # mirrors upstream #5989: validate the destination playlist name the
+        # same way core's own create_playlist path does, rejecting path
+        # separators and traversal components.
+        if not is_safe_name(destination_name):
+            msg = f"{destination_name} is not a valid Playlist name"
+            raise InvalidDataError(msg)
+        del match_policy  # accepted, not honoured; see docstring above
         return self.mass.tasks.run_background_task(
             name=f"Migrate playlist {playlist.name} to {destination.name}",
-            handler=lambda: self._migrate_playlist(playlist, destination, name),
+            handler=lambda: self._migrate_playlist(playlist, destination, destination_name),
             translation_key="playlist_bridge_migrate",
             translation_owner=self.translation_owner,
             translation_args=[playlist.name, destination.name],
@@ -236,7 +302,7 @@ class PlaylistBridgeProvider(PluginProvider):
         )
 
     async def _migrate_playlist(
-        self, playlist: Playlist, destination: MusicProvider, name: str | None
+        self, playlist: Playlist, destination: MusicProvider, destination_name: str
     ) -> None:
         """Do the actual export, match and cross-provider write."""
         builtin = self.mass.get_provider("builtin")
@@ -274,7 +340,7 @@ class PlaylistBridgeProvider(PluginProvider):
         # create_playlist is the same safe, tested path the frontend already
         # uses for manual playlist creation (music/playlists/create_playlist)
         new_playlist = await self.mass.music.playlists.create_playlist(
-            name or playlist.name, [MediaType.TRACK], destination.instance_id
+            destination_name, [MediaType.TRACK], destination.instance_id
         )
         new_prov_mapping = next(
             (m for m in new_playlist.provider_mappings if m.provider_instance == destination.instance_id),

@@ -49,16 +49,31 @@ def test_the_fixture_matches_the_pinned_server_release() -> None:
     )
 
 
-def _pinned_server_version() -> tuple[int, ...]:
-    """Parse the Dockerfile's pinned SERVER_VERSION as a tuple of ints.
+def _parse_server_version(dockerfile_text: str) -> tuple[int, ...]:
+    """Parse a Dockerfile's pinned SERVER_VERSION as a tuple of ints.
 
     CalVer-ish MAJOR.MINOR.PATCH, but tolerate a trailing dev/beta suffix
-    (e.g. "2.11.0b1") by only parsing the leading digit groups.
+    (e.g. "2.11.0b1") by only parsing the leading digit groups. Split out
+    from `_pinned_server_version` so the parsing/compare logic itself can be
+    unit tested against synthetic input without touching the real Dockerfile.
     """
-    dockerfile = (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
-    match = re.search(r'ARG SERVER_VERSION="(\d+)\.(\d+)\.(\d+)', dockerfile)
+    match = re.search(r'ARG SERVER_VERSION="(\d+)\.(\d+)\.(\d+)', dockerfile_text)
     assert match, "could not find ARG SERVER_VERSION=\"MAJOR.MINOR.PATCH...\" in the Dockerfile"
     return tuple(int(part) for part in match.groups())
+
+
+def _pinned_server_version() -> tuple[int, ...]:
+    """Parse the real Dockerfile's pinned SERVER_VERSION as a tuple of ints."""
+    dockerfile = (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    return _parse_server_version(dockerfile)
+
+
+def test_parse_server_version_compares_correctly_around_the_2_11_boundary() -> None:
+    """The tripwire's version compare must pass at 2.10.5 and fail at 2.11.0."""
+    assert _parse_server_version('ARG SERVER_VERSION="2.10.5"') < (2, 11, 0)
+    assert _parse_server_version('ARG SERVER_VERSION="2.11.0"') >= (2, 11, 0)
+    # a trailing dev/beta suffix must not break parsing
+    assert _parse_server_version('ARG SERVER_VERSION="2.11.0b1"') >= (2, 11, 0)
 
 
 def test_playlist_bridge_is_retired_once_the_server_pin_reaches_2_11() -> None:
@@ -82,10 +97,13 @@ def test_playlist_bridge_is_retired_once_the_server_pin_reaches_2_11() -> None:
     """
     assert _pinned_server_version() < (2, 11, 0), (
         "SERVER_VERSION reached 2.11.0+: upstream server#5989 now ships "
-        "cross-provider playlist migration natively. Retire the "
-        "playlist_bridge plugin (music_assistant_lm/patches/playlist_bridge.py "
-        "and its Dockerfile wiring) and revert api.migratePlaylist() in "
-        "trooperthorn/HA_int_MA-UI back to music/playlists/migrate_playlist."
+        "cross-provider playlist migration natively. Read "
+        "docs/playlist-bridge-vs-upstream.md for the full keep/modify/drop "
+        "contract before doing anything else -- the pre-decided verdict "
+        "there is DROP. Retire the playlist_bridge plugin "
+        "(music_assistant_lm/patches/playlist_bridge.py and its Dockerfile "
+        "wiring) and revert api.migratePlaylist() in trooperthorn/HA_int_MA-UI "
+        "back to music/playlists/migrate_playlist."
     )
 
 
@@ -438,9 +456,30 @@ def test_playlist_bridge_manifest_and_module_are_valid() -> None:
     # translation key never resolves
     assert "translation_owner=self.translation_owner" in bridge.INIT_PY
 
+    # guards ported from upstream #5989 -- see the module docstring and the
+    # inline "mirrors upstream #5989" comments for why each one exists
+    assert "item.available" in bridge.INIT_PY  # exclude unavailable providers before matching
+    assert "is_dynamic" in bridge.INIT_PY  # reject dynamic source playlists
+    assert "is_streaming_provider" in bridge.INIT_PY  # reject non-streaming, non-builtin destinations
+    assert "PLAYLIST_TRACKS_EDIT" in bridge.INIT_PY  # destination must support editing playlists
+    assert "supported_media_types" in bridge.INIT_PY  # destination must support track playlists
+    assert "is_safe_name" in bridge.INIT_PY  # validate the destination playlist name
+    assert "from music_assistant.helpers.security import is_safe_name" in bridge.INIT_PY
+    # the source playlist's own provider must also be available/allowed, not
+    # just the destination
+    assert "playlist.provider_mappings" in bridge.INIT_PY
+
     strings = json.loads(bridge.STRINGS_JSON)
     assert strings["manifest"]["description"] == manifest["description"]
     assert strings["background_task"]["playlist_bridge_migrate"] == "Migrate playlist {0} to {1}"
+
+
+def test_playlist_bridge_match_policy_docstring_states_it_has_no_effect() -> None:
+    """match_policy must never be presented as honoured; see docs/playlist-bridge-vs-upstream.md."""
+    assert "HAS NO EFFECT IN THIS BRIDGE" in bridge.INIT_PY
+    assert "PlaylistMatchPolicy" in bridge.INIT_PY
+    assert "server PR #5989" in bridge.INIT_PY
+    assert "2.11.0" in bridge.INIT_PY
 
 
 def test_playlist_bridge_main_writes_once_and_is_idempotent(tmp_path: Path) -> None:

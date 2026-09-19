@@ -261,3 +261,35 @@ to do: retire the `playlist_bridge` plugin (this includes its patch script,
 Dockerfile wiring and `docs/upstream-review.md` references), and revert
 `api.migratePlaylist()` in `trooperthorn/HA_int_MA-UI` back to calling
 `music/playlists/migrate_playlist` directly.
+
+The full side-by-side against upstream's merged implementation, and the
+pre-decided verdict for that retirement (drop, not keep or modify), is in
+[playlist-bridge-vs-upstream.md](playlist-bridge-vs-upstream.md).
+
+## `playlist_bridge` guards ported from upstream #5989 (2026-09-19)
+
+Upstream's merged `migrate_playlist` (server PR #5989) carries validation
+this plugin initially lacked: excluding unavailable provider instances
+before matching, rejecting dynamic source playlists, rejecting destinations
+that are neither `builtin` nor a streaming provider, requiring
+`PLAYLIST_TRACKS_EDIT` and `MediaType.TRACK` support on the destination, and
+validating the destination playlist name with `is_safe_name`. All six were
+verified against the real, pinned 2.10.4 server source (not just upstream's
+`dev` branch) before being ported: `provider.available`,
+`provider.is_streaming_provider`, `provider.supported_media_types`,
+`ProviderFeature.PLAYLIST_TRACKS_EDIT`, `Playlist.is_dynamic`, and
+`is_safe_name` (importable from `music_assistant.helpers.security` in
+2.10.4, same as upstream's `dev`) all exist unchanged in 2.10.4. None had to
+be skipped.
+
+Upstream also validates that the *source* playlist's own provider is within
+the caller's allowed, available instances, using `get_current_user()` and an
+explicit `allowed_provider_instances` set built from the request's
+authorization context. This plugin approximates the same intent with what
+it already has: it checks whether any of the source playlist's provider
+mappings are on the caller's own `self.mass.music.providers` list (already
+scope-filtered for the destination check) or are `builtin`. This is not
+identical to upstream's user-context-aware check and is recorded as the
+plugin's weakest remaining point in
+[playlist-bridge-vs-upstream.md](playlist-bridge-vs-upstream.md), rather
+than presented as equivalent.
