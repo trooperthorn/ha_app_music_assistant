@@ -18,19 +18,19 @@ import play_source_steer as steer  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 
 # the modules exactly as the pinned server release ships them
-UPSTREAM = ROOT / "tests" / "fixtures" / "hass_player_2_10_3.py"
-QUEUE_LOADER = ROOT / "tests" / "fixtures" / "queue_loader_2_10_3.py"
-STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_3.py"
-# aiosendspin as server 2.10.3 pins it (aiosendspin[server]==9.1.1)
+UPSTREAM = ROOT / "tests" / "fixtures" / "hass_player_2_10_4.py"
+QUEUE_LOADER = ROOT / "tests" / "fixtures" / "queue_loader_2_10_4.py"
+STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_4.py"
+# aiosendspin as server 2.10.4 pins it (aiosendspin[server]==9.1.1)
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
-SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_3.py"
-CONFIG_PROVIDERS = ROOT / "tests" / "fixtures" / "config_providers_2_10_3.py"
+SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
+CONFIG_PROVIDERS = ROOT / "tests" / "fixtures" / "config_providers_2_10_4.py"
 
 
 def test_the_fixture_matches_the_pinned_server_release() -> None:
     dockerfile = (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
-    assert 'ARG SERVER_VERSION="2.10.3"' in dockerfile, (
+    assert 'ARG SERVER_VERSION="2.10.4"' in dockerfile, (
         "the server moved; refresh the tests/fixtures/*_<version>.py copies from the new "
         "release and re-check the anchors in music_assistant_lm/patches/*.py"
     )
@@ -191,7 +191,7 @@ def test_main_writes_once_and_keeps_line_endings(tmp_path: Path) -> None:
 
 # music_trash: the methods are exercised for real by lifting the patched
 # class body onto a stub with the two things the code touches
-MUSIC_CONTROLLER = ROOT / "tests" / "fixtures" / "music_controller_2_10_3.py"
+MUSIC_CONTROLLER = ROOT / "tests" / "fixtures" / "music_controller_2_10_4.py"
 
 
 def _trash_controller(base: Path):
