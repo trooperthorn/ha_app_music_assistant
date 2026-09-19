@@ -56,8 +56,19 @@ MANIFEST_JSON = """\
   "requirements": [],
   "documentation": "https://github.com/trooperthorn/ha_app_music_assistant/blob/main/docs/upstream-review.md",
   "multi_instance": false,
-  "builtin": false,
+  "builtin": true,
   "icon": "swap-horizontal"
+}
+"""
+
+STRINGS_JSON = """\
+{
+  "manifest": {
+    "description": "Migrate a library playlist's tracks into another provider's own playlist."
+  },
+  "background_task": {
+    "playlist_bridge_migrate": "Migrate playlist {0} to {1}"
+  }
 }
 """
 
@@ -164,11 +175,13 @@ class PlaylistBridgeProvider(PluginProvider):
             if not isinstance(provider, MusicProvider):
                 msg = f"{destination_provider} is not a music provider"
                 raise InvalidDataError(msg)
+            # mirror the core create_playlist check exactly: PLAYLIST_CREATE is
+            # deprecated in favour of PLAYLIST_CREATE_TRACKS but some providers
+            # (filesystem_local among them) still declare only the old one, and
+            # the core controller accepts either for a track playlist. Requiring
+            # the new flag on its own would reject destinations core allows.
             if not any(feature in provider.supported_features for feature in PLAYLIST_CREATE_FEATURES):
                 msg = f"{provider.name} does not support creating playlists"
-                raise InvalidDataError(msg)
-            if ProviderFeature.PLAYLIST_CREATE_TRACKS not in provider.supported_features:
-                msg = f"{provider.name} does not support adding tracks to a playlist"
                 raise InvalidDataError(msg)
             return provider
         msg = f"{destination_provider} is not one of your configured providers"
@@ -204,7 +217,7 @@ class PlaylistBridgeProvider(PluginProvider):
             name=f"Migrate playlist {playlist.name} to {destination.name}",
             handler=lambda: self._migrate_playlist(playlist, destination, name),
             translation_key="playlist_bridge_migrate",
-            translation_owner=self.domain,
+            translation_owner=self.translation_owner,
             translation_args=[playlist.name, destination.name],
             metadata={
                 "task_domain": "playlist_bridge_migrate",
@@ -235,14 +248,17 @@ class PlaylistBridgeProvider(PluginProvider):
             matched_playlist.item_id, [destination.instance_id]
         )
 
-        matched_uris: list[str] = []
+        # the destination provider's own track ids, kept as-is: a provider item_id
+        # may itself contain slashes (a filesystem provider's are relative paths),
+        # so they must never be round-tripped through a uri and split back out
+        matched_item_ids: list[str] = []
         async for item in self.mass.music.playlists.tracks(matched_playlist.item_id, "builtin"):
             for mapping in item.provider_mappings:
                 if mapping.provider_instance == destination.instance_id:
-                    matched_uris.append(f"{destination.instance_id}://track/{mapping.item_id}")
+                    matched_item_ids.append(mapping.item_id)
                     break
 
-        if not matched_uris:
+        if not matched_item_ids:
             msg = (
                 f"No tracks in '{playlist.name}' could be matched against "
                 f"{destination.name}; nothing was migrated"
@@ -267,7 +283,6 @@ class PlaylistBridgeProvider(PluginProvider):
         # surfaces to this task's own outcome instead of being silently
         # swallowed by a separately-tracked task - the false-success bug this
         # plugin exists to avoid.
-        matched_item_ids = [uri.rsplit("/", 1)[-1] for uri in matched_uris]
         try:
             await destination.add_playlist_tracks(new_prov_mapping.item_id, matched_item_ids)
         except MusicAssistantError as err:
@@ -287,13 +302,18 @@ def locate() -> Path:
 
 
 def write_provider(providers_dir: Path) -> None:
-    """Write the plugin's manifest and module, creating its directory if needed."""
+    """Write the plugin's manifest, strings and module, creating its directory if needed."""
+    import json
+
     provider_dir = providers_dir / DOMAIN
     provider_dir.mkdir(exist_ok=True)
     manifest_path = provider_dir / "manifest.json"
+    strings_path = provider_dir / "strings.json"
     init_path = provider_dir / "__init__.py"
     compile(INIT_PY, str(init_path), "exec")
+    json.loads(STRINGS_JSON)
     manifest_path.write_text(MANIFEST_JSON, encoding="utf-8", newline="\n")
+    strings_path.write_text(STRINGS_JSON, encoding="utf-8", newline="\n")
     init_path.write_text(INIT_PY, encoding="utf-8", newline="\n")
 
 
