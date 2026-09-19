@@ -162,3 +162,48 @@ train for three lines. Fixtures are pinned to the aiosendspin version the
 server release pins, so a server bump that moves aiosendspin re-checks
 the anchors the same way.
 
+
+## Migrate Playlist ships as a new provider, not a patch or a port (2026-09-19)
+
+The fork frontend's "Migrate Playlist" dialog called
+`music/playlists/migrate_playlist`, a command that does not exist upstream.
+It traces to music-assistant/server PR #5926, authored by the project's own
+lead maintainer but closed unmerged with several unresolved CRITICAL review
+findings: an authorization bug (a migration task could end up reading from a
+provider outside the calling user's permitted scope, because it resolved the
+destination with `mass.get_provider(domain)`, which returns the first
+globally loaded instance of a domain regardless of the caller's session) and
+a false-success bug (the task reported a full migration even when a
+destination provider silently dropped tracks). Porting that code would bring
+both bugs into this fork.
+
+Every other entry in `music_assistant_lm/patches/` edits an already-existing
+installed file at an exact anchor. `playlist_bridge.py` is deliberately
+different: it writes a small, self-contained plugin provider
+(`music_assistant/providers/playlist_bridge/`) instead. Music Assistant
+discovers providers by listing directories under its providers path at
+runtime (`os.listdir(PROVIDERS_PATH)` in `mass.py`), not through a central
+registry, so a new provider directory is purely additive and cannot conflict
+with any future upstream diff the way an anchored edit to an existing file
+can.
+
+The plugin reuses only the parts of the upstream playlist pipeline that are
+already merged and tested — `export_playlist`, `import_playlist` with
+library matching (PR #3387), and the same `create_playlist`/
+`add_playlist_tracks` path the frontend already uses for manual playlist
+creation — and adds only the one thing genuinely missing upstream: writing
+the matched tracks into the destination provider's own playlist via the
+generic `MusicProvider.create_playlist`/`add_playlist_tracks` methods every
+playlist-capable provider already implements. It never touches PR #5926's
+matching/confidence code, so neither of its CRITICAL findings apply here:
+the destination is resolved by filtering the caller's own configured
+provider list (`self.mass.music.providers`) rather than a global domain
+lookup, and every provider write is awaited directly in the plugin's own
+background task so a real failure surfaces as this task's own failure
+instead of being silently swallowed by a separately-tracked task.
+
+`match_policy` is accepted from the existing frontend request shape but not
+yet actionable: the already-merged matching pipeline this plugin calls into
+does not expose a confidence knob today. Fabricating one client-side would
+be dishonest about what's actually happening; this is left as a follow-up
+for whenever upstream's matcher grows one.

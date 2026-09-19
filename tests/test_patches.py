@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "music_assistant_lm" / "patches"))
 import browse_path as browse  # noqa: E402
 import hass_source_select as patch  # noqa: E402
 import play_source_steer as steer  # noqa: E402
+import playlist_bridge as bridge  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 
 # the modules exactly as the pinned server release ships them
@@ -358,3 +359,33 @@ def test_music_trash_moves_lists_restores_and_empties(tmp_path: Path) -> None:
     assert run(ctl.trash_list("fs")) == []
     assert run(ctl.trash_empty("fs")) == {"deleted": 0}
     assert song.read_bytes() == b"mp3"
+
+
+def test_playlist_bridge_manifest_and_module_are_valid() -> None:
+    import json
+
+    manifest = json.loads(bridge.MANIFEST_JSON)
+    assert manifest["type"] == "plugin"
+    assert manifest["domain"] == "playlist_bridge"
+    assert manifest["codeowners"] == ["@trooperthorn"]
+    compile(bridge.INIT_PY, "playlist_bridge/__init__.py", "exec")
+    assert "migrate_playlist" in bridge.INIT_PY
+    # the plugin must resolve destinations from the caller's own configured
+    # providers, not a global domain lookup, or it reintroduces the
+    # scope-escape bug the closed upstream PR shipped
+    assert "self.mass.music.providers" in bridge.INIT_PY
+    assert "self.mass.get_provider(destination" not in bridge.INIT_PY
+
+
+def test_playlist_bridge_main_writes_once_and_is_idempotent(tmp_path: Path) -> None:
+    providers_dir = tmp_path / "providers"
+    providers_dir.mkdir()
+    assert bridge.main(["playlist_bridge.py", str(providers_dir)]) == 0
+    provider_dir = providers_dir / "playlist_bridge"
+    manifest_once = (provider_dir / "manifest.json").read_bytes()
+    init_once = (provider_dir / "__init__.py").read_bytes()
+    assert b"\r\n" not in manifest_once
+    assert b"\r\n" not in init_once
+    assert bridge.main(["playlist_bridge.py", str(providers_dir)]) == 0
+    assert (provider_dir / "manifest.json").read_bytes() == manifest_once
+    assert (provider_dir / "__init__.py").read_bytes() == init_once
