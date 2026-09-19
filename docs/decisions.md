@@ -207,3 +207,89 @@ yet actionable: the already-merged matching pipeline this plugin calls into
 does not expose a confidence knob today. Fabricating one client-side would
 be dishonest about what's actually happening; this is left as a follow-up
 for whenever upstream's matcher grows one.
+
+## The PEP 758 syntax was never broken; the fixtures are restored verbatim (2026-09-19)
+
+The "Server 2.10.4 compat" entry above concluded that the shipped server
+source carried a latent bare-except bug, because `except A, B:` (without
+parentheses) does not compile on the Python this repository's tooling ran
+at the time. That conclusion was wrong. Music Assistant's server targets
+Python 3.14 (`requires-python = ">=3.14"`, and the server's own ruff config
+sets `target-version = "py314"`), and upstream deliberately adopted PEP 758
+("parenthesis-free" multi-exception `except` clauses) across the codebase
+in server PR #4254. `except A, B:` is valid syntax on Python 3.14 and only
+invalid on 3.13 and earlier. The container this app ships runs
+`python3.14`, so nothing is broken there; nothing needed fixing in the
+vendored source at all.
+
+The earlier fix parenthesized the exception tuples in
+`tests/fixtures/music_controller_2_10_4.py`, `streams_audio_2_10_4.py` and
+`sendspin_player_2_10_4.py`, on the false premise that upstream's own
+source was invalid. Those fixtures exist to be byte-identical pinned copies
+of the real upstream release, precisely so a diff against a fresh checkout
+reveals genuine upstream drift; silently "fixing" them made them diverge
+from upstream for no reason and would have hidden a real future change
+under the same three lines. They have been restored to verbatim upstream
+content from the real `music-assistant/server` tag 2.10.4.
+
+The actual, narrower consequence for this repository is that any local
+tool that parses or compiles those vendored files - this includes
+`tests/test_patches.py`'s `ast.parse`/`compile` checks and the patch
+scripts' own `compile()` validation - needs Python 3.14 to do it. Below
+3.14, those specific tests are skipped with an explicit reason instead of
+failing, so a contributor on an older local interpreter sees why, while CI
+(which runs on 3.14) exercises them for real.
+
+## `playlist_bridge` retires itself once the server pin reaches 2.11.0 (2026-09-19)
+
+Upstream server#5989 ("cross-provider playlist migration"), authored and
+merged by the project's own maintainers on 2026-09-03, registers
+`music/playlists/migrate_playlist` starting in server release 2.11.0 - the
+exact command name the fork frontend originally called before this
+repository's `playlist_bridge` plugin took over serving it under
+`playlist_bridge/migrate_playlist`. As of this writing 2.10.4 is still the
+Latest stable release and 2.11.0 is nightly-only, so `playlist_bridge`
+remains the only implementation available to this fork.
+
+Because `scripts/sync_upstream.py` bumps `SERVER_VERSION` in
+`music_assistant_lm/Dockerfile` automatically, nothing here would otherwise
+notice the day that pin crosses into 2.11.0 and upstream's own command
+becomes available. `tests/test_patches.py` carries a tripwire test next to
+`test_the_fixture_matches_the_pinned_server_release` that fails as soon as
+the pinned version reaches 2.11.0, with a message pointing at exactly what
+to do: retire the `playlist_bridge` plugin (this includes its patch script,
+Dockerfile wiring and `docs/upstream-review.md` references), and revert
+`api.migratePlaylist()` in `trooperthorn/HA_int_MA-UI` back to calling
+`music/playlists/migrate_playlist` directly.
+
+The full side-by-side against upstream's merged implementation, and the
+pre-decided verdict for that retirement (drop, not keep or modify), is in
+[playlist-bridge-vs-upstream.md](playlist-bridge-vs-upstream.md).
+
+## `playlist_bridge` guards ported from upstream #5989 (2026-09-19)
+
+Upstream's merged `migrate_playlist` (server PR #5989) carries validation
+this plugin initially lacked: excluding unavailable provider instances
+before matching, rejecting dynamic source playlists, rejecting destinations
+that are neither `builtin` nor a streaming provider, requiring
+`PLAYLIST_TRACKS_EDIT` and `MediaType.TRACK` support on the destination, and
+validating the destination playlist name with `is_safe_name`. All six were
+verified against the real, pinned 2.10.4 server source (not just upstream's
+`dev` branch) before being ported: `provider.available`,
+`provider.is_streaming_provider`, `provider.supported_media_types`,
+`ProviderFeature.PLAYLIST_TRACKS_EDIT`, `Playlist.is_dynamic`, and
+`is_safe_name` (importable from `music_assistant.helpers.security` in
+2.10.4, same as upstream's `dev`) all exist unchanged in 2.10.4. None had to
+be skipped.
+
+Upstream also validates that the *source* playlist's own provider is within
+the caller's allowed, available instances, using `get_current_user()` and an
+explicit `allowed_provider_instances` set built from the request's
+authorization context. This plugin approximates the same intent with what
+it already has: it checks whether any of the source playlist's provider
+mappings are on the caller's own `self.mass.music.providers` list (already
+scope-filtered for the destination check) or are `builtin`. This is not
+identical to upstream's user-context-aware check and is recorded as the
+plugin's weakest remaining point in
+[playlist-bridge-vs-upstream.md](playlist-bridge-vs-upstream.md), rather
+than presented as equivalent.

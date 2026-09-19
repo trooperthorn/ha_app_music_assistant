@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,17 @@ import hass_source_select as patch  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
+
+# streams_audio_2_10_4.py, sendspin_player_2_10_4.py and music_controller_2_10_4.py
+# are verbatim pinned copies of upstream, which deliberately uses PEP 758
+# parenthesis-free multi-exception syntax (`except A, B:`, server PR #4254).
+# That syntax is only valid on Python 3.14+ (the server's own requires-python
+# and the container's venv); any test that compile()s or ast.parse()s one of
+# these fixtures, or a patch result derived from one, cannot run below 3.14.
+requires_py314 = pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="fixtures use PEP 758 syntax, valid only on Python 3.14+",
+)
 
 # the modules exactly as the pinned server release ships them
 UPSTREAM = ROOT / "tests" / "fixtures" / "hass_player_2_10_4.py"
@@ -34,6 +46,64 @@ def test_the_fixture_matches_the_pinned_server_release() -> None:
     assert 'ARG SERVER_VERSION="2.10.4"' in dockerfile, (
         "the server moved; refresh the tests/fixtures/*_<version>.py copies from the new "
         "release and re-check the anchors in music_assistant_lm/patches/*.py"
+    )
+
+
+def _parse_server_version(dockerfile_text: str) -> tuple[int, ...]:
+    """Parse a Dockerfile's pinned SERVER_VERSION as a tuple of ints.
+
+    CalVer-ish MAJOR.MINOR.PATCH, but tolerate a trailing dev/beta suffix
+    (e.g. "2.11.0b1") by only parsing the leading digit groups. Split out
+    from `_pinned_server_version` so the parsing/compare logic itself can be
+    unit tested against synthetic input without touching the real Dockerfile.
+    """
+    match = re.search(r'ARG SERVER_VERSION="(\d+)\.(\d+)\.(\d+)', dockerfile_text)
+    assert match, "could not find ARG SERVER_VERSION=\"MAJOR.MINOR.PATCH...\" in the Dockerfile"
+    return tuple(int(part) for part in match.groups())
+
+
+def _pinned_server_version() -> tuple[int, ...]:
+    """Parse the real Dockerfile's pinned SERVER_VERSION as a tuple of ints."""
+    dockerfile = (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    return _parse_server_version(dockerfile)
+
+
+def test_parse_server_version_compares_correctly_around_the_2_11_boundary() -> None:
+    """The tripwire's version compare must pass at 2.10.5 and fail at 2.11.0."""
+    assert _parse_server_version('ARG SERVER_VERSION="2.10.5"') < (2, 11, 0)
+    assert _parse_server_version('ARG SERVER_VERSION="2.11.0"') >= (2, 11, 0)
+    # a trailing dev/beta suffix must not break parsing
+    assert _parse_server_version('ARG SERVER_VERSION="2.11.0b1"') >= (2, 11, 0)
+
+
+def test_playlist_bridge_is_retired_once_the_server_pin_reaches_2_11() -> None:
+    """
+    Upstream server#5989 ("cross-provider playlist migration"), merged
+    2026-09-03, registers `music/playlists/migrate_playlist` -- the exact
+    command name the fork frontend originally called -- starting in server
+    release 2.11.0. Once music_assistant_lm/Dockerfile's SERVER_VERSION pin
+    reaches 2.11.0 or later, this fork's own playlist_bridge plugin is
+    redundant and should be retired:
+
+    1. Remove music_assistant_lm/patches/playlist_bridge.py, its
+       docs/upstream-review.md references, and its COPY/RUN lines in
+       music_assistant_lm/Dockerfile.
+    2. In trooperthorn/HA_int_MA-UI, revert api.migratePlaylist() to call
+       the now-upstream `music/playlists/migrate_playlist` instead of
+       `playlist_bridge/migrate_playlist`.
+
+    scripts/sync_upstream.py bumps SERVER_VERSION automatically, so this
+    test is the tripwire that catches the pin crossing that line.
+    """
+    assert _pinned_server_version() < (2, 11, 0), (
+        "SERVER_VERSION reached 2.11.0+: upstream server#5989 now ships "
+        "cross-provider playlist migration natively. Read "
+        "docs/playlist-bridge-vs-upstream.md for the full keep/modify/drop "
+        "contract before doing anything else -- the pre-decided verdict "
+        "there is DROP. Retire the playlist_bridge plugin "
+        "(music_assistant_lm/patches/playlist_bridge.py and its Dockerfile "
+        "wiring) and revert api.migratePlaylist() in trooperthorn/HA_int_MA-UI "
+        "back to music/playlists/migrate_playlist."
     )
 
 
@@ -64,6 +134,7 @@ def test_apply_refuses_a_provider_that_moved() -> None:
         patch.apply("class HomeAssistantPlayer:\n    pass\n")
 
 
+@requires_py314
 def test_steer_marks_queue_items_and_prefers_their_provider() -> None:
     loader = steer.apply(QUEUE_LOADER.read_text(encoding="utf-8"), steer.EDITS[steer.QUEUE_LOADER])
     audio = steer.apply(STREAMS_AUDIO.read_text(encoding="utf-8"), steer.EDITS[steer.STREAMS_AUDIO])
@@ -92,6 +163,7 @@ def test_steer_is_idempotent_and_refuses_a_moved_module() -> None:
         steer.apply("class PlayerQueuesController:\n    pass\n", steer.EDITS[steer.QUEUE_LOADER])
 
 
+@requires_py314
 def test_steer_main_patches_both_files_once(tmp_path: Path) -> None:
     loader = tmp_path / "queue_loader.py"
     audio = tmp_path / "audio.py"
@@ -106,6 +178,7 @@ def test_steer_main_patches_both_files_once(tmp_path: Path) -> None:
         steer.main(["x", str(loader)])
 
 
+@requires_py314
 def test_opus_bitrate_reaches_the_encoder_and_the_config() -> None:
     codecs = opus.apply(AIOSENDSPIN_CODECS.read_text(encoding="utf-8"), opus.EDITS[opus.CODECS])
     role = opus.apply(AIOSENDSPIN_PLAYER_V1.read_text(encoding="utf-8"), opus.EDITS[opus.PLAYER_ROLE])
@@ -134,6 +207,7 @@ def test_opus_bitrate_is_idempotent_and_refuses_a_moved_module() -> None:
         opus.apply("class OpusEncoder:\n    pass\n", opus.EDITS[opus.CODECS])
 
 
+@requires_py314
 def test_opus_bitrate_main_patches_all_three_once(tmp_path: Path) -> None:
     targets = []
     for fixture in (AIOSENDSPIN_CODECS, AIOSENDSPIN_PLAYER_V1, SENDSPIN_PLAYER):
@@ -261,6 +335,7 @@ def _trash_controller(base: Path):
     return ctl
 
 
+@requires_py314
 def test_music_trash_adds_four_scoped_commands() -> None:
     import music_trash as trash
 
@@ -282,6 +357,7 @@ def test_music_trash_adds_four_scoped_commands() -> None:
         trash.apply("class MusicController:\n    pass\n")
 
 
+@requires_py314
 def test_music_trash_main_patches_the_module_once(tmp_path: Path) -> None:
     import music_trash as trash
 
@@ -375,6 +451,35 @@ def test_playlist_bridge_manifest_and_module_are_valid() -> None:
     # scope-escape bug the closed upstream PR shipped
     assert "self.mass.music.providers" in bridge.INIT_PY
     assert "self.mass.get_provider(destination" not in bridge.INIT_PY
+    # translation_owner must come from the base Provider property
+    # (f"provider.{domain}"), not the bare domain, or the background task's
+    # translation key never resolves
+    assert "translation_owner=self.translation_owner" in bridge.INIT_PY
+
+    # guards ported from upstream #5989 -- see the module docstring and the
+    # inline "mirrors upstream #5989" comments for why each one exists
+    assert "item.available" in bridge.INIT_PY  # exclude unavailable providers before matching
+    assert "is_dynamic" in bridge.INIT_PY  # reject dynamic source playlists
+    assert "is_streaming_provider" in bridge.INIT_PY  # reject non-streaming, non-builtin destinations
+    assert "PLAYLIST_TRACKS_EDIT" in bridge.INIT_PY  # destination must support editing playlists
+    assert "supported_media_types" in bridge.INIT_PY  # destination must support track playlists
+    assert "is_safe_name" in bridge.INIT_PY  # validate the destination playlist name
+    assert "from music_assistant.helpers.security import is_safe_name" in bridge.INIT_PY
+    # the source playlist's own provider must also be available/allowed, not
+    # just the destination
+    assert "playlist.provider_mappings" in bridge.INIT_PY
+
+    strings = json.loads(bridge.STRINGS_JSON)
+    assert strings["manifest"]["description"] == manifest["description"]
+    assert strings["background_task"]["playlist_bridge_migrate"] == "Migrate playlist {0} to {1}"
+
+
+def test_playlist_bridge_match_policy_docstring_states_it_has_no_effect() -> None:
+    """match_policy must never be presented as honoured; see docs/playlist-bridge-vs-upstream.md."""
+    assert "HAS NO EFFECT IN THIS BRIDGE" in bridge.INIT_PY
+    assert "PlaylistMatchPolicy" in bridge.INIT_PY
+    assert "server PR #5989" in bridge.INIT_PY
+    assert "2.11.0" in bridge.INIT_PY
 
 
 def test_playlist_bridge_main_writes_once_and_is_idempotent(tmp_path: Path) -> None:
@@ -383,9 +488,12 @@ def test_playlist_bridge_main_writes_once_and_is_idempotent(tmp_path: Path) -> N
     assert bridge.main(["playlist_bridge.py", str(providers_dir)]) == 0
     provider_dir = providers_dir / "playlist_bridge"
     manifest_once = (provider_dir / "manifest.json").read_bytes()
+    strings_once = (provider_dir / "strings.json").read_bytes()
     init_once = (provider_dir / "__init__.py").read_bytes()
     assert b"\r\n" not in manifest_once
+    assert b"\r\n" not in strings_once
     assert b"\r\n" not in init_once
     assert bridge.main(["playlist_bridge.py", str(providers_dir)]) == 0
     assert (provider_dir / "manifest.json").read_bytes() == manifest_once
+    assert (provider_dir / "strings.json").read_bytes() == strings_once
     assert (provider_dir / "__init__.py").read_bytes() == init_once
