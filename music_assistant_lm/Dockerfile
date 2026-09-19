@@ -16,8 +16,8 @@
 # All four arguments are declared here, before the first FROM, so they are in
 # global scope: BuildKit refuses variable expansion in COPY --from, and the
 # supported way to keep uv's reference maintainable is to name it as a stage.
-ARG SERVER_VERSION="2.10.3"
-ARG SERVER_DIGEST="sha256:885872224fa541c0faefc936625c939ba705a00e89c180f89e877f58448ea5d5"
+ARG SERVER_VERSION="2.10.4"
+ARG SERVER_DIGEST="sha256:37a9a2776e838a754c9f5b38c432567389952304e7cb8f6b44b6cd28043de6de"
 ARG UV_VERSION="0.12.13"
 ARG UV_DIGEST="sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6"
 
@@ -30,9 +30,9 @@ FROM ghcr.io/music-assistant/server:${SERVER_VERSION}@${SERVER_DIGEST}
 
 # release tag on trooperthorn/HA_int_MA-UI, the wheel it carries and its
 # sha256; empty FRONTEND_WHEEL keeps the upstream frontend (bootstrap only)
-ARG FRONTEND_RELEASE="v2026.09.16.2"
-ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.16.2-py3-none-any.whl"
-ARG FRONTEND_SHA256="2e6e1dc6526e89b1255a75281cc62fc8f748660404800620907b1d122f0714f3"
+ARG FRONTEND_RELEASE="v2026.09.19.1"
+ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.19.1-py3-none-any.whl"
+ARG FRONTEND_SHA256="111738efa027f0c9669ad79a4e4c165b632ace7dfe2c0aa507b3ee790872ee72"
 
 # The frontend version this server release pins for itself. The fork wheel is
 # installed over that package with --no-deps, so the server's own expectation
