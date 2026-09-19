@@ -1,133 +1,185 @@
 # TODO: Cross-repo UI/backend follow-ups (Music Assistant)
 
-Tracked here because the issues below live in the bundled `music-assistant-server`
-backend that this app packages, not in the frontend repo. This repo is the
-right place to decide what to do about them since it owns the upstream sync
+Tracked here because the issues below touch the bundled `music-assistant-server`
+backend that this app packages, or need a decision that spans both this repo
+and `HA_int_MA-UI`. This repo owns the upstream sync
 (`scripts/sync_upstream.py`, `docs/upstream-review.md`).
 
-Source: UI workflow review requested 2026-09-19, covering
-[trooperthorn/HA_int_MA-UI](https://github.com/trooperthorn/HA_int_MA-UI) and this repo.
-16 workflow items were triaged; the ones below could not be fixed in either
-repo as-is and need a decision or an upstream report.
+History:
+- 2026-09-19: 16 UI workflow items triaged from a review of `HA_int_MA-UI`
+  and this repo; most were fixed directly, the rest recorded below.
+- 2026-09-19 (later same day): deep-dive research against
+  `music-assistant/server` (all issues/PRs) and `music-assistant/support`,
+  and against the actual pinned server source, resolved most of what was
+  still open below. See per-item notes for what was verified and how.
 
-## 1. Artist "All" view shows no songs for some artists (backend bug)
+## 1. Artist "All" view shows no songs for some artists — FIXED
 
-- **Symptom**: selecting an artist in the Library Manager UI sometimes shows
-  zero tracks (e.g. "Goo Goo Dolls"), but navigating into a specific album by
-  that same artist does show tracks.
-- **Where it actually lives**: `HA_int_MA-UI`'s `useItemSource.ts` calls
-  `api.getArtistTracks(item_id, provider)`, a single unpaginated RPC
-  (`music/artists/artist_tracks`) against `music-assistant-server`. The
-  album-scoped path uses a different RPC (`getAlbumTracks`) that resolves
-  fine. No client-side pagination/limit is being applied in the frontend, and
-  no error is being silently swallowed there.
-- **Likely root cause**: a multi-provider artist identity merge gap in
-  `music-assistant-server`, where the artist `item_id`/`provider` pair passed
-  to `artist_tracks` doesn't match the provider instance under which that
-  artist's tracks were actually indexed, while album-level lookups use the
-  album's own (correct) provider linkage.
-- **Decision**: do not attempt a frontend workaround (e.g. falling back to
-  aggregating tracks from all albums client-side) without confirming this is
-  really a server bug and not a sync/indexing gap in the specific library.
-  Per this project's AI policy constraints, this needs to be reported
-  upstream to `music-assistant/server` by a human (Sean), not opened
-  autonomously by an agent on this project's behalf.
-- **Action**: Sean to reproduce against a specific test library (confirm
-  whether it's provider-specific, e.g. only affects certain streaming
-  providers vs. local filesystem), then file an upstream issue against
-  `music-assistant/server` with the artist/provider IDs from the API
-  response, or open an issue in this repo first if it turns out to be caused
-  by how `ha_app_music_assistant` configures/patches the bundled server.
-- **Status**: open, unassigned.
+Was: "backend bug, needs upstream report." **Confirmed not a server bug** by
+reading `music_assistant/controllers/music/media/artists.py` in the actual
+pinned 2.10.4 server source: `music/artists/artist_tracks` is intentionally
+library-only for a library-scoped artist and does not fall back to the
+provider catalog (matches upstream
+[server#4039](https://github.com/music-assistant/server/pull/4039), merged
+2026-06-08, which deliberately separated library-artist views from
+per-provider listings). An artist whose albums are library items but whose
+individual tracks aren't (e.g. "Goo Goo Dolls") shows zero tracks by design,
+not by bug.
+
+Fixed in `HA_int_MA-UI` — see
+[PR #56](https://github.com/trooperthorn/HA_int_MA-UI/pull/56): browse-scope
+artist-tracks fetch now falls back to the cross-provider top-tracks listing
+(`getArtistTopTracks`) when the library-scoped result is empty, matching the
+pattern already used on the artist detail page
+(`src/components/artist/artistData.ts`).
+
+No upstream issue needed; the original "Sean to file an upstream issue"
+action is dropped.
+
+**Related upstream context, not blockers, kept for reference:**
+- [server#6324](https://github.com/music-assistant/server/pull/6324) (open,
+  draft) is a real but separate multi-provider identity-merge problem
+  (same-provider artists with different IDs, e.g. Tidal "loud" vs "LOUD").
+- [server#6327](https://github.com/music-assistant/server/pull/6327) (closed,
+  unmerged) — an automated repair pass for that was rejected as unsafe
+  because some providers legitimately list two distinct artists under
+  near-identical names.
+- [server#6362](https://github.com/music-assistant/server/pull/6362) (merged
+  2026-09-15) fixed library items picking up a bogus `"None"` provider link;
+  already included in our pinned 2.10.4, no action needed.
+- [server#6279](https://github.com/music-assistant/server/pull/6279) (closed,
+  unmerged) — do not build against a `music/artists/discography` command,
+  it does not exist upstream; a maintainer rejected merging provider
+  catalogs for this on data-quality grounds.
 
 ## 2. Product decisions made instead of blocking on review (2026-09-19)
 
-These two items were ambiguous in the original request and were resolved
-with a judgment call in the `HA_int_MA-UI` PR rather than stopping to ask.
-Documented here so they can be revisited if wrong.
+- **"Replace Up Next" vs. "Use as Up Next" toggles**: merged into a single
+  "Replace Up Next" control (`HA_int_MA-UI`,
+  `src/library-manager/LibraryManagerView.vue`), since both described the
+  same behavior. Documented in code at the call site. No action unless a
+  genuinely distinct second behavior is wanted later.
+- **"Blue bar on the left" loading expanded**: treated as the fullscreen
+  player auto-opening from a stale `showFullscreenPlayer` URL query param,
+  and fixed (`src/layouts/default/Default.vue`). **Still open**: no
+  left-docked persistent bar exists anywhere in `HA_int_MA-UI` today (the
+  only persistent player bar is full-width at the bottom). If a different,
+  actually-left-docked bar was meant, this needs a screenshot from Sean
+  before anything else can be done here.
 
-- **"Replace Up Next" vs. "Use as Up Next" toggles**: the original request
-  listed these as two separate slider controls on the bottom track table,
-  but both described the same behavior (replace the Up Next queue with the
-  currently shown table rows, in shown order). Merged into a single
-  "Replace Up Next" control rather than shipping two controls that do the
-  same thing. If a genuinely distinct second behavior was intended (e.g. one
-  should preserve the currently-playing track and one should not), open a
-  follow-up issue in `HA_int_MA-UI` describing the distinction.
-- **"Blue bar on the left" loading expanded**: no component in `HA_int_MA-UI`
-  literally matches "a blue bar on the left side" — the only persistent
-  player bar is `Footer.vue`, which is full-width at the bottom of the
-  screen, not left-docked. Treated the report as referring to the fullscreen
-  player auto-opening on load (traced to a stale `showFullscreenPlayer` URL
-  query param being honored on initial mount) and fixed that. If a different,
-  actually-left-docked bar was meant, open a follow-up issue in
-  `HA_int_MA-UI` with a screenshot.
+## 3. Deferred features — rescoped 2026-09-19
 
-## 3. Deferred features — scoped 2026-09-19, split by feasibility
+### 3a. Import Spotify playlists — smaller than originally scoped
 
-Per prior scoping conversation, these are bigger features, not workflow
-fixes, and were intentionally left out of the 2026-09-19 UI fix pass. A
-scoping pass on 2026-09-19 found both need to be split; see below.
+The matching engine this needs largely already exists upstream:
+[server#3387](https://github.com/music-assistant/server/pull/3387) (merged
+2026-03-30) added `music/playlists/export_playlist` (to M3U8) and
+`music/playlists/import_playlist` with tiered library matching (exact
+ISRC/MusicBrainz match first, fuzzy fallback, optional provider
+restriction), plus
+[server#5986](https://github.com/music-assistant/server/pull/5986) (merged)
+which re-matches tracks if the original import source later disappears.
+`HA_int_MA-UI` already exposes all of this end to end
+(`ImportPlaylistDialog.vue`, `ItemContextMenu.vue`'s M3U8 export,
+`api.importPlaylist`/`api.exportPlaylist`).
 
-### 3a. Import Spotify playlists into a local playlist file
+**What's actually still missing**: importing into a **local playlist file on
+the filesystem** specifically, as opposed to a builtin/library playlist.
+Upstream's import destination is always a builtin playlist, not an arbitrary
+`.m3u` on disk.
 
-**Blocked upstream on `music-assistant-server`.** `HA_int_MA-UI` already has
-generic playlist-import/matching RPCs (`API.importPlaylist`,
-`API.migratePlaylist` with `PlaylistMatchPolicy` —
-`src/plugins/api/index.ts`), but those take an m3u file as input, not "read
-playlist directly from a connected provider." No RPC exists anywhere to list
-or read a user's Spotify playlists by ID; that has to be added to
-`music-assistant-server`'s Spotify provider first, then consumed here. Not
-safely buildable as an `ha_app_music_assistant` patch either — the existing
-patches (`play_source_steer.py`, `sendspin_opus_bitrate.py`) are narrow,
-single-anchor-point edits; a Spotify playlist-read integration (OAuth scope,
-pagination, rate limits, track matching) is a much larger surface that would
-fight every upstream Spotify provider release.
+**Decision needed (Sean)**: is a builtin-playlist destination good enough,
+or does the filesystem-file destination specifically matter (e.g. for
+syncing to another tool)? If the latter, scope a small filesystem-write step
+on top of the existing import pipeline — much smaller than the originally
+assumed "build Spotify OAuth + MusicBrainz matching from scratch," since
+matching is already solved.
 
-**Needs verification in `music-assistant-server` (Sean, in progress):**
-- Does the Spotify provider already fetch the user's own playlists
-  internally for any reason, even if not exposed over RPC today?
-- Does MA's Spotify integration use a shared app client ID, or does each
-  user need their own Spotify developer app? This determines feasibility
-  under Spotify's Extension Quota Mode restrictions on new API access.
+**Status**: waiting on Sean's decision above; not blocked on any missing
+server capability.
 
-**Status**: blocked, pending upstream investigation.
+### 3b. Equalizer — DONE, was already fully shipped before this was written
 
-### 3b. Equalizer + streaming quality + delay settings
+Fully shipped both upstream (DSP/parametric EQ landed
+[server#1795](https://github.com/music-assistant/server/pull/1795) in
+2024-12, multichannel PEQ, gain/balance, high/low-pass, convolution, stereo
+width, crossfeed, limiter, compressor, transpose all merged by 2026-07/08)
+and in `HA_int_MA-UI` (`src/components/dsp/*`, `EditPlayerDsp.vue`). The only
+real gap — no quick-access entry point outside Settings — was closed in
+[PR #55](https://github.com/trooperthorn/HA_int_MA-UI/pull/55) (equalizer
+button + menu entry in the fullscreen player, opens the existing DSP
+editor). No further action.
 
-Split into three independent pieces by actual buildability:
+### 3b'. Streaming quality / delay — partially shipped, rest is optional
 
-- **EQ quick-access button (buildable now, UI-only)**: the full DSP/EQ
-  system already exists server-side and in the frontend
-  (`src/views/settings/EditPlayerDsp.vue`, `src/components/dsp/DSPParametricEQ.vue`
-  and siblings), including a visual EQ-style component
-  (`src/components/MiniEqualizer.vue`, currently just a decorative waveform
-  on queue rows, not a control). The gap is only a quick-access entry point:
-  there's no EQ button on the player OSD/controls, only a path buried in
-  Settings → per-player → DSP. **In progress in `HA_int_MA-UI`** as of
-  2026-09-19: adding an OSD button that opens the existing DSP editor.
-- **Streaming quality control**: `AudioQuality` (`LOW/STANDARD/LOSSLESS/HI_RES`)
-  and stream format fields already exist but are read-only/diagnostic
-  today. One precedent patch,
-  `music_assistant_lm/patches/sendspin_opus_bitrate.py` in this repo, adds a
-  per-player bitrate setting but only for Sendspin/Opus players. Needs
-  checking whether `music-assistant-server`'s RPC already accepts a
-  quality/output-format override more generically (then it's UI-only, add a
-  field to `EditPlayerOptions.vue`) or needs a new patch modeled on the
-  Sendspin one for other player types. **Status: needs upstream server
-  investigation before scoping further.**
-- **Playback delay/sync compensation**: no capability found anywhere in the
-  frontend's API model (no `sync_offset`/`group_delay`/`latency_comp`
-  fields). Likely a genuine gap in `music-assistant-server` too, not just
-  unexposed. **Status: needs upstream server investigation** — flag during
-  the same `music-assistant-server` review as 3a and the streaming-quality
-  question above, since all three are "does the server already do more than
-  it exposes over RPC" questions.
+- Playback delay already exists as a per-player setting in `HA_int_MA-UI`
+  (`audio_delay` in `src/helpers/player_menu_items.ts` and
+  `player_menu_preferences.ts`) — the original "no delay capability exists"
+  assumption was wrong, this was already there.
+- General streaming-quality override does **not** exist upstream beyond one
+  narrow case:
+  [server#5882](https://github.com/music-assistant/server/pull/5882)
+  (merged) added a quality setting, but it's Spotify Connect-specific only.
+  This repo's own `music_assistant_lm/patches/sendspin_opus_bitrate.py`
+  patch is the only other precedent, and it's Sendspin/Opus-specific too.
+- **Status**: optional, no upstream API to build a general version against
+  today. Scope separately only if a specific player type's quality control
+  is actually wanted; there's no one-size-fits-all RPC to wrap.
 
-## Related PRs/issues
+## 4. `MigratePlaylistDialog` calls a server command that does not exist — KNOWN BROKEN, left as-is
 
-- `HA_int_MA-UI` PR: workflow fixes batch (search debounce, title sort in
-  browse scope, stale-search-on-select, scoped Up Next clear in fullscreen
-  player, hover tooltips, double-click-plays-first-song, Replace Up Next
-  toggle, fullscreen player load-minimized fix) — see that repo's PR list
-  for the branch `ui-workflow-fixes`.
+New finding (2026-09-19, not from the original workflow review). `HA_int_MA-UI`
+ships a full "Migrate Playlist" UI
+(`src/layouts/default/MigratePlaylistDialog.vue`, reachable from
+`ItemContextMenu.vue`'s `migrate_playlist.action`) that calls
+`api.migratePlaylist()` →  `music/playlists/migrate_playlist`. That command
+**does not exist** in the pinned 2.10.4 server — confirmed directly by
+cloning `music-assistant/server` at tag `2.10.4` and grepping the source; the
+only `migrate_playlist`-adjacent hit is `_migrate_playlists` in
+`providers/builtin/__init__.py`, an unrelated one-time internal startup
+migration task, not a client-callable RPC. The feature traces back to
+upstream [server#5926](https://github.com/music-assistant/server/pull/5926)
+("Migrate playlists between providers"), which is **closed, unmerged**.
+
+**Effect**: any user who opens this dialog and submits it gets a runtime
+failure. No patch in this repo (`ha_app_music_assistant`) adds the missing
+command — checked `scripts/`, `docs/`, and all `.py`/`.md` files, nothing
+references `migrate_playlist`.
+
+**Decision (Sean, 2026-09-19): leave it broken for now, revisit later.**
+Options on the table when it's picked back up:
+- Remove the menu entry and dialog, point users at the working
+  export (.m3u8) + import-with-matching flow instead (smallest, safest).
+- Port upstream's closed PR #5926 server-side logic as a new patch in this
+  repo's `music_assistant_lm/patches/` — bigger, riskier surface; upstream
+  maintainers themselves didn't merge it.
+- Feature-gate the UI on a runtime capability/command-availability check —
+  needs new infrastructure that doesn't exist yet (no generic "does this RPC
+  exist" check anywhere in the app today).
+
+## Notes for anyone contributing upstream later
+
+- Per standing project policy, no PRs or issues get opened on non-`trooperthorn`
+  repos autonomously; upstream gaps get documented here as follow-ups, and
+  Sean files anything that needs to go to `music-assistant/server` himself.
+- `music-assistant/server` has almost no user-filed issues; user reports go
+  to `music-assistant/support` — search both when checking a symptom.
+- No `wontfix`/`not planned` labels are in use upstream; a rejected idea
+  shows up as a closed-unmerged PR with a maintainer comment instead.
+- Upstream has an automated critical-issue gate that holds PRs in draft
+  until flagged threads are resolved; maintainers bypass it with an
+  `override-critical` label. Worth knowing when judging whether an open
+  upstream PR is actually close to merging.
+
+## Related PRs
+
+- `HA_int_MA-UI` #54: original workflow fixes batch (search debounce, title
+  sort in browse scope, stale-search-on-select, scoped Up Next clear in
+  fullscreen player, hover tooltips, double-click-plays-first-song, Replace
+  Up Next toggle, fullscreen player load-minimized fix).
+- `HA_int_MA-UI` #55: equalizer quick-access button.
+- `HA_int_MA-UI` #56: artist-tracks fallback fix (item 1 above).
+- `ha_app_music_assistant` #48: fixed a patch-compatibility break against
+  server 2.10.4 unrelated to the above (pre-existing invalid syntax in
+  pinned test fixtures, exposed by an automated version-pin bump that
+  didn't run the patch test suite before merging — see `docs/decisions.md`).
