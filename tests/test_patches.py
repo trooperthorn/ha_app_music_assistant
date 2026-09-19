@@ -15,12 +15,13 @@ sys.path.insert(0, str(ROOT / "music_assistant_lm" / "patches"))
 
 import folder_browser as folders  # noqa: E402
 import hass_source_select as patch  # noqa: E402
+import library_trash as trash  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 
-# streams_audio_2_10_4.py, sendspin_player_2_10_4.py and music_controller_2_10_4.py
-# are verbatim pinned copies of upstream, which deliberately uses PEP 758
+# streams_audio_2_10_4.py and sendspin_player_2_10_4.py are verbatim pinned
+# copies of upstream, which deliberately uses PEP 758
 # parenthesis-free multi-exception syntax (`except A, B:`, server PR #4254).
 # That syntax is only valid on Python 3.14+ (the server's own requires-python
 # and the container's venv); any test that compile()s or ast.parse()s one of
@@ -286,22 +287,19 @@ def test_main_writes_once_and_keeps_line_endings(tmp_path: Path) -> None:
     assert target.read_bytes() == first
 
 
-# music_trash: the methods are exercised for real by lifting the patched
-# class body onto a stub with the two things the code touches
-MUSIC_CONTROLLER = ROOT / "tests" / "fixtures" / "music_controller_2_10_4.py"
+# library_trash: the methods are exercised for real by lifting the plugin's
+# class body onto a stub with the two things the code touches (mass, logger)
 
 
-def _trash_controller(base: Path):
-    """A MusicController stand-in carrying only the trash methods from the patch."""
+def _library_trash_provider(base: Path):
+    """A LibraryTrashProvider stand-in carrying only the trash methods from the plugin."""
     import asyncio
     import logging
     import os
     import shutil
+    from collections.abc import Callable
 
-    from music_trash import EDITS
-
-    body = EDITS[2][1].split('    @api_command("music/match_providers"')[0]
-    body = body.replace("    @api_command(", "    @_command(")
+    body = trash.INIT_PY.split("class LibraryTrashProvider(PluginProvider):\n", 1)[1]
 
     class InvalidDataError(Exception):
         pass
@@ -323,9 +321,6 @@ def _trash_controller(base: Path):
         except ValueError:
             return False
 
-    class Scope:
-        LIBRARY_MANAGE = "library.manage"
-
     class Provider:
         def __init__(self, base_path: str | None) -> None:
             if base_path is not None:
@@ -343,11 +338,11 @@ def _trash_controller(base: Path):
         "os": os,
         "shutil": shutil,
         "Any": object,
+        "Callable": Callable,
+        "TRASH_DIR": ".music-assistant-trash",
         "InvalidDataError": InvalidDataError,
         "MediaNotFoundError": MediaNotFoundError,
         "is_safe_path": is_safe_path,
-        "Scope": Scope,
-        "_command": lambda *_a, **_k: (lambda fn: fn),
     }
     exec("class Ctl:\n" + body, namespace)  # noqa: S102
     ctl = namespace["Ctl"]()
@@ -357,42 +352,54 @@ def _trash_controller(base: Path):
     return ctl
 
 
-@requires_py314
-def test_music_trash_adds_four_scoped_commands() -> None:
-    import music_trash as trash
+def test_library_trash_manifest_and_module_are_valid() -> None:
+    import json
 
-    patched = trash.apply(MUSIC_CONTROLLER.read_text(encoding="utf-8"))
-    tree = ast.parse(patched)
-    methods = {
-        node.name
-        for cls in tree.body
-        if isinstance(cls, ast.ClassDef)
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-    assert {"trash_move", "trash_list", "trash_restore", "trash_empty", "remove_provider_mapping"} <= methods
+    manifest = json.loads(trash.MANIFEST_JSON)
+    assert manifest["type"] == "plugin"
+    assert manifest["domain"] == "library_trash"
+    assert manifest["codeowners"] == ["@trooperthorn"]
+    # this backs the Duplicates page's trash actions; a user disabling it
+    # would silently break that flow, so it must not be disableable
+    assert manifest["builtin"] is True
+    assert manifest["allow_disable"] is False
+    compile(trash.INIT_PY, "library_trash/__init__.py", "exec")
+
+    tree = ast.parse(trash.INIT_PY)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LibraryTrashProvider")
+    methods = {node.name for node in provider.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+    assert {"trash_move", "trash_list", "trash_restore", "trash_empty", "loaded_in_mass", "unload"} <= methods
+
+    # the command names and scope are a contract with the fork frontend's
+    # Duplicates page; carried over unchanged from the retired music_trash.py
+    # anchor patch
     for name in ("move", "list", "restore", "empty"):
-        assert f'api_command("music/trash/{name}", required_scope=Scope.LIBRARY_MANAGE)' in patched
-    assert "from music_assistant.helpers.security import is_safe_path" in patched
-    assert trash.apply(patched) == patched
-    with pytest.raises(SystemExit, match="anchor found 0 times"):
-        trash.apply("class MusicController:\n    pass\n")
+        assert f'"music/trash/{name}"' in trash.INIT_PY
+    assert trash.INIT_PY.count("required_scope=Scope.LIBRARY_MANAGE") == 4
+    assert "from music_assistant.helpers.security import is_safe_path" in trash.INIT_PY
+
+    strings = json.loads(trash.STRINGS_JSON)
+    assert strings["manifest"]["description"] == manifest["description"]
 
 
-@requires_py314
-def test_music_trash_main_patches_the_module_once(tmp_path: Path) -> None:
-    import music_trash as trash
+def test_library_trash_main_writes_once_and_is_idempotent(tmp_path: Path) -> None:
+    providers_dir = tmp_path / "providers"
+    providers_dir.mkdir()
+    assert trash.main(["library_trash.py", str(providers_dir)]) == 0
+    provider_dir = providers_dir / "library_trash"
+    manifest_once = (provider_dir / "manifest.json").read_bytes()
+    strings_once = (provider_dir / "strings.json").read_bytes()
+    init_once = (provider_dir / "__init__.py").read_bytes()
+    assert b"\r\n" not in manifest_once
+    assert b"\r\n" not in strings_once
+    assert b"\r\n" not in init_once
+    assert trash.main(["library_trash.py", str(providers_dir)]) == 0
+    assert (provider_dir / "manifest.json").read_bytes() == manifest_once
+    assert (provider_dir / "strings.json").read_bytes() == strings_once
+    assert (provider_dir / "__init__.py").read_bytes() == init_once
 
-    target = tmp_path / "controller.py"
-    target.write_text(MUSIC_CONTROLLER.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
-    assert trash.main(["music_trash.py", str(target)]) == 0
-    once = target.read_bytes()
-    assert b"\r\n" not in once
-    assert trash.main(["music_trash.py", str(target)]) == 0
-    assert target.read_bytes() == once
 
-
-def test_music_trash_moves_lists_restores_and_empties(tmp_path: Path) -> None:
+def test_library_trash_moves_lists_restores_and_empties(tmp_path: Path) -> None:
     import asyncio
 
     base = tmp_path / "music"
@@ -401,7 +408,7 @@ def test_music_trash_moves_lists_restores_and_empties(tmp_path: Path) -> None:
     song.write_bytes(b"mp3")
     sheet = base / "Artist" / "Album" / "Album.cue"
     sheet.write_bytes(b"cue")
-    ctl = _trash_controller(base)
+    ctl = _library_trash_provider(base)
     run = asyncio.run
 
     # relative and absolute paths both land in the dot folder, path kept
