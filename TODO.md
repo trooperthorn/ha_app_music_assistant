@@ -126,36 +126,37 @@ editor). No further action.
   today. Scope separately only if a specific player type's quality control
   is actually wanted; there's no one-size-fits-all RPC to wrap.
 
-## 4. `MigratePlaylistDialog` calls a server command that does not exist — KNOWN BROKEN, left as-is
+## 4. `MigratePlaylistDialog` called a server command that did not exist — FIXED
 
-New finding (2026-09-19, not from the original workflow review). `HA_int_MA-UI`
-ships a full "Migrate Playlist" UI
+Found 2026-09-19 (not from the original workflow review). `HA_int_MA-UI`
+shipped a full "Migrate Playlist" UI
 (`src/layouts/default/MigratePlaylistDialog.vue`, reachable from
-`ItemContextMenu.vue`'s `migrate_playlist.action`) that calls
-`api.migratePlaylist()` →  `music/playlists/migrate_playlist`. That command
-**does not exist** in the pinned 2.10.4 server — confirmed directly by
-cloning `music-assistant/server` at tag `2.10.4` and grepping the source; the
-only `migrate_playlist`-adjacent hit is `_migrate_playlists` in
-`providers/builtin/__init__.py`, an unrelated one-time internal startup
-migration task, not a client-callable RPC. The feature traces back to
-upstream [server#5926](https://github.com/music-assistant/server/pull/5926)
-("Migrate playlists between providers"), which is **closed, unmerged**.
+`ItemContextMenu.vue`'s `migrate_playlist.action`) calling
+`api.migratePlaylist()` →  `music/playlists/migrate_playlist`, a command that
+does not exist in the pinned 2.10.4 server. Anyone who opened that dialog and
+submitted it got a runtime failure. The feature traced to upstream
+[server#5926](https://github.com/music-assistant/server/pull/5926), which was
+closed unmerged with unresolved authorization and false-success findings, so
+porting it as-is was rejected.
 
-**Effect**: any user who opens this dialog and submits it gets a runtime
-failure. No patch in this repo (`ha_app_music_assistant`) adds the missing
-command — checked `scripts/`, `docs/`, and all `.py`/`.md` files, nothing
-references `migrate_playlist`.
+**Fixed** by shipping the `playlist_bridge` plugin provider
+(`music_assistant_lm/patches/playlist_bridge.py`), which registers
+`playlist_bridge/migrate_playlist` and orchestrates only the already-merged,
+already-tested parts of the upstream playlist pipeline, and by repointing
+`api.migratePlaylist()` at that command in `HA_int_MA-UI`. Note this
+supersedes the earlier statement here that no patch in this repo adds the
+command: one now does.
 
-**Decision (Sean, 2026-09-19): leave it broken for now, revisit later.**
-Options on the table when it's picked back up:
-- Remove the menu entry and dialog, point users at the working
-  export (.m3u8) + import-with-matching flow instead (smallest, safest).
-- Port upstream's closed PR #5926 server-side logic as a new patch in this
-  repo's `music_assistant_lm/patches/` — bigger, riskier surface; upstream
-  maintainers themselves didn't merge it.
-- Feature-gate the UI on a runtime capability/command-availability check —
-  needs new infrastructure that doesn't exist yet (no generic "does this RPC
-  exist" check anywhere in the app today).
+**This is a bridge for the 2.10.x line only.** Upstream landed its own
+reworked version in
+[server#5989](https://github.com/music-assistant/server/pull/5989) (merged
+2026-09-03) under the original `music/playlists/migrate_playlist` name,
+shipping in server 2.11.0. Upstream's implementation is a strict superset and
+more thoroughly hardened, so the decision when the pin crosses 2.11.0 is to
+drop ours rather than keep or modify it. The full side-by-side comparison,
+the retirement steps, and what would change that verdict are in
+`docs/playlist-bridge-vs-upstream.md`; `tests/test_patches.py` carries the
+tripwire that fails the build at that pin bump.
 
 ## 5. `gh pr merge --auto` races the checks it is supposed to wait on — FIXED
 
