@@ -2,15 +2,21 @@
 Add a plugin that migrates a library playlist's tracks to another provider.
 
 The fork frontend ships a "Migrate Playlist" dialog that calls
-``music/playlists/migrate_playlist``. That command does not exist upstream:
-it traces to music-assistant/server PR #5926 ("Migrate playlists between
-providers"), authored by the project's own lead maintainer but closed
-unmerged with several unresolved CRITICAL review findings from an automated
-reviewer, including a real authorization bug (a migration task could end up
-reading from a provider outside the calling user's permitted scope) and a
-false-success bug (claims a full migration when a destination provider
-silently dropped tracks). Porting that code as-is would import those bugs
-into this fork.
+``music/playlists/migrate_playlist``. That command does not exist in the
+server release this app pins: it first traced to music-assistant/server PR
+#5926 ("Migrate playlists between providers"), authored by the project's own
+lead maintainer but closed unmerged with several unresolved CRITICAL review
+findings from an automated reviewer, including a real authorization bug (a
+migration task could end up reading from a provider outside the calling
+user's permitted scope) and a false-success bug (claims a full migration when
+a destination provider silently dropped tracks). Porting that code as-is
+would import those bugs into this fork.
+
+Upstream later landed a reworked version in server PR #5989 (merged
+2026-09-03) under that same command name, shipping in server 2.11.0. This
+plugin is therefore a bridge for the 2.10.x line only, and is retired when
+the pin crosses 2.11.0. ``tests/test_patches.py`` carries the tripwire that
+fails the build at that point; see docs/decisions.md.
 
 Every other patch in this directory edits an already-existing installed
 file at an exact anchor. This one is different on purpose: instead of
@@ -31,7 +37,7 @@ providers path at runtime (``os.listdir(PROVIDERS_PATH)`` in
 new provider directory is therefore purely additive: it cannot conflict
 with any future upstream diff to an existing file, unlike an anchor-based
 edit. This script has no anchors to fail on; it always (re)writes the same
-two files.
+three files (``manifest.json``, ``strings.json`` and ``__init__.py``).
 
 Usage: ``python playlist_bridge.py [path/to/music_assistant/providers]``.
 Without a path the installed providers package is located through
