@@ -338,3 +338,56 @@ conflicting with upstream's own implementation.
 This is step 1 of moving the remaining anchor-shaped-but-anchor-independent
 patches to plugins; `music_trash.py`'s `library_trash` migration is next
 and follows this same template.
+
+## `music_trash` moves from an anchor patch to a plugin (2026-09-19)
+
+`music_trash.py` was an anchor patch: it string-replaced exact lines in the
+installed `music_assistant.controllers.music.controller` module to add four
+`music/trash/*` commands (`move`, `list`, `restore`, `empty`) that give the
+fork frontend's Duplicates page a reversible step past removing a library
+row. Reading the code it injected showed the same thing `browse_path.py`
+showed before it: the handlers had no real dependency on `MusicController`.
+They only ever touched `self.logger` and `self.mass.get_provider`, both of
+which exist on the `Provider` base class every plugin provider already
+subclasses. The anchor's only job was delivery, and an anchor is the
+fragile way to deliver something with no dependency on the file it edits.
+
+`library_trash.py` replaces it with a plugin provider, following the exact
+template `folder_browser.py` established (and the shape `playlist_bridge.py`
+established before that): a `DOMAIN` constant, string constants for
+`manifest.json`, `strings.json` and `__init__.py`, a `locate()` that
+resolves the installed `music_assistant.providers` package, a
+`write_provider()` that compile/json-validates before writing, and a
+`main()` accepting an optional path override for tests. Music Assistant
+discovers providers by listing directories under its providers path at
+runtime, not through a registry, so this is purely additive and cannot
+conflict with a future upstream diff the way the anchor could.
+
+The four command names (`music/trash/move`, `music/trash/list`,
+`music/trash/restore`, `music/trash/empty`) and the required scope
+(`Scope.LIBRARY_MANAGE`, the same scope that already guards provider
+mappings) carried over unchanged, so nothing downstream had to move:
+`mass.register_api_command` accepts any command string with no namespace
+ownership, so the fork frontend's Duplicates page needed no change at all.
+The manifest sets `builtin: true` and `allow_disable: false`, because this
+backs the Duplicates page's trash actions and a user disabling it would
+silently break that flow rather than fail loudly.
+
+`register_api_command` raises `RuntimeError` if a command is already
+registered, so the old anchor patch and this plugin can never both ship;
+both the anchor script and its Dockerfile `RUN` line were removed in the
+same change that added the plugin.
+
+This retires the last anchor patch on `controllers/music/controller.py`,
+the single upstream file that has churned the most across server releases
+so far (it is also where the retired `music_trash.py` anchor and, earlier,
+several now-obsolete anchors before it, all lived). With this migration,
+none of this fork's build-time edits still anchor to that file; the only
+anchor patches remaining touch `hass_players/player.py`,
+`controllers/player_queues/queue_loader.py` plus
+`controllers/streams/audio.py`, and the `aiosendspin` package for the Opus
+bitrate setting, none of which have this same anchor-with-no-real-
+dependency shape, so no further plugin migrations are planned for now.
+
+This was step 2 of 2 of moving the remaining anchor-shaped-but-anchor-
+independent patches to plugins that started with `folder_browser.py`.

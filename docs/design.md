@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are four:
+Today there are five:
 
 - `hass_source_select.py`: the Home Assistant player provider mirrors the
   wrapped entity's `source_list` as selectable player sources (which gives
@@ -89,18 +89,23 @@ Today there are four:
   anchor patch on the providers config controller; moved to a plugin
   because the handler had no dependency on that controller (see
   `docs/decisions.md`).
-- `music_trash.py`: four `music/trash/*` commands on the music controller
-  (`move`, `list`, `restore`, `empty`) that give the fork frontend's
-  Duplicates page one reversible step past removing a library row. `move`
-  renames a file of a Filesystem provider into `.music-assistant-trash/` at
-  the root of that provider's folder, keeping its relative path; same
-  filesystem, so no copy is made and the sync skips the dot folder. `restore`
-  renames it back and refuses when the original path is taken again. `empty`
-  is the only command that deletes anything. Every path is checked with the
-  server's own `is_safe_path` against the provider's folder, the provider
-  must have a `base_path` (the Filesystem family), and the commands carry
-  the scope that already guards provider mappings (`LIBRARY_MANAGE`). The
-  server itself never touches files on disk.
+- `library_trash.py`: a plugin provider registering four `music/trash/*`
+  commands (`move`, `list`, `restore`, `empty`) that give the fork
+  frontend's Duplicates page one reversible step past removing a library
+  row. `move` renames a file of a Filesystem provider into
+  `.music-assistant-trash/` at the root of that provider's folder, keeping
+  its relative path; same filesystem, so no copy is made and the sync skips
+  the dot folder. `restore` renames it back and refuses when the original
+  path is taken again. `empty` is the only command that deletes anything.
+  Every path is checked with the server's own `is_safe_path` against the
+  provider's folder, the provider must have a `base_path` (the Filesystem
+  family), and the commands carry the scope that already guards provider
+  mappings (`LIBRARY_MANAGE`). The server itself never touches files on
+  disk. Originally an anchor patch on the music controller; moved to a
+  plugin because the handlers had no dependency on that controller beyond
+  `self.logger` and `self.mass.get_provider`, both available on the base
+  `Provider` class (see `docs/decisions.md`). This retires the last anchor
+  patch on `controllers/music/controller.py`.
 
 `tests/test_patches.py` applies each script to a copy of the upstream modules
 kept under `tests/fixtures/` and pins the copies to the server version in the

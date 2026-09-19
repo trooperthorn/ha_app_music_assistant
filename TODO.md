@@ -157,6 +157,27 @@ Options on the table when it's picked back up:
   needs new infrastructure that doesn't exist yet (no generic "does this RPC
   exist" check anywhere in the app today).
 
+## 5. `gh pr merge --auto` races the checks it is supposed to wait on (queued 2026-09-19)
+
+Both `.github/workflows/sync-upstream.yml` (around line 135) and
+`.github/workflows/prepare-release.yml` (around line 163) create their
+automation PR and immediately call
+`gh pr merge "$PR_NUMBER" --auto --squash --delete-branch`. If the PR's own
+checks (this repo's `Test` workflow) have not registered against the PR yet
+at that moment, the call fails with
+`GraphQL: Pull request is in unstable status (enablePullRequestAutoMerge)`.
+
+**Symptom**: a green automation PR is created but the auto-merge enable
+call fails silently in the workflow logs, so nothing ever merges it and it
+sits open. This happened for real on 2026-09-19 to a sync-upstream PR and
+had to be merged by hand.
+
+**Fix, next cleanup task, not done in this PR**: both workflows need to
+either poll/retry `gh pr merge --auto` until the checks have registered (or
+until the merge call itself succeeds), or wait for the checks to start
+before making the call. Cover both workflows in the same fix so they don't
+drift out of sync with each other again.
+
 ## Notes for anyone contributing upstream later
 
 - Per standing project policy, no PRs or issues get opened on non-`trooperthorn`
