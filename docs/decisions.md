@@ -1,5 +1,55 @@
 # Decisions
 
+## Server 2.10.4 compat: fixtures carried a latent bare-except bug (2026-09-19)
+
+`Sync upstream pins (#45)` moved `SERVER_VERSION` from 2.10.3 to 2.10.4
+without refreshing `tests/fixtures/*_2_10_3.py` or re-running
+`tests/test_patches.py`, so `test_the_fixture_matches_the_pinned_server_release`
+started failing (it asserts the Dockerfile pin) and the fixture stopped
+matching what the app actually ships.
+
+Refreshing the fixtures from the real `music-assistant/server` tag `2.10.4`
+(fetched from `raw.githubusercontent.com`) showed only one file actually
+changed: `controllers/music/controller.py` gained a `candidate_titles` CTE
+and a `TRACK_RECONCILIATION_MAX_TITLE_ROWS` bound parameter in the duplicate
+track query, to keep the self-join's pairing bounded per title instead of
+scanning every track pair. `config/providers.py`, `player_queues/queue_loader.py`,
+`streams/audio.py`, `providers/hass_players/player.py` and
+`providers/sendspin/player.py` are byte-identical to 2.10.3. aiosendspin
+stays pinned at 9.1.1 for 2.10.4 (the server's `requirements_all.txt`
+pin did not move), so the `aiosendspin_*_9_1_1.py` fixtures needed no change.
+
+Separately, and **not caused by the version bump**: `music_controller_2_10_3.py`,
+`streams_audio_2_10_3.py` and `sendspin_player_2_10_3.py` each carried several
+bare multi-exception clauses (`except A, B:` instead of `except (A, B):`),
+which is not valid Python 3 syntax. Checking out the commit immediately
+before the sync (`Sync upstream pins (#45)`'s parent) and running the same
+suite reproduces 6 of the 7 failures already, unrelated to the pin: the
+`ast.parse`/`compile` calls in `test_music_trash_*`, `test_steer_*` and
+`test_opus_bitrate_*` were breaking on this pre-existing syntax before the
+bump too, since PR #37 first vendored `music_controller_2_10_3.py`. None of
+the three affected patches (`music_trash.py`, `play_source_steer.py`,
+`sendspin_opus_bitrate.py`) touch the lines in question, so their anchors
+and splices were never the problem; the vendored copies themselves were
+invalid syntax. Fixed by parenthesizing the exception tuples in the
+refreshed fixtures (behavior unchanged, only the grouping needed for valid
+Python 3), and renaming every server-pinned fixture from `*_2_10_3.py` to
+`*_2_10_4.py`. Only `test_the_fixture_matches_the_pinned_server_release`'s
+failure was actually caused by the version bump; the other six were a
+latent gap in test coverage that the bump happened to surface at the same
+time.
+
+**Gap in the automation.** `scripts/sync_upstream.py` resolves and writes
+`SERVER_VERSION`/`SERVER_DIGEST` and the upstream app config, but it does not
+run `pytest tests/test_patches.py` (or any test) against the new pin before
+`sync-upstream.yml` opens its auto-merging PR, and it never touches
+`tests/fixtures/`. A pin bump that breaks a patch anchor, or that ships with
+a fixture that was already broken, merges to main unnoticed until someone
+runs the suite by hand. This is a documentation-only observation: the sync
+workflow and script are left as they are; whether to add a fixture-refresh
+and `pytest tests/test_patches.py` step to `sync-upstream.yml` (failing the
+auto-merge, or opening a draft PR instead) is for a human to decide.
+
 ## Build on the host, no registry image (2026-09-12)
 
 The official app pulls `ghcr.io/music-assistant/server`; this app has no

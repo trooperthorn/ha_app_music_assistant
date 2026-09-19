@@ -83,6 +83,7 @@ from music_assistant.controllers.music.constants import (
     SEARCH_PROVIDER_SOFT_TIMEOUT,
     TRACK_RECONCILIATION_BATCH_SIZE,
     TRACK_RECONCILIATION_MAX_DURATION_DELTA,
+    TRACK_RECONCILIATION_MAX_TITLE_ROWS,
     TRACK_RECONCILIATION_TASK_ID,
 )
 from music_assistant.controllers.music.database import (
@@ -193,14 +194,29 @@ def _album_title_match(base: str, other: str) -> str:
 # normalize to nothing (symbol-only album names) are excluded there, as they would match
 # every other such album. Rows that already share a provider are skipped, as a provider
 # listing the same recording twice is a separate (and far riskier) case.
+# Pairing the rows of a title is quadratic in their count, and the query runs on the single
+# library connection, where anything slow holds up every other library query. The self-join
+# is therefore confined to titles held by more than one provider, shared by a bounded number
+# of rows, excluding titles whose normalized value is empty.
 _DUPLICATE_TRACK_CANDIDATES_QUERY = f"""
+WITH candidate_titles AS (
+    SELECT t.search_name
+    FROM {DB_TABLE_TRACKS} t
+    LEFT JOIN {DB_TABLE_PROVIDER_MAPPINGS} pm
+      ON pm.media_type = 'track' AND pm.item_id = t.item_id
+    WHERE t.search_name != ''
+    GROUP BY t.search_name
+    HAVING count(DISTINCT pm.provider_domain) > 1
+       AND count(DISTINCT t.item_id) <= :max_title_rows
+)
 SELECT t1.item_id AS item_id_1, t2.item_id AS item_id_2
 FROM {DB_TABLE_TRACKS} t1
 JOIN {DB_TABLE_TRACKS} t2
   ON t2.search_name = t1.search_name
  AND t2.item_id > t1.item_id
  AND abs(t2.duration - t1.duration) <= :max_duration_delta
-WHERE (t1.item_id > :cursor_item_id_1
+WHERE t1.search_name IN (SELECT search_name FROM candidate_titles)
+  AND (t1.item_id > :cursor_item_id_1
        OR (t1.item_id = :cursor_item_id_1 AND t2.item_id > :cursor_item_id_2))
   AND EXISTS (
     SELECT 1 FROM {DB_TABLE_TRACK_ARTISTS} ta1
@@ -1216,7 +1232,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             # instead of bubbling MediaNotFoundError from get_item_by_uri.
             try:
                 uri_media_type, _, _ = await parse_uri(item)
-            except InvalidProviderURI, InvalidProviderID:
+            except (InvalidProviderURI, InvalidProviderID):
                 uri_media_type = None
             if uri_media_type in (MediaType.AUDIO_SOURCE, MediaType.SOUND_EFFECT):
                 raise UnsupportedFeaturedException(
@@ -1328,7 +1344,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             # Mirrors the same guard in add_item_to_favorites.
             try:
                 uri_media_type, _, _ = await parse_uri(item)
-            except InvalidProviderURI, InvalidProviderID:
+            except (InvalidProviderURI, InvalidProviderID):
                 uri_media_type = None
             if uri_media_type in (MediaType.AUDIO_SOURCE, MediaType.SOUND_EFFECT):
                 raise UnsupportedFeaturedException(
@@ -2158,7 +2174,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         async def _rewrite(uri: str) -> str | None:
             try:
                 media_type, provider, item_id = await parse_uri(uri)
-            except InvalidProviderURI, InvalidProviderID, KeyError, ValueError:
+            except (InvalidProviderURI, InvalidProviderID, KeyError, ValueError):
                 return uri
             if provider != provider_instance:
                 return uri
@@ -2185,7 +2201,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         async def _rewrite(uri: str) -> str | None:
             try:
                 media_type, provider, item_id = await parse_uri(uri)
-            except InvalidProviderURI, InvalidProviderID, KeyError, ValueError:
+            except (InvalidProviderURI, InvalidProviderID, KeyError, ValueError):
                 return uri
             if provider == "library" or provider in known_providers:
                 return uri
@@ -2207,7 +2223,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         async def _rewrite(uri: str) -> str | None:
             try:
                 media_type, provider, item_id = await parse_uri(uri)
-            except InvalidProviderURI, InvalidProviderID, KeyError, ValueError:
+            except (InvalidProviderURI, InvalidProviderID, KeyError, ValueError):
                 return uri
             if provider != "library":
                 return uri
@@ -2217,7 +2233,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 return uri
             try:
                 await ctrl.get_library_item(item_id)
-            except MediaNotFoundError, ValueError:
+            except (MediaNotFoundError, ValueError):
                 return None
             return uri
 
@@ -2937,6 +2953,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             _DUPLICATE_TRACK_CANDIDATES_QUERY,
             {
                 "max_duration_delta": TRACK_RECONCILIATION_MAX_DURATION_DELTA,
+                "max_title_rows": TRACK_RECONCILIATION_MAX_TITLE_ROWS,
                 "cursor_item_id_1": cursor[0],
                 "cursor_item_id_2": cursor[1],
             },
@@ -3389,7 +3406,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
 
         try:
             media_type, provider_instance_id_or_domain, item_id = await parse_uri(uri)
-        except InvalidProviderURI, InvalidProviderID:
+        except (InvalidProviderURI, InvalidProviderID):
             return False
 
         # fast return for a provider uri which is not part of a user with a provider filter
@@ -3418,7 +3435,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 provider_instance_id_or_domain=provider_instance_id_or_domain,
                 allow_update_metadata=False,  # no need trigger more methods
             )
-        except MediaNotFoundError, NotImplementedError:
+        except (MediaNotFoundError, NotImplementedError):
             # NotImplementedError: the uri has a valid format, but specifies an unknown media type
             return False
 
