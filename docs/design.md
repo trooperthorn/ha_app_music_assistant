@@ -49,7 +49,12 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are five:
+Today there are six: three anchor patches that rewrite exact lines in an
+already-installed file, and three plugin providers that add a self-contained
+new provider directory instead (see `docs/extension-points.md` for the
+distinction).
+
+Anchor patches:
 
 - `hass_source_select.py`: the Home Assistant player provider mirrors the
   wrapped entity's `source_list` as selectable player sources (which gives
@@ -77,6 +82,21 @@ Today there are five:
   web player uses it as the lower rungs of its adaptive mode and from the
   phone layout's menu. Its fixtures are pinned to the aiosendspin release
   the server pins (9.1.1 for 2.10.3).
+
+Plugin providers:
+
+- `playlist_bridge.py`: a plugin provider registering a
+  `playlist_bridge/migrate_playlist` command that migrates a library
+  playlist's tracks into another provider's own playlist, reusing only the
+  already-merged, safe parts of the upstream playlist pipeline
+  (`export_playlist`, `import_playlist` with library matching, and the
+  generic `create_playlist`/`add_playlist_tracks`). It exists because the
+  fork frontend's "Migrate Playlist" dialog calls a command upstream never
+  shipped in a mergeable form (server PR #5926, closed unmerged with
+  unresolved authorization and false-success bugs); a reworked version
+  merged upstream as PR #5989 for server 2.11.0, so this plugin is a bridge
+  for the 2.10.x line only and retires itself once the pin crosses 2.11.0
+  (`tests/test_patches.py` carries the tripwire; see `docs/decisions.md`).
 - `folder_browser.py`: a plugin provider registering a
   `config/providers/browse_path` command that lists the folders under the
   app's music roots (`/music`, the drive this app mounts; `/media`;

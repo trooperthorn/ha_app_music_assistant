@@ -157,7 +157,7 @@ Options on the table when it's picked back up:
   needs new infrastructure that doesn't exist yet (no generic "does this RPC
   exist" check anywhere in the app today).
 
-## 5. `gh pr merge --auto` races the checks it is supposed to wait on (queued 2026-09-19)
+## 5. `gh pr merge --auto` races the checks it is supposed to wait on — FIXED
 
 Both `.github/workflows/sync-upstream.yml` (around line 135) and
 `.github/workflows/prepare-release.yml` (around line 163) create their
@@ -172,11 +172,11 @@ call fails silently in the workflow logs, so nothing ever merges it and it
 sits open. This happened for real on 2026-09-19 to a sync-upstream PR and
 had to be merged by hand.
 
-**Fix, next cleanup task, not done in this PR**: both workflows need to
-either poll/retry `gh pr merge --auto` until the checks have registered (or
-until the merge call itself succeeds), or wait for the checks to start
-before making the call. Cover both workflows in the same fix so they don't
-drift out of sync with each other again.
+**Fix (2026-09-19)**: both workflows now retry the `gh pr merge --auto`
+call, up to 6 attempts with a 10s sleep between them, instead of failing on
+the first "unstable status" response. Every attempt failing still fails the
+step loudly (with the manual `gh pr merge` command to run) so a genuine
+problem is never silently swallowed.
 
 ## Notes for anyone contributing upstream later
 
