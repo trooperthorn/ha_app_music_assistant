@@ -2,6 +2,7 @@
 
 ## 2026-09-19
 
+- Fork frontend v2026.09.19.1 -> v2026.09.19.2
 - Music Assistant server 2.10.3 -> 2.10.4
 - Fork frontend v2026.09.16.2 -> v2026.09.19.1
 
