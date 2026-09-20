@@ -171,11 +171,13 @@ Nothing writes to the drive on its own. An exFAT volume gets a read-only
 check at every start; one that was not cleanly ejected is mounted read-only
 and the log says so. Writes happen only through `music_drive_task`, one
 task per start, each reporting under `/share/music-drive-backup/<label>`:
-`backup` (rsync copy plus a size-and-SHA-256 manifest), `verify` (the drive
+`backup` (rsync copy plus independent source/destination SHA-256 snapshots,
+published only when the source stayed stable and the copy matches, with the prior
+set retained for crash recovery during promotion), `verify` (the drive
 against the manifest, a report of missing, changed and new files),
 `restore` (the reported files copied back from the backup) and `repair`
 (the exFAT check with repair, run before the mount and refused without a
-manifest, so a backup always precedes it). The wrapper is tested in
+valid completed recovery set, so a verified backup always precedes it). The wrapper is tested in
 `tests/test_drive_wrapper.py` with the host commands stubbed.
 
 ## Two upstreams and one fork

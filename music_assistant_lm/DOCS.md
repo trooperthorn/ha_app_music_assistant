@@ -21,11 +21,20 @@ rather than emptying the library.
 
 An exFAT drive that was not cleanly ejected is mounted read-only. The tasks
 exist so that repairing it never risks data: run `backup` (the drive is
-copied to `/share/music-drive-backup/<label>` with a checksum manifest),
+copied to `/share/music-drive-backup/<label>` and independently hashed),
 then `repair`, then `verify` (a report of anything the repair changed) and,
 if the report lists files, `restore` (copies them back from the backup).
 Each task runs once at the next start and the log tells you when to set
 the option back to `none`.
+
+A successful backup contains `manifest.sha256` plus `backup-set.json`. The
+completion record is published only after the source is unchanged
+across the copy and every destination file matches the source snapshot. A
+failed or interrupted run has no completion record, so repair and restore are
+refused. Promotion keeps the previous verified set and automatically restores
+it if the app lost power between directory renames. Verify, restore and repair
+also validate the recovery set before using it; corruption in the backup cannot
+silently become restore input.
 
 The fork frontend's Duplicates page can move lesser copies and orphaned CUE
 sheets into a trash folder on the drive (`.music-assistant-trash/` at the

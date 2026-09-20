@@ -14,8 +14,9 @@ cleanly ejected) is mounted read-only and the log says so. Writing only
 happens through the ``music_drive_task`` option, one task per start, each
 logged and each leaving a report under the backup folder:
 
-- ``backup``: copy the drive to ``/share/music-drive-backup/<label>`` with
-  rsync and write a manifest (size and SHA-256 of every file).
+- ``backup``: copy the drive into a staging set, independently hash source and
+  destination, then publish it at ``/share/music-drive-backup/<label>`` only
+  when the source stayed stable and every copied byte matches.
 - ``verify``: hash the drive again and report what is missing, changed or
   new against the manifest.
 - ``restore``: copy every file the last verify reported missing or changed
@@ -44,6 +45,7 @@ ENTRYPOINT = "/usr/local/bin/entrypoint.sh"
 MOUNT_ROOT = Path("/music")
 BACKUP_ROOT = Path("/share/music-drive-backup")
 MANIFEST_NAME = "manifest.sha256"
+COMPLETION_NAME = "backup-set.json"
 REPORT_NAME = "verify-report.txt"
 TASKS = ("none", "backup", "verify", "restore", "repair")
 # the drive is internal, but enumeration can trail the container start
@@ -141,15 +143,17 @@ def unmount(target: Path) -> None:
 # ---- tasks -------------------------------------------------------------------
 
 
-def walk_files(root: Path) -> list[Path]:
+def walk_files(root: Path, exclude_root_files: set[str] | None = None) -> list[Path]:
     """Every regular file under root, relative, sorted; hidden trash skipped."""
+    exclude_root_files = exclude_root_files or set()
     files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for name in filenames:
             path = Path(dirpath) / name
-            if path.is_file():
-                files.append(path.relative_to(root))
+            rel = path.relative_to(root)
+            if path.is_file() and not (len(rel.parts) == 1 and name in exclude_root_files):
+                files.append(rel)
     return sorted(files)
 
 
@@ -161,9 +165,9 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_manifest(root: Path, manifest: Path) -> int:
+def write_manifest(root: Path, manifest: Path, exclude_root_files: set[str] | None = None) -> int:
     """size, sha256 and path of every file under root; returns the count."""
-    files = walk_files(root)
+    files = walk_files(root, exclude_root_files)
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w", encoding="utf-8", newline="\n") as out:
         for index, rel in enumerate(files, 1):
@@ -174,6 +178,30 @@ def write_manifest(root: Path, manifest: Path) -> int:
     return len(files)
 
 
+def manifests_match(left: Path, right: Path) -> bool:
+    """Return whether two complete snapshots describe identical bytes."""
+    return read_manifest(left) == read_manifest(right)
+
+
+def _temporary_manifest(backup: Path, purpose: str) -> Path:
+    """A same-filesystem temporary path suitable for an atomic publish."""
+    return backup.parent / f".{backup.name}.{purpose}.{os.getpid()}.tmp"
+
+
+def _remove_if_present(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _remove_tree_if_present(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
 def read_manifest(manifest: Path) -> dict[str, tuple[int, str]]:
     entries: dict[str, tuple[int, str]] = {}
     for line in manifest.read_text(encoding="utf-8").splitlines():
@@ -182,38 +210,147 @@ def read_manifest(manifest: Path) -> dict[str, tuple[int, str]]:
     return entries
 
 
-def task_backup(mount_point: Path, backup: Path) -> None:
-    backup.mkdir(parents=True, exist_ok=True)
-    log(f"backup: copying {mount_point} to {backup} (rsync, resumable)")
-    result = subprocess.run(  # noqa: S603
-        [
-            "rsync",
-            "-rt",
-            "--modify-window=2",
-            "--no-perms",
-            "--no-owner",
-            "--no-group",
-            *(f"--exclude=/{name}" for name in SKIP_DIRS),
-            f"{mount_point}/",
-            f"{backup}/",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        log(f"backup: rsync exit code {result.returncode}: {result.stderr.strip()[-400:]}")
-        log("backup: manifest not written; fix the cause and run the task again")
-        return
-    count = write_manifest(mount_point, backup / MANIFEST_NAME)
-    log(f"backup: done, {count} files copied and hashed; manifest at {backup / MANIFEST_NAME}")
-    log("backup: set music_drive_task back to none")
+def _published_marker_is_valid(backup: Path) -> bool:
+    manifest = backup / MANIFEST_NAME
+    completion = backup / COMPLETION_NAME
+    try:
+        metadata = json.loads(completion.read_text(encoding="utf-8"))
+        return bool(
+            metadata.get("schema_version") == 1
+            and metadata.get("status") == "complete"
+            and metadata.get("manifest") == MANIFEST_NAME
+            and metadata.get("manifest_sha256") == sha256_of(manifest)
+        )
+    except (OSError, ValueError, TypeError):
+        return False
 
 
-def compare(root: Path, manifest: Path) -> tuple[list[str], list[str], list[str]]:
+def recover_interrupted_promotion(backup: Path) -> None:
+    """Restore the prior verified set if power was lost during promotion."""
+    previous = backup.parent / f"{backup.name}.previous"
+    if not backup.exists() and _published_marker_is_valid(previous):
+        os.replace(previous, backup)
+        log(f"backup: recovered the previous verified set at {backup}")
+
+
+def completed_backup_is_valid(backup: Path, verify_files: bool = False) -> bool:
+    """Validate the published marker and, optionally, every destination byte."""
+    recover_interrupted_promotion(backup)
+    manifest = backup / MANIFEST_NAME
+    try:
+        if not _published_marker_is_valid(backup):
+            return False
+        if not verify_files:
+            return True
+        missing, changed, new = compare(
+            backup,
+            manifest,
+            {MANIFEST_NAME, COMPLETION_NAME, REPORT_NAME},
+        )
+        return not (missing or changed or new)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def task_backup(mount_point: Path, backup: Path) -> bool:
+    """Copy and independently validate a stable source snapshot."""
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    recover_interrupted_promotion(backup)
+    candidate = backup.parent / f".{backup.name}.candidate.{os.getpid()}"
+    previous = backup.parent / f"{backup.name}.previous"
+    _remove_tree_if_present(candidate)
+    candidate.mkdir()
+    manifest = candidate / MANIFEST_NAME
+    completion = candidate / COMPLETION_NAME
+    source_before = _temporary_manifest(backup, "source-before")
+    source_after = _temporary_manifest(backup, "source-after")
+    destination = _temporary_manifest(backup, "destination")
+    completion_tmp = _temporary_manifest(backup, "completion")
+    control_files = {MANIFEST_NAME, COMPLETION_NAME, REPORT_NAME}
+    try:
+        log("backup: hashing the source before copy")
+        count = write_manifest(mount_point, source_before)
+        log(f"backup: copying {mount_point} to a private staging set (rsync, resumable)")
+        result = subprocess.run(  # noqa: S603
+            [
+                "rsync",
+                "-rt",
+                "--delete",
+                "--modify-window=2",
+                "--no-perms",
+                "--no-owner",
+                "--no-group",
+                *(f"--exclude=/{name}" for name in SKIP_DIRS),
+                f"{mount_point}/",
+                f"{candidate}/",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            log(f"backup: rsync exit code {result.returncode}: {result.stderr.strip()[-400:]}")
+            log("backup: no completed backup set was published; fix the cause and run the task again")
+            return False
+
+        log("backup: independently hashing the copied destination")
+        write_manifest(candidate, destination, control_files)
+        log("backup: confirming the source did not change during the copy")
+        write_manifest(mount_point, source_after)
+        if not manifests_match(source_before, source_after):
+            log("backup: source changed while it was being copied; no completed backup set was published")
+            return False
+        if not manifests_match(source_before, destination):
+            log("backup: destination bytes do not match the source; no completed backup set was published")
+            return False
+
+        os.replace(destination, manifest)
+        manifest_digest = sha256_of(manifest)
+        total_bytes = sum(size for size, _digest in read_manifest(manifest).values())
+        completion_tmp.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "complete",
+                    "file_count": count,
+                    "total_bytes": total_bytes,
+                    "manifest": MANIFEST_NAME,
+                    "manifest_sha256": manifest_digest,
+                    "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(completion_tmp, completion)
+        _remove_tree_if_present(previous)
+        if backup.exists():
+            os.replace(backup, previous)
+        try:
+            os.replace(candidate, backup)
+        except OSError:
+            if previous.exists() and not backup.exists():
+                os.replace(previous, backup)
+            raise
+        log(f"backup: complete and verified, {count} files; recovery set at {backup}")
+        log("backup: set music_drive_task back to none")
+        return True
+    finally:
+        for temporary in (source_before, source_after, destination, completion_tmp):
+            _remove_if_present(temporary)
+        _remove_tree_if_present(candidate)
+
+
+def compare(
+    root: Path,
+    manifest: Path,
+    exclude_root_files: set[str] | None = None,
+) -> tuple[list[str], list[str], list[str]]:
     """Missing, changed and new files under root against the manifest."""
     expected = read_manifest(manifest)
-    present = {rel.as_posix() for rel in walk_files(root)}
+    present = {rel.as_posix() for rel in walk_files(root, exclude_root_files)}
     missing = sorted(set(expected) - present)
     new = sorted(present - set(expected))
     changed: list[str] = []
@@ -229,12 +366,13 @@ def compare(root: Path, manifest: Path) -> tuple[list[str], list[str], list[str]
 
 def task_verify(mount_point: Path, backup: Path) -> None:
     manifest = backup / MANIFEST_NAME
-    if not manifest.is_file():
-        log("verify: no manifest; run the backup task first")
+    if not completed_backup_is_valid(backup, verify_files=True):
+        log("verify: no valid completed backup set; run the backup task first")
         return
     missing, changed, new = compare(mount_point, manifest)
     report = backup / REPORT_NAME
     with report.open("w", encoding="utf-8", newline="\n") as out:
+        out.write(f"manifest_sha256\t{sha256_of(manifest)}\n")
         out.write(f"verify of {mount_point} against {manifest} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         out.write(f"missing {len(missing)}, changed {len(changed)}, new {len(new)}\n")
         for label, items in (("missing", missing), ("changed", changed), ("new", new)):
@@ -249,20 +387,41 @@ def task_restore(mount_point: Path, backup: Path) -> None:
     if not report.is_file():
         log("restore: no verify report; run the verify task first")
         return
+    if not completed_backup_is_valid(backup, verify_files=True):
+        log("restore: backup destination verification failed; run the backup task again")
+        return
+    lines = report.read_text(encoding="utf-8").splitlines()
+    expected_report_header = f"manifest_sha256\t{sha256_of(backup / MANIFEST_NAME)}"
+    if not lines or lines[0] != expected_report_header:
+        log("restore: verify report does not belong to this backup set; run verify again")
+        return
+    manifest_entries = read_manifest(backup / MANIFEST_NAME)
     restored = failed = 0
-    for line in report.read_text(encoding="utf-8").splitlines():
+    for line in lines[1:]:
         kind, _, rel = line.partition("\t")
         if kind not in ("missing", "changed") or not rel:
             continue
+        rel_path = Path(rel)
+        if rel not in manifest_entries or rel_path.is_absolute() or ".." in rel_path.parts:
+            failed += 1
+            log(f"restore: refused invalid path {rel!r}")
+            continue
         source = backup / rel
         target = mount_point / rel
+        temporary = target.parent / f".{target.name}.restore.{os.getpid()}.tmp"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            shutil.copyfile(source, temporary)
+            size, digest = manifest_entries[rel]
+            if temporary.stat().st_size != size or sha256_of(temporary) != digest:
+                raise OSError("copied bytes do not match the backup manifest")
+            os.replace(temporary, target)
             restored += 1
         except OSError as err:
             failed += 1
             log(f"restore: {rel}: {err}")
+        finally:
+            _remove_if_present(temporary)
     log(f"restore: {restored} files copied back, {failed} failed; run verify again to confirm")
     log("restore: set music_drive_task back to none")
 
@@ -322,8 +481,8 @@ def main(argv: list[str]) -> int:
     if task == "repair":
         if fstype != "exfat":
             log("repair: only exFAT is repaired here")
-        elif not (backup / MANIFEST_NAME).is_file():
-            log("repair: refused, no backup manifest; run the backup task first")
+        elif not completed_backup_is_valid(backup, verify_files=True):
+            log("repair: refused, no completed verified backup set; run the backup task first")
         elif clean:
             log("repair: the volume is already clean; nothing to do")
         else:
@@ -347,7 +506,8 @@ def main(argv: list[str]) -> int:
         return run_server(argv)
     finally:
         if worker and worker.is_alive():
-            log(f"the {task} task was still running at stop; run it again to finish")
+            log(f"waiting for the {task} task to finish before unmounting")
+            worker.join()
         unmount(mount_point)
 
 
