@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.6 -> v2026.09.20.7
 - Fork frontend v2026.09.20.5 -> v2026.09.20.6
 - Library Enrichment adds API-v1 read-only typed Spotify provenance from immutable
   captures and links builtin playlist destinations to archive/checkpoint state,
