@@ -76,34 +76,13 @@ def test_parse_server_version_compares_correctly_around_the_2_11_boundary() -> N
     assert _parse_server_version('ARG SERVER_VERSION="2.11.0b1"') >= (2, 11, 0)
 
 
-def test_playlist_bridge_is_retired_once_the_server_pin_reaches_2_11() -> None:
-    """
-    Upstream server#5989 ("cross-provider playlist migration"), merged
-    2026-09-03, registers `music/playlists/migrate_playlist` -- the exact
-    command name the fork frontend originally called -- starting in server
-    release 2.11.0. Once music_assistant_lm/Dockerfile's SERVER_VERSION pin
-    reaches 2.11.0 or later, this fork's own playlist_bridge plugin is
-    redundant and should be retired:
-
-    1. Remove music_assistant_lm/patches/playlist_bridge.py, its
-       docs/upstream-review.md references, and its COPY/RUN lines in
-       music_assistant_lm/Dockerfile.
-    2. In trooperthorn/HA_int_MA-UI, revert api.migratePlaylist() to call
-       the now-upstream `music/playlists/migrate_playlist` instead of
-       `playlist_bridge/migrate_playlist`.
-
-    scripts/sync_upstream.py bumps SERVER_VERSION automatically, so this
-    test is the tripwire that catches the pin crossing that line.
-    """
+def test_playlist_bridge_requires_responsibility_review_at_2_11() -> None:
+    """Migration parity does not establish archive parity at an upstream bump."""
     assert _pinned_server_version() < (2, 11, 0), (
-        "SERVER_VERSION reached 2.11.0+: upstream server#5989 now ships "
-        "cross-provider playlist migration natively. Read "
-        "docs/playlist-bridge-vs-upstream.md for the full keep/modify/drop "
-        "contract before doing anything else -- the pre-decided verdict "
-        "there is DROP. Retire the playlist_bridge plugin "
-        "(music_assistant_lm/patches/playlist_bridge.py and its Dockerfile "
-        "wiring) and revert api.migratePlaylist() in trooperthorn/HA_int_MA-UI "
-        "back to music/playlists/migrate_playlist."
+        "SERVER_VERSION reached 2.11.0+: review migration parity and preserve or "
+        "replace archival before retiring the bridge. Read "
+        "docs/playlist-bridge-vs-upstream.md. Selected enrichment captures do not "
+        "yet replace builtin mirror application or bulk controls."
     )
 
 

@@ -1,0 +1,12 @@
+{
+  "type": "plugin",
+  "stage": "experimental",
+  "domain": "library_enrichment",
+  "name": "Library Enrichment",
+  "description": "Selected Spotify playlist metadata archives with durable ordered versions.",
+  "codeowners": ["@trooperthorn"],
+  "requirements": [],
+  "multi_instance": false,
+  "builtin": false,
+  "icon": "archive"
+}
