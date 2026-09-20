@@ -3,6 +3,9 @@
 ## 2026-09-20
 
 - Fork frontend v2026.09.20.1 -> v2026.09.20.2
+- Library Enrichment can explicitly project a committed archive version into a
+  visible builtin playlist with omission review, ordered-reference verification,
+  durable idempotency and separate applied checkpoints.
 - Fork frontend v2026.09.19.5 -> v2026.09.20.1
 
 ## 2026-09-19
@@ -53,4 +56,3 @@
 - Fork frontend v2026.09.12.2 -> v2026.09.12.4
 - Fork frontend none -> v2026.09.12.2
 - First definition: upstream server 2.10.3; the fork frontend is pinned by the first upstream sync once its wheel is published.
-

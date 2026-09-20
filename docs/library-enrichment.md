@@ -32,9 +32,16 @@ provider before its commands are registered. It never auto-starts a capture.
 - Optional capture preconditions bind a request to the account and snapshot shown
   in the user's preview. A mismatch fails before writing archive state.
 - Bounded historical version listing returns metadata without loading occurrences.
+- An administrator with library-write permission can preview and explicitly apply
+  one committed version as a visible builtin playlist. The projection preserves
+  ordered duplicate Spotify track references, reports every omitted occurrence,
+  verifies the stored M3U order, and records its applied checkpoint separately.
+- Apply intent is durable and idempotent. Once playlist creation starts, an
+  unverified failure becomes `uncertain` and is never retried automatically.
 
-These are metadata/reference archives, not downloaded audio. This slice does not
-apply MA builtin mirrors, schedule sync, expose a bulk UI, support Liked Songs,
+These are metadata/reference archives, not downloaded audio. A visible applied
+playlist contains Spotify references and does not establish local playback. This
+slice does not maintain a synchronized mirror, schedule sync, expose a bulk UI, support Liked Songs,
 perform local matching, enforce playback source policies, or replace coordinated
 MA backup/restore. It does not change ordinary detail-page behavior. The existing
 bridge bulk copy remains a separate name-based export and is not a durable archive.
@@ -58,6 +65,9 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/version` | `version_id` | immutable ordered occurrence capture, verified against content digest |
 | `library_enrichment/versions` | `subscription_id`, optional `limit` (1..200, default 50), `offset` | newest-first version metadata; stable timestamp/ID ordering |
 | `library_enrichment/cancel` | `job_id` | final durable state; an already executing atomic commit can win the cancellation race |
+| `library_enrichment/apply_preview` | `version_id` | exact projection digest, source/projected counts, omissions, partial-consent requirement and existing destination |
+| `library_enrichment/apply` | `version_id`, `expected_digest`, optional `allow_partial` | create and verify one visible builtin playlist; also requires `library.write` |
+| `library_enrichment/apply_status` | `version_id` | durable apply state and destination without starting or retrying a write |
 
 The playlist ID is the 22-character source ID, not a URL, title or MA integer ID.
 The provider instance ID must identify a currently available Spotify instance in
@@ -101,6 +111,6 @@ a real installation, complete image CI and a selected-source test plus independe
 backup/restore proof. Keep historical versions and archive data during upgrades or
 provider removal; do not substitute a new empty database after a migration error.
 
-Next work: builtin mirror apply and reconciliation, broader read-only inspection
-UI, source retention controls and a
-coordinated recovery set. Matching and enrichment follow those preservation gates.
+Next work: uncertain-apply reconciliation, scheduled snapshot-aware refresh,
+broader read-only inspection UI, source retention controls and a coordinated
+recovery set. Local matching and playback policy follow those preservation gates.

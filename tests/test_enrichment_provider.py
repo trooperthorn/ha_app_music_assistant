@@ -23,6 +23,7 @@ def plugin(monkeypatch, tmp_path):
 
     class Scope(StrEnum):
         CONFIG_PROVIDERS_WRITE = "config.providers.write"
+        LIBRARY_WRITE = "library.write"
 
     class MediaType(StrEnum):
         TRACK = "track"
@@ -135,6 +136,164 @@ def test_preview_and_inspection_do_not_mutate_archive_or_schedule_refresh(plugin
     assert not plugin.handlers
 
 
+def _apply_fixture(plugin, *, omitted=False, empty=False):
+    store = plugin.provider._store
+    subscription = store.upsert_subscription("spotify", "account-a", "A" * 22, "spotify-a", "My archive")
+    job = store.begin_capture(subscription["id"], "source-snapshot")
+    rows = [] if empty else [{"position": index, "state": "track", "source_item_id": "T" * 22} for index in range(2)]
+    if omitted:
+        rows.append({"position": len(rows), "state": "null", "source_payload": None})
+    version_id = store.commit_capture(job, snapshot_before="source-snapshot", snapshot_after="source-snapshot",
+                                      total=len(rows), occurrences=rows)
+    builtin = types.SimpleNamespace(instance_id="builtin", domain="builtin", available=True, _read_m3u_file=AsyncMock())
+    destination = types.SimpleNamespace(
+        item_id="123", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="copy")]
+    )
+
+    async def import_playlist(m3u, *, library_matching):
+        assert library_matching is False
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    builtin._read_m3u_file.return_value = "#EXTM3U\n#PLAYLIST:Empty\n"
+    plugin.provider.mass.music.providers.append(builtin)
+    playlists = plugin.provider.mass.music.playlists
+    playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    playlists.create_playlist = AsyncMock(return_value=destination)
+    return version_id, builtin, playlists
+
+
+def test_apply_preserves_repeated_occurrences_and_is_idempotent(plugin):
+    version_id, builtin, playlists = _apply_fixture(plugin)
+
+    async def run():
+        preview = await plugin.provider.apply_preview(version_id)
+        assert preview["projected_count"] == 2 and not preview["requires_partial_consent"]
+        result = await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert result["state"] == "applied"
+        assert result["destination"]["item_id"] == "123"
+        assert result["destination"]["uri"] == "library://playlist/123"
+        again = await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert again["id"] == result["id"]
+        assert playlists.import_playlist.await_count == 1
+        m3u = playlists.import_playlist.call_args.args[0]
+        assert m3u.count("spotify://track/" + "T" * 22) == 2
+        builtin._read_m3u_file.assert_awaited_once_with("copy")
+
+    asyncio.run(run())
+
+
+def test_apply_requires_exact_preview_and_partial_consent(plugin):
+    version_id, _, playlists = _apply_fixture(plugin, omitted=True)
+
+    async def run():
+        preview = await plugin.provider.apply_preview(version_id)
+        assert preview["omitted"] == [{"position": 2, "state": "null"}]
+        with pytest.raises(Exception, match="preview again"):
+            await plugin.provider.apply(version_id, "stale-digest", True)
+        with pytest.raises(Exception, match="Explicit consent"):
+            await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert plugin.provider._store.get_apply_for_version(version_id) is None
+        result = await plugin.provider.apply(version_id, preview["projection_digest"], True)
+        assert result["state"] == "partial" and result["omitted_count"] == 1
+        assert playlists.import_playlist.await_count == 1
+
+    asyncio.run(run())
+
+
+def test_empty_projection_creates_visible_builtin_playlist(plugin):
+    version_id, _, playlists = _apply_fixture(plugin, empty=True)
+
+    async def run():
+        preview = await plugin.provider.apply_preview(version_id)
+        result = await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert result["state"] == "applied" and result["projected_count"] == 0
+        playlists.import_playlist.assert_not_called()
+        assert playlists.create_playlist.call_args.kwargs["provider_instance_or_domain"] == "builtin"
+
+    asyncio.run(run())
+
+
+def test_apply_import_failure_is_uncertain_and_cannot_duplicate_on_retry(plugin):
+    version_id, _, playlists = _apply_fixture(plugin)
+    playlists.import_playlist.side_effect = RuntimeError("untrusted remote error")
+
+    async def run():
+        preview = await plugin.provider.apply_preview(version_id)
+        with pytest.raises(Exception, match="outcome uncertain"):
+            await plugin.provider.apply(version_id, preview["projection_digest"])
+        result = await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert result["state"] == "uncertain" and not result["retryable"]
+        assert playlists.import_playlist.await_count == 1
+        assert "untrusted" not in result["error"]
+
+    asyncio.run(run())
+
+
+def test_apply_verifies_exact_destination_order_before_success(plugin):
+    version_id, builtin, playlists = _apply_fixture(plugin)
+    builtin._read_m3u_file.side_effect = AsyncMock(return_value="#EXTM3U\nspotify://track/WRONG\n")
+
+    async def run():
+        preview = await plugin.provider.apply_preview(version_id)
+        with pytest.raises(Exception, match="outcome uncertain"):
+            await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert (await plugin.provider.apply_status(version_id))["state"] == "uncertain"
+        assert playlists.import_playlist.await_count == 1
+
+    asyncio.run(run())
+
+
+def test_apply_remains_available_when_archived_source_provider_is_offline(plugin):
+    version_id, _, playlists = _apply_fixture(plugin)
+    plugin.provider.mass.music.providers[0].available = False
+
+    async def run():
+        preview = await plugin.provider.apply_preview(version_id)
+        result = await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert result["state"] == "applied"
+
+    asyncio.run(run())
+    playlists.import_playlist.assert_awaited_once()
+
+
+def test_disconnected_apply_waits_for_known_outcome_and_does_not_duplicate(plugin):
+    version_id, _, playlists = _apply_fixture(plugin)
+
+    async def run():
+        started, release = asyncio.Event(), asyncio.Event()
+        original = playlists.import_playlist.side_effect
+
+        async def blocked_import(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        playlists.import_playlist.side_effect = blocked_import
+        preview = await plugin.provider.apply_preview(version_id)
+        operation = asyncio.create_task(plugin.provider.apply(version_id, preview["projection_digest"]))
+        await started.wait()
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done() and plugin.provider._write_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        result = await plugin.provider.apply(version_id, preview["projection_digest"])
+        assert result["state"] == "applied"
+        assert playlists.import_playlist.await_count == 1
+
+    asyncio.run(run())
+
+
+def test_apply_requires_library_write_even_with_configuration_permission(plugin, monkeypatch):
+    version_id, _, playlists = _apply_fixture(plugin)
+    monkeypatch.setattr(plugin.module, "has_scope", lambda user, scope: scope != plugin.module.Scope.LIBRARY_WRITE)
+    with pytest.raises(Exception, match="library write permission"):
+        asyncio.run(plugin.provider.apply(version_id, "unused"))
+    playlists.import_playlist.assert_not_called()
+
+
 @pytest.mark.parametrize("user", [None, types.SimpleNamespace(user_id="guest", allowed=False)])
 def test_unauthorized_archive_and_inspection_calls_are_denied(plugin, user):
     plugin.auth.user = user
@@ -158,7 +317,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 9
+    assert len(plugin.registered) == 12
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
