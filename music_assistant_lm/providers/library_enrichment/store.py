@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 
 
@@ -53,7 +53,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -62,6 +62,8 @@ class ArchiveStore:
                     required.update(("subscription_sync_policy", "subscription_sync_state", "sync_jobs"))
                 if version >= 4:
                     required.update(("match_sources", "local_assets", "local_asset_locations", "match_candidates", "match_decisions"))
+                if version >= 5:
+                    required.update(("playback_policies", "playback_projections"))
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if actual != required:
                     raise ValueError("Unexpected enrichment database tables; database untouched")
@@ -81,6 +83,8 @@ class ArchiveStore:
                     self._migrate_v3()
                 if version <= 3:
                     self._migrate_v4()
+                if version <= 4:
+                    self._migrate_v5()
         except Exception:
             self._db.close()
             raise
@@ -213,6 +217,28 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT INTO metadata VALUES ('schema_v4_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=4")
+
+    def _migrate_v5(self) -> None:
+        """Add explicit playback policy and its independent projection checkpoint."""
+        self._db.execute("""CREATE TABLE playback_policies (
+            subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+            mode TEXT NOT NULL DEFAULT 'prefer_spotify'
+              CHECK(mode IN ('prefer_local','local_only','prefer_spotify')),
+            revision INTEGER NOT NULL DEFAULT 0, actor_id TEXT, updated_at TEXT NOT NULL)""")
+        self._db.execute("""CREATE TABLE playback_projections (
+            subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+            version_id TEXT NOT NULL REFERENCES versions(id), policy_revision INTEGER NOT NULL,
+            projection_digest TEXT NOT NULL, source_count INTEGER NOT NULL,
+            projected_count INTEGER NOT NULL, gaps_json TEXT NOT NULL,
+            destination_item_id TEXT, destination_provider_instance TEXT,
+            state TEXT NOT NULL CHECK(state IN ('prepared','writing','applied','failed','uncertain','conflict')),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT)""")
+        self._db.execute(
+            "INSERT INTO playback_policies(subscription_id,updated_at) SELECT id,? FROM subscriptions", (_now(),)
+        )
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT INTO metadata VALUES ('schema_v5_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=5")
 
     @staticmethod
     def _json_object(value: dict | None, label: str) -> str:
@@ -859,6 +885,104 @@ class ArchiveStore:
                 raise ValueError("Cannot rewrite an applied checkpoint")
             self._db.execute("UPDATE apply_jobs SET state='conflict',error=?,updated_at=? WHERE id=?", (error, _now(), job_id))
 
+    def get_playback_policy(self, subscription_id: str) -> dict:
+        with self._lock:
+            self.get_subscription(subscription_id)
+            row = self._db.execute(
+                "SELECT * FROM playback_policies WHERE subscription_id=?", (subscription_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Playback policy is missing")
+            return dict(row)
+
+    def set_playback_policy(self, subscription_id: str, mode: str, expected_revision: int, actor_id: str | None = None) -> dict:
+        if mode not in ("prefer_local", "local_only", "prefer_spotify"):
+            raise ValueError("Playback mode must be prefer_local, local_only or prefer_spotify")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("Expected playback policy revision must be a nonnegative integer")
+        with self._transaction():
+            policy = self.get_playback_policy(subscription_id)
+            if policy["revision"] != expected_revision:
+                raise ValueError("Playback policy revision conflict")
+            self._db.execute(
+                "UPDATE playback_policies SET mode=?,revision=revision+1,actor_id=?,updated_at=? WHERE subscription_id=?",
+                (mode, actor_id, _now(), subscription_id),
+            )
+            return self.get_playback_policy(subscription_id)
+
+    def get_playback_projection(self, subscription_id: str) -> dict | None:
+        with self._lock:
+            self.get_subscription(subscription_id)
+            row = self._db.execute(
+                "SELECT * FROM playback_projections WHERE subscription_id=?", (subscription_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def prepare_playback_projection(self, subscription_id: str, version_id: str, policy_revision: int,
+                                    projection_digest: str, source_count: int, projected_count: int,
+                                    gaps_json: str) -> dict:
+        if not isinstance(projection_digest, str) or len(projection_digest) != 64:
+            raise ValueError("Expected SHA-256 projection digest")
+        gaps = json.loads(gaps_json)
+        if not isinstance(gaps, list) or type(source_count) is not int or type(projected_count) is not int \
+                or not 0 <= projected_count <= source_count:
+            raise ValueError("Invalid playback projection gaps or counts")
+        normalized = json.dumps(gaps, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        with self._transaction():
+            version = self.get_version(version_id)
+            policy = self.get_playback_policy(subscription_id)
+            if version["subscription_id"] != subscription_id or version["total"] != source_count:
+                raise ValueError("Playback projection does not match subscription archive")
+            if policy["revision"] != policy_revision:
+                raise ValueError("Playback policy revision conflict")
+            existing = self.get_playback_projection(subscription_id)
+            now = _now()
+            destination = (existing["destination_item_id"], existing["destination_provider_instance"]) if existing else (None, None)
+            if existing and existing["state"] in ("writing", "uncertain"):
+                raise ValueError("Playback projection requires reconciliation")
+            self._db.execute("""INSERT INTO playback_projections
+                (subscription_id,version_id,policy_revision,projection_digest,source_count,projected_count,gaps_json,
+                 destination_item_id,destination_provider_instance,state,created_at,updated_at,error)
+                VALUES (?,?,?,?,?,?,?,?,?,'prepared',?,?,NULL)
+                ON CONFLICT(subscription_id) DO UPDATE SET version_id=excluded.version_id,
+                 policy_revision=excluded.policy_revision,projection_digest=excluded.projection_digest,
+                 source_count=excluded.source_count,projected_count=excluded.projected_count,gaps_json=excluded.gaps_json,
+                 state='prepared',updated_at=excluded.updated_at,error=NULL""",
+                (subscription_id, version_id, policy_revision, projection_digest, source_count, projected_count,
+                 normalized, *destination, now, now),
+            )
+            return self.get_playback_projection(subscription_id)
+
+    def mark_playback_projection_writing(self, subscription_id: str) -> None:
+        with self._transaction():
+            row = self.get_playback_projection(subscription_id)
+            if row is None or row["state"] != "prepared":
+                raise ValueError("Playback projection is not prepared")
+            self._db.execute("UPDATE playback_projections SET state='writing',updated_at=? WHERE subscription_id=?",
+                             (_now(), subscription_id))
+
+    def commit_playback_projection(self, subscription_id: str, destination_item_id: str,
+                                   destination_provider_instance: str, verified_digest: str) -> dict:
+        with self._transaction():
+            row = self.get_playback_projection(subscription_id)
+            if row is None or row["state"] not in ("writing", "uncertain"):
+                raise ValueError("Playback projection is not being written")
+            if verified_digest != row["projection_digest"]:
+                raise ValueError("Playback destination digest does not match preview")
+            self._db.execute("""UPDATE playback_projections SET state='applied',destination_item_id=?,
+                destination_provider_instance=?,updated_at=?,error=NULL WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, _now(), subscription_id))
+            return self.get_playback_projection(subscription_id)
+
+    def fail_playback_projection(self, subscription_id: str, error: str, uncertain: bool = False) -> None:
+        with self._transaction():
+            row = self.get_playback_projection(subscription_id)
+            if row is None:
+                raise ValueError("Playback projection is missing")
+            state = "uncertain" if uncertain or row["state"] in ("writing", "uncertain") else "failed"
+            self._db.execute("UPDATE playback_projections SET state=?,updated_at=?,error=? WHERE subscription_id=?",
+                             (state, _now(), error, subscription_id))
+
     def close(self) -> None:
         with self._lock:
             self._db.close()
@@ -887,6 +1011,9 @@ class ArchiveStore:
                 "INSERT OR IGNORE INTO subscription_sync_policy(subscription_id,updated_at) VALUES (?,?)", (result["id"], _now())
             )
             self._db.execute("INSERT OR IGNORE INTO subscription_sync_state(subscription_id) VALUES (?)", (result["id"],))
+            self._db.execute(
+                "INSERT OR IGNORE INTO playback_policies(subscription_id,updated_at) VALUES (?,?)", (result["id"], _now())
+            )
             return result
 
     def get_subscription(self, subscription_id: str) -> dict:

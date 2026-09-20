@@ -45,6 +45,29 @@ def test_identity_rename_accounts_and_restart(tmp_path):
     reopened.close()
 
 
+def test_playback_policy_cas_and_projection_checkpoint_are_independent(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    subscription = subscribe(store)
+    version = capture(store, subscription)
+    policy = store.get_playback_policy(subscription)
+    assert policy["mode"] == "prefer_spotify" and policy["revision"] == 0
+    policy = store.set_playback_policy(subscription, "local_only", 0, "admin")
+    assert policy["revision"] == 1
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.set_playback_policy(subscription, "prefer_local", 0)
+    projection = store.prepare_playback_projection(
+        subscription, version, 1, "a" * 64, 1, 0,
+        '[{"position":0,"reason":"missing","omitted":true,"fallback":null}]',
+    )
+    assert projection["state"] == "prepared"
+    store.mark_playback_projection_writing(subscription)
+    committed = store.commit_playback_projection(subscription, "playback", "builtin", "a" * 64)
+    assert committed["state"] == "applied"
+    # The playback checkpoint does not advance the older archive-copy checkpoint.
+    assert store.get_subscription(subscription)["applied_version_id"] is None
+    store.close()
+
+
 def test_faithful_occurrences_and_empty_playlist(tmp_path):
     store = ArchiveStore(tmp_path / "archive.db")
     sub = subscribe(store)
@@ -379,6 +402,9 @@ def test_v2_sync_migration_rollback_preserves_applied_capture(tmp_path):
     store.mark_apply_creating(job["id"])
     store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
     with store._transaction():
+        for table in ("playback_projections", "playback_policies"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v5_migrated_at'")
         for table in ("match_decisions", "match_candidates", "match_sources", "local_asset_locations", "local_assets"):
             store._db.execute(f"DROP TABLE {table}")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v4_migrated_at'")
@@ -578,6 +604,9 @@ def test_v3_match_migration_is_transactional_and_backup_preserves_overlay(tmp_pa
     sub = subscribe(store)
     version = capture(store, sub)
     with store._transaction():
+        for table in ("playback_projections", "playback_policies"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v5_migrated_at'")
         for table in ("match_decisions", "match_candidates", "match_sources", "local_asset_locations", "local_assets"):
             store._db.execute(f"DROP TABLE {table}")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v4_migrated_at'")
@@ -608,5 +637,29 @@ def test_v3_match_migration_is_transactional_and_backup_preserves_overlay(tmp_pa
     store.backup(destination)
     restored = ArchiveStore(destination)
     assert restored.get_match_overlay("spotify", "account-a", "track", "song")["approved_asset_id"] == asset["id"]
+    restored.close()
+
+
+def test_v4_playback_policy_migration_preserves_match_overlay(tmp_path):
+    path = tmp_path / "legacy-v4.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    version = capture(store, sub, rows=[{"position": 0, "state": "track", "source_item_id": "song"}])
+    asset = store.upsert_local_asset("track", "local", "song.flac")
+    store.replace_match_candidates(
+        "spotify", "account-a", "track", "song", [{"asset_id": asset["id"], "score": 1, "evidence": {}}], "v1"
+    )
+    store.set_match_decision("spotify", "account-a", "track", "song", "approve", asset["id"], 0)
+    with store._transaction():
+        for table in ("playback_projections", "playback_policies"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v5_migrated_at'")
+        store._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (store._schema_digest(),))
+        store._db.execute("PRAGMA user_version=4")
+    store.close()
+
+    restored = ArchiveStore(path)
+    assert restored.get_playback_policy(sub)["mode"] == "prefer_spotify"
+    assert restored.get_version_match_overlay(version)["occurrences"][0]["match"]["approved_asset_id"] == asset["id"]
     restored.close()
     store.close()

@@ -18,6 +18,15 @@ modules at image build time:
   the stream comes from it when it can serve the item and falls back to the
   others otherwise.
 
+An explicit local-only request prefixes that same uri with ``local-only:``.
+For a builtin M3U, which reconstructs media items instead of returning its raw
+path, the equivalent entry directive is
+``#EXTPROV:local_only||<provider-instance>``. The marker is consumed before
+queue resolution. The queue item then also carries
+``extra_attributes["strict_provider"]``. The provider must be loaded,
+available, and non-streaming; selection and capacity retries may not widen
+outside that provider instance or domain.
+
 The fork frontend's library manager sends such uris for a listing narrowed to
 one source. Every edit is anchored on exact upstream lines and the script
 fails loudly when an anchor is gone, so a server release that reshapes either
@@ -44,8 +53,17 @@ EDITS: dict[str, list[tuple[str, str]]] = {
         (
             "        media_items: list[MediaItemType] = []\n        # the subset of media_items the user explicitly picked to play next\n",
             "        media_items: list[MediaItemType] = []\n"
-            f"        steered: dict[int, str] = {{}}  {MARKER}\n"
+            f"        steered: dict[int, tuple[str, bool]] = {{}}  {MARKER}\n"
             "        # the subset of media_items the user explicitly picked to play next\n",
+        ),
+        # Parse the optional local-only prefix outside the skip-on-error block: an invalid
+        # strict request must fail closed rather than be turned into a skipped item.
+        (
+            "        for item in media_list:\n"
+            "            try:\n",
+            "        for item in media_list:\n"
+            f"            steer_uri, strict_provider = self._play_source_steer(item)  {MARKER}\n"
+            "            try:\n",
         ),
         # the uri as the caller wrote it, before it resolves to the library item
         (
@@ -53,16 +71,17 @@ EDITS: dict[str, list[tuple[str, str]]] = {
             "                if isinstance(item, str):\n"
             "                    media_item = await self.mass.music.get_item_by_uri(item)\n",
             "                media_item: MediaItemType | ItemMapping | BrowseFolder\n"
-            f"                steer_uri = item if isinstance(item, str) else None  {MARKER}\n"
             "                if isinstance(item, str):\n"
-            "                    media_item = await self.mass.music.get_item_by_uri(item)\n",
+            "                    media_item = await self.mass.music.get_item_by_uri(steer_uri)\n",
         ),
         (
             "                if isinstance(media_item, ItemMapping):\n"
             "                    # Resolve any ItemMapping to its full media item, exactly as the str-uri\n",
             f"                if steer_uri is None:  {MARKER}\n"
             '                    steer_uri = getattr(media_item, "uri", None)\n'
-            "                steer_provider = self._play_source_steer(steer_uri)\n"
+            "                steer_provider = self._play_source_provider(\n"
+            "                    steer_uri, strict_provider\n"
+            "                )\n"
             "                if isinstance(media_item, ItemMapping):\n"
             "                    # Resolve any ItemMapping to its full media item, exactly as the str-uri\n",
         ),
@@ -73,7 +92,8 @@ EDITS: dict[str, list[tuple[str, str]]] = {
             "                        play_next_items += resolved_items\n",
             "                    media_items += resolved_items\n"
             f"                    if steer_provider:  {MARKER}\n"
-            "                        steered.update((id(x), steer_provider) for x in resolved_items)\n"
+            "                        steer_value = (steer_provider, strict_provider is not None)\n"
+            "                        steered.update((id(x), steer_value) for x in resolved_items)\n"
             "                    if plays_next_track:\n"
             "                        play_next_items += resolved_items\n",
         ),
@@ -88,26 +108,85 @@ EDITS: dict[str, list[tuple[str, str]]] = {
             "            if not (x and x.available):\n"
             "                continue\n"
             '            queue_item = build_queue_item(queue_id, cast("PlayableMediaItemType", x))\n'
-            "            if steer_provider := steered.get(id(x)):\n"
+            "            if steer := steered.get(id(x)):\n"
+            "                steer_provider, strict_steer = steer\n"
             '                queue_item.extra_attributes["preferred_provider"] = steer_provider\n'
+            "                if strict_steer:\n"
+            '                    queue_item.extra_attributes["strict_provider"] = steer_provider\n'
             "            queue_items.append(queue_item)\n",
         ),
         (
             "    async def _enter_dynamic_mode(self, queue_id: str, option: QueueOption | None) -> None:\n",
-            f"    def _play_source_steer(self, uri: str | None) -> str | None:  {MARKER}\n"
-            '        """The provider instance a uri asks to stream from, if it names a loaded one."""\n'
+            f"    def _play_source_steer(self, item: object) -> tuple[str | None, str | None]:  {MARKER}\n"
+            '        """Consume the direct-uri prefix or a builtin-M3U provider marker."""\n'
+            "        if not isinstance(item, str):\n"
+            '            mappings = getattr(item, "provider_mappings", set())\n'
+            "            markers = [\n"
+            "                mapping for mapping in mappings\n"
+            '                if mapping.provider_domain == "local_only"\n'
+            "            ]\n"
+            "            if not markers:\n"
+            '                return getattr(item, "uri", None), None\n'
+            "            if len(markers) != 1 or not markers[0].item_id:\n"
+            '                raise InvalidDataError("Invalid local-only provider marker in playlist")\n'
+            "            mappings.discard(markers[0])\n"
+            '            return getattr(item, "uri", None), markers[0].item_id\n'
+            '        if not item.startswith("local-only:"):\n'
+            "            return item, None\n"
+            '        uri = item.removeprefix("local-only:")\n'
+            '        if not uri or "://" not in uri:\n'
+            '            raise InvalidDataError("Invalid local-only uri: expected local-only:<provider-uri>")\n'
+            '        return uri, uri.split("://", 1)[0]\n'
+            "\n"
+            "    def _play_source_provider(\n"
+            "        self, uri: str | None, strict_provider: str | None\n"
+            "    ) -> str | None:\n"
+            '        """Return and, for local-only, validate the provider named by a uri."""\n'
             '        if not uri or "://" not in uri:\n'
             "            return None\n"
             '        provider_id = uri.split("://", 1)[0]\n'
+            "        provider_id = strict_provider or provider_id\n"
             '        if provider_id in ("library", "builtin"):\n'
+            "            if strict_provider:\n"
+            '                raise InvalidDataError(f"Local-only uri must name a provider: {uri}")\n'
             "            return None\n"
-            "        provider = self.mass.get_provider(provider_id)\n"
-            "        return provider.instance_id if provider else None\n"
+            "        provider = self.mass.get_provider(provider_id, return_unavailable=True)\n"
+            "        if provider and provider.available and not provider.is_streaming_provider:\n"
+            "            return strict_provider or provider.instance_id\n"
+            "        if strict_provider:\n"
+            '            raise InvalidDataError(\n'
+            '                f"Local-only provider {provider_id!r} is unavailable or is a streaming provider"\n'
+            "            )\n"
+            "        return provider.instance_id if provider and provider.available else None\n"
             "\n"
             "    async def _enter_dynamic_mode(self, queue_id: str, option: QueueOption | None) -> None:\n",
         ),
     ],
     STREAMS_AUDIO: [
+        (
+            "        time_start = time.time()\n"
+            '        self.logger.debug("Getting streamdetails for %s", queue_item.uri)\n',
+            "        time_start = time.time()\n"
+            f'        strict_provider = queue_item.extra_attributes.get("strict_provider")  {MARKER}\n'
+            '        self.logger.debug("Getting streamdetails for %s", queue_item.uri)\n',
+        ),
+        (
+            "            queue_item.streamdetails\n"
+            "            # cached details of an excluded instance are exactly what we select away from\n",
+            "            queue_item.streamdetails\n"
+            f"            # strict plays may never reuse details from another provider  {MARKER}\n"
+            "            and (\n"
+            "                not strict_provider\n"
+            "                or (strict_stream_provider := mass.get_provider(\n"
+            "                    queue_item.streamdetails.provider, return_unavailable=True\n"
+            "                ))\n"
+            "                and not strict_stream_provider.is_streaming_provider\n"
+            "                and strict_provider in (\n"
+            "                    strict_stream_provider.instance_id, strict_stream_provider.domain\n"
+            "                )\n"
+            "            )\n"
+            "            # cached details of an excluded instance are exactly what we select away from\n",
+        ),
         (
             "            candidates = self._get_streamdetail_candidates(\n"
             "                media_item.provider_mappings,\n"
@@ -116,11 +195,56 @@ EDITS: dict[str, list[tuple[str, str]]] = {
             "            )\n",
             f'            if steer := queue_item.extra_attributes.get("preferred_provider"):  {MARKER}\n'
             "                preferred_providers = [steer, *preferred_providers]\n"
+            "            if strict_provider:\n"
+            "                preferred_providers = [strict_provider]\n"
             "            candidates = self._get_streamdetail_candidates(\n"
             "                media_item.provider_mappings,\n"
             "                preferred_providers,\n"
             "                excluded_provider_instances,\n"
-            "            )\n",
+            "            )\n"
+            "            if strict_provider:\n"
+            "                candidates = [\n"
+            "                    (mapping, provider)\n"
+            "                    for mapping, provider in candidates\n"
+            "                    if not provider.is_streaming_provider\n"
+            "                    and strict_provider in (provider.instance_id, provider.domain)\n"
+            "                ]\n"
+            "                if not candidates:\n"
+            "                    raise MediaNotFoundError(\n"
+            '                        f"Local-only provider {strict_provider!r} cannot serve "\n'
+            '                        f"{queue_item.name} ({queue_item.uri})"\n'
+            "                    )\n",
+        ),
+        (
+            "        all_candidate_instances = {\n"
+            "            provider.instance_id\n"
+            "            for mapping in (\n"
+            "                queue_item.media_item.provider_mappings if queue_item.media_item else ()\n"
+            "            )\n"
+            "            if mapping.available\n"
+            "            for provider in self._get_mapping_providers(mapping)\n"
+            "        }\n",
+            f'        strict_provider = queue_item.extra_attributes.get("strict_provider")  {MARKER}\n'
+            "        all_candidate_instances = {\n"
+            "            provider.instance_id\n"
+            "            for mapping in (\n"
+            "                queue_item.media_item.provider_mappings if queue_item.media_item else ()\n"
+            "            )\n"
+            "            if mapping.available\n"
+            "            for provider in self._get_mapping_providers(mapping)\n"
+            "            if not strict_provider\n"
+            "            or (\n"
+            "                not provider.is_streaming_provider\n"
+            "                and strict_provider in (provider.instance_id, provider.domain)\n"
+            "            )\n"
+            "        }\n",
+        ),
+        (
+            "        match_pending = (\n"
+            "            allow_provider_match\n",
+            "        match_pending = (\n"
+            f"            not strict_provider  {MARKER}\n"
+            "            and allow_provider_match\n",
         ),
     ],
 }

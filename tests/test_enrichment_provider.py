@@ -493,7 +493,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 18
+    assert len(plugin.registered) == 23
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -612,6 +612,109 @@ def test_match_decision_requires_library_write_and_uses_revision_cas(plugin):
     assert next(
         item for item in rejected["match"]["candidates"] if item["asset_id"] == candidate["asset_id"]
     )["rejected"] is True
+
+
+def test_playback_policy_preview_is_explicit_revisioned_and_strict(plugin):
+    version_id = _match_fixture(plugin)
+    review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    candidate = review["items"][0]["match"]["candidates"][0]
+    local_instance = candidate["asset"]["locations"][0]["provider_instance_id"]
+    asyncio.run(plugin.provider.set_match_decision(version_id, "T" * 22, 0, "approve", candidate["asset_id"]))
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+
+    initial = asyncio.run(plugin.provider.playback_policy(subscription_id))
+    assert initial["mode"] == "prefer_spotify" and initial["revision"] == 0
+    policy = asyncio.run(plugin.provider.set_playback_policy(subscription_id, "local_only", 0))
+    assert policy["revision"] == 1
+    with pytest.raises(Exception, match="revision conflict"):
+        asyncio.run(plugin.provider.set_playback_policy(subscription_id, "prefer_local", 0))
+
+    preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    assert preview["mode"] == "local_only" and preview["policy_revision"] == 1
+    assert preview["projected_count"] == 2 and preview["omitted_count"] == 1
+    assert preview["rows"][0]["uri"].startswith(f"{local_instance}://track/")
+    assert preview["rows"][0]["strict_provider"] == local_instance
+    assert preview["gaps"] == [{"position": 2, "reason": "unsupported", "omitted": True, "fallback": None}]
+    assert plugin.provider._store.get_version(version_id)["occurrences"][0]["source_item_id"] == "T" * 22
+
+
+def test_prefer_local_and_prefer_spotify_report_explicit_fallback(plugin):
+    version_id = _match_fixture(plugin)
+    # Candidate discovery without approval is intentionally insufficient for local playback.
+    asyncio.run(plugin.provider.match_review(version_id, limit=3))
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+    asyncio.run(plugin.provider.set_playback_policy(subscription_id, "prefer_local", 0))
+    local_preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    assert local_preview["rows"][0]["uri"] == f"spotify://track/{'T' * 22}"
+    assert local_preview["rows"][0]["fallback"] == "spotify"
+    assert local_preview["gaps"][0]["reason"] == "ambiguous"
+    asyncio.run(plugin.provider.set_playback_policy(subscription_id, "prefer_spotify", 1))
+    spotify_preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    assert spotify_preview["rows"][0]["selected_source"] == "spotify"
+    assert spotify_preview["rows"][0]["fallback"] is None
+
+
+def test_local_only_apply_writes_verified_strict_provider_sentinels(plugin):
+    version_id = _match_fixture(plugin)
+    review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    candidate = review["items"][0]["match"]["candidates"][0]
+    local_instance = candidate["asset"]["locations"][0]["provider_instance_id"]
+    asyncio.run(plugin.provider.set_match_decision(version_id, "T" * 22, 0, "approve", candidate["asset_id"]))
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+    asyncio.run(plugin.provider.set_playback_policy(subscription_id, "local_only", 0))
+    preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    builtin = types.SimpleNamespace(instance_id="builtin", domain="builtin", available=True, _read_m3u_file=AsyncMock())
+    destination = types.SimpleNamespace(
+        item_id="playback-1", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="projection")]
+    )
+
+    async def import_playlist(m3u, *, library_matching):
+        assert library_matching is False
+        assert m3u.count(f"#EXTPROV:local_only||{local_instance}") == 2
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    plugin.provider.mass.music.providers.append(builtin)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    result = asyncio.run(
+        plugin.provider.playback_apply(
+            version_id, preview["projection_digest"], preview["policy_revision"], allow_partial=True
+        )
+    )
+    assert result["state"] == "applied"
+    assert result["destination"]["item_id"] == "playback-1"
+    assert plugin.provider._store.get_subscription(subscription_id)["applied_version_id"] is None
+
+
+def test_local_only_apply_rejects_destination_that_drops_strict_sentinels(plugin):
+    version_id = _match_fixture(plugin)
+    review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    candidate = review["items"][0]["match"]["candidates"][0]
+    asyncio.run(plugin.provider.set_match_decision(version_id, "T" * 22, 0, "approve", candidate["asset_id"]))
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+    asyncio.run(plugin.provider.set_playback_policy(subscription_id, "local_only", 0))
+    preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    builtin = types.SimpleNamespace(instance_id="builtin", domain="builtin", available=True, _read_m3u_file=AsyncMock())
+    destination = types.SimpleNamespace(
+        item_id="playback-1", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="projection")]
+    )
+
+    async def import_playlist(m3u, *, library_matching):
+        assert library_matching is False
+        builtin._read_m3u_file.return_value = "\n".join(
+            line for line in m3u.splitlines() if not line.startswith("#EXTPROV:local_only||")
+        )
+        return destination
+
+    plugin.provider.mass.music.providers.append(builtin)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    with pytest.raises(plugin.module.InvalidDataError, match="outcome uncertain"):
+        asyncio.run(
+            plugin.provider.playback_apply(
+                version_id, preview["projection_digest"], preview["policy_revision"], allow_partial=True
+            )
+        )
+    assert asyncio.run(plugin.provider.playback_status(subscription_id))["projection"]["state"] == "uncertain"
 
 
 def test_match_review_returns_stale_overlay_without_retry_or_ma_mutation(plugin):

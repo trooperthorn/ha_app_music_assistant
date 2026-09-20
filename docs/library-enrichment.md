@@ -45,12 +45,19 @@ provider before its commands are registered. It never auto-starts a capture.
 - Synchronization jobs and access failures are durable. Authentication or access
   loss pauses future checks until an administrator saves the schedule again;
   pausing to manual remains available while the source provider is offline.
+- Each subscription has an explicit revisioned playback policy: `prefer_local`,
+  `local_only`, or `prefer_spotify`. Preview uses only explicitly approved v4
+  local candidates, reports missing, ambiguous, rejected, and unsupported gaps,
+  and preserves occurrence order and duplicates without rewriting the archive.
+- Playback projection is a separate, explicit write with digest and policy-revision
+  preconditions. Its durable checkpoint is independent of archive-copy apply.
+  Synchronization never creates or updates a playback playlist.
 
 These are metadata/reference archives, not downloaded audio. A visible applied
 playlist contains Spotify references and does not establish local playback. This
-slice does not automatically update an applied visible playlist, expose a bulk UI,
-support Liked Songs,
-perform local matching, enforce playback source policies, or replace coordinated
+slice does not automatically update an applied visible playlist or playback
+projection, expose a bulk UI, support Liked Songs, automatically approve local
+matches, or replace coordinated
 MA backup/restore. It does not change ordinary detail-page behavior. The existing
 bridge bulk copy remains a separate name-based export and is not a durable archive.
 Production retention/source-policy controls, storage verification and live recovery
@@ -82,6 +89,11 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/sync_status` | `subscription_id` | policy, state, recent jobs and latest job |
 | `library_enrichment/match_review` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned local candidates from existing merged mappings, including ambiguity and freshness |
 | `library_enrichment/set_match_decision` | `version_id`, `source_item_id`, `expected_revision`, `action` (`approve`, `reject` or `clear`), `asset_id` for approval or rejection | revisioned decision overlay; also requires `library.write` |
+| `library_enrichment/playback_policy` | `subscription_id` | current mode, revision, actor and update time |
+| `library_enrichment/set_playback_policy` | `subscription_id`, `mode`, `expected_revision` | CAS update only; never writes a playlist |
+| `library_enrichment/playback_preview` | `version_id` | ordered rows, explicit fallbacks, visible gaps, counts, policy revision and digest |
+| `library_enrichment/playback_apply` | `version_id`, `expected_digest`, `expected_policy_revision`, optional `allow_partial` | explicitly write and verify the builtin playback projection; also requires `library.write` |
+| `library_enrichment/playback_status` | `subscription_id` | policy plus independent durable projection state and destination |
 
 Local match review is an overlay on the immutable Spotify occurrence archive. It
 uses direct MA library lookups and only considers mappings owned by an available,
@@ -91,6 +103,14 @@ separate in the response while sharing one account-scoped source decision. A
 failed library read returns the last stored candidates as stale when available;
 it is not retried automatically. See `local-match-review.md` for the exact
 contract and current boundary.
+
+`prefer_local` selects an approved local URI and otherwise records an explicit
+Spotify fallback. `prefer_spotify` selects Spotify and falls back to an approved
+local URI only when the occurrence has no usable Spotify identity. `local_only`
+omits unresolved occurrences, requires explicit partial consent when omissions
+exist, and writes `#EXTPROV:local_only||<provider-instance>` before each local
+entry. The server playback hook converts that sentinel into a strict provider
+constraint; it must never retry another provider.
 
 The playlist ID is the 22-character source ID, not a URL, title or MA integer ID.
 The provider instance ID must identify a currently available Spotify instance in

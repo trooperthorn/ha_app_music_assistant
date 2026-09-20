@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import re
 import sqlite3
@@ -77,6 +78,11 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("sync_status", self.sync_status),
             ("match_review", self.match_review),
             ("set_match_decision", self.set_match_decision),
+            ("playback_policy", self.playback_policy),
+            ("set_playback_policy", self.set_playback_policy),
+            ("playback_preview", self.playback_preview),
+            ("playback_apply", self.playback_apply),
+            ("playback_status", self.playback_status),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -146,6 +152,10 @@ class LibraryEnrichmentProvider(PluginProvider):
             "local_matching": True,
             "match_review_api_version": 1,
             "max_match_review_page": 200,
+            "playback_policy": True,
+            "playback_policy_api_version": 1,
+            "playback_policy_modes": ["prefer_local", "local_only", "prefer_spotify"],
+            "playback_strict_signal": "#EXTPROV:local_only||<provider-instance>",
             "liked_songs": False,
             "audio_backup": False,
             "max_items": 10000,
@@ -780,6 +790,195 @@ class LibraryEnrichmentProvider(PluginProvider):
                                      "uri": f"library://playlist/{job['destination_item_id']}", "name": job["requested_name"],
                                      "builtin_provider_instance": job.get("destination_provider_instance")}
         return result
+
+    async def playback_policy(self, subscription_id: str) -> dict[str, Any]:
+        """Return the explicit source-selection policy for one subscription."""
+        self._authorize()
+        return await self._read_store(self._store.get_playback_policy, subscription_id)
+
+    async def set_playback_policy(self, subscription_id: str, mode: str, expected_revision: int) -> dict[str, Any]:
+        """CAS update only; changing policy never mutates a playlist."""
+        user = self._authorize()
+        try:
+            return await self._read_store(
+                self._store.set_playback_policy, subscription_id, mode, expected_revision, str(user.user_id)
+            )
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+
+    @staticmethod
+    def _playback_result(row: dict | None, subscription_id: str) -> dict[str, Any]:
+        if row is None:
+            return {"subscription_id": subscription_id, "state": "not_applied", "destination": None,
+                    "retryable": True}
+        result = dict(row)
+        result["gaps"] = json.loads(result.pop("gaps_json"))
+        result["state"] = {"prepared": "pending", "writing": "applying"}.get(result["state"], result["state"])
+        result["retryable"] = row["state"] == "failed"
+        result["destination"] = None
+        if row.get("destination_item_id"):
+            result["destination"] = {
+                "item_id": row["destination_item_id"], "provider_instance": "library",
+                "uri": f"library://playlist/{row['destination_item_id']}",
+                "builtin_provider_instance": row.get("destination_provider_instance"),
+            }
+        return result
+
+    def _playback_projection(self, version: dict, policy: dict, overlay: dict) -> tuple[dict, list[str]]:
+        """Derive ordered playback URIs solely from immutable occurrences and approved v4 assets."""
+        matches = {item["position"]: item.get("match") for item in overlay["occurrences"]}
+        rows, gaps, uris = [], [], []
+        for occurrence in version["occurrences"]:
+            position = occurrence["position"]
+            source_id = occurrence.get("source_item_id")
+            spotify_uri = f"spotify://track/{source_id}" if (
+                occurrence.get("state") == "track" and isinstance(source_id, str)
+                and re.fullmatch(r"[A-Za-z0-9]{22}", source_id)
+            ) else None
+            match = matches.get(position)
+            approved = None
+            if match and match.get("approved_asset_id"):
+                approved = next((item for item in match["candidates"] if item.get("approved") and not item.get("rejected")), None)
+            local_uri = None
+            if approved and approved["asset"].get("locations"):
+                location = approved["asset"]["locations"][0]
+                local_uri = f"{location['provider_instance_id']}://track/{location['item_id']}"
+            available = [item for item in (match or {}).get("candidates", ()) if not item.get("rejected")]
+            gap_reason = None
+            if local_uri is None:
+                if match and match.get("candidates") and not available:
+                    gap_reason = "rejected"
+                elif len(available) > 1:
+                    gap_reason = "ambiguous"
+                else:
+                    gap_reason = "missing"
+            mode = policy["mode"]
+            selected = None
+            fallback = None
+            strict_provider = None
+            if mode == "local_only":
+                if local_uri:
+                    selected = local_uri
+                    strict_provider = local_uri.split("://", 1)[0]
+            elif mode == "prefer_local":
+                selected = local_uri or spotify_uri
+                fallback = "spotify" if local_uri is None and spotify_uri else None
+            else:
+                selected = spotify_uri or local_uri
+                fallback = "local" if spotify_uri is None and local_uri else None
+            if selected:
+                uris.append(selected)
+                rows.append({
+                    "position": position,
+                    "uri": selected,
+                    "selected_source": "local" if local_uri and selected.endswith(local_uri) else "spotify",
+                    "fallback": fallback,
+                    "strict_provider": strict_provider,
+                })
+            else:
+                gap_reason = "unsupported" if spotify_uri is None and gap_reason == "missing" else gap_reason
+            if gap_reason:
+                gaps.append({"position": position, "reason": gap_reason, "omitted": selected is None,
+                             "fallback": fallback})
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", version.get("name", "") or "Spotify archive").strip()
+        name = f"{name[:120] or 'Spotify archive'} - playback"
+        document = {"version_id": version["id"], "subscription_id": version["subscription_id"],
+                    "policy_revision": policy["revision"], "mode": policy["mode"], "name": name,
+                    "rows": rows, "gaps": gaps}
+        digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {**document, "source_count": version["total"], "projected_count": len(rows),
+                "omitted_count": sum(bool(item["omitted"]) for item in gaps), "projection_digest": digest,
+                "requires_partial_consent": any(item["omitted"] for item in gaps)}, uris
+
+    async def playback_preview(self, version_id: str) -> dict[str, Any]:
+        self._authorize()
+        version = await self._read_store(self._store.get_version, version_id)
+        policy = await self._read_store(self._store.get_playback_policy, version["subscription_id"])
+        overlay = await self._read_store(self._store.get_version_match_overlay, version_id)
+        preview, _ = self._playback_projection(version, policy, overlay)
+        current = await self._read_store(self._store.get_playback_projection, version["subscription_id"])
+        return {**preview, "destination": self._playback_result(current, version["subscription_id"])["destination"]}
+
+    async def playback_status(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        policy, projection = await self._read_store(
+            lambda: (self._store.get_playback_policy(subscription_id), self._store.get_playback_projection(subscription_id))
+        )
+        return {"policy": policy, "projection": self._playback_result(projection, subscription_id)}
+
+    async def playback_apply(self, version_id: str, expected_digest: str, expected_policy_revision: int,
+                             allow_partial: bool = False) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Updating the playback projection requires library write permission")
+        if type(allow_partial) is not bool:
+            raise InvalidDataError("Partial-projection consent must be a boolean")
+        async with self._write_lock:
+            version = await self._store_operation(self._store.get_version, version_id)
+            policy = await self._store_operation(self._store.get_playback_policy, version["subscription_id"])
+            overlay = await self._store_operation(self._store.get_version_match_overlay, version_id)
+            preview, uris = self._playback_projection(version, policy, overlay)
+            if policy["revision"] != expected_policy_revision:
+                raise InvalidDataError("Playback policy changed; preview again")
+            if preview["projection_digest"] != expected_digest:
+                raise InvalidDataError("Playback projection changed; preview again")
+            if preview["requires_partial_consent"] and not allow_partial:
+                raise InvalidDataError("Explicit consent is required to omit unresolved occurrences")
+            builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+            if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)):
+                raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+            row = await self._store_operation(
+                self._store.prepare_playback_projection, version["subscription_id"], version_id, policy["revision"],
+                expected_digest, preview["source_count"], preview["projected_count"], json.dumps(preview["gaps"])
+            )
+            started = False
+            try:
+                await self._store_operation(self._store.mark_playback_projection_writing, version["subscription_id"])
+                started = True
+                m3u_rows = []
+                for projected, uri in zip(preview["rows"], uris, strict=True):
+                    if projected["strict_provider"]:
+                        m3u_rows.append(f"#EXTPROV:local_only||{projected['strict_provider']}\n")
+                    m3u_rows.append(f"{uri}\n")
+                m3u = "#EXTM3U\n#PLAYLIST:" + preview["name"] + "\n" + "".join(m3u_rows)
+                if row.get("destination_item_id"):
+                    destination = await self.mass.music.playlists.get_library_item(row["destination_item_id"])
+                    mapping = next(
+                        (m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None
+                    )
+                    if mapping is None:
+                        raise InvalidDataError("Playback destination lost its builtin mapping")
+                    playlist_helpers = importlib.import_module("music_assistant.helpers.playlists")
+                    await builtin._write_m3u_file(mapping.item_id, preview["name"], playlist_helpers.parse_m3u(m3u))
+                else:
+                    destination = await self.mass.music.playlists.import_playlist(m3u, library_matching=False)
+                    mapping = next(
+                        (m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None
+                    )
+                if mapping is None:
+                    raise InvalidDataError("Created playback playlist has no expected builtin mapping")
+                raw = await builtin._read_m3u_file(mapping.item_id)
+                persisted, pending_strict = [], None
+                for raw_line in raw.splitlines():
+                    line = raw_line.strip()
+                    if line.startswith("#EXTPROV:local_only||"):
+                        pending_strict = line.removeprefix("#EXTPROV:local_only||")
+                    elif line and not line.startswith("#"):
+                        persisted.append((line, pending_strict))
+                        pending_strict = None
+                expected = [(uri, row["strict_provider"]) for row, uri in zip(preview["rows"], uris, strict=True)]
+                if pending_strict is not None or persisted != expected:
+                    raise InvalidDataError("Playback playlist contents differ from the approved ordered projection")
+                row = await self._store_operation(self._store.commit_playback_projection, version["subscription_id"],
+                                                  str(destination.item_id), builtin.instance_id, expected_digest)
+            except BaseException as err:
+                await self._store_operation(self._store.fail_playback_projection, version["subscription_id"],
+                                            "Playback projection outcome uncertain" if started else "Unable to prepare playback projection",
+                                            started)
+                if isinstance(err, asyncio.CancelledError):
+                    raise
+                raise InvalidDataError("Playback projection outcome uncertain; inspect builtin playlists") from None
+            return self._playback_result(row, version["subscription_id"])
 
     async def apply_preview(self, version_id: str) -> dict[str, Any]:
         """Review the exact immutable-version projection before a local playlist write."""
