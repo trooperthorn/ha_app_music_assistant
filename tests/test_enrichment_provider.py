@@ -512,7 +512,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 28
+    assert len(plugin.registered) == 30
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -536,24 +536,120 @@ def _write_itunes_xml(plugin):
 
 def test_itunes_inspect_and_preview_are_staged_digest_bound_and_do_not_write_library(plugin):
     source = _write_itunes_xml(plugin)
+    filesystem = types.SimpleNamespace(
+        instance_id="filesystem-a", domain="filesystem_local", available=True, is_streaming_provider=False,
+    )
+    plugin.provider.mass.music.providers.append(filesystem)
 
     async def run():
         capabilities = await plugin.provider.capabilities()
-        assert capabilities["itunes_import"] is True and capabilities["itunes_apply"] is False
+        assert capabilities["itunes_import"] is True and capabilities["itunes_apply"] is True
         inspected = await plugin.provider.itunes_inspect(source.name)
         assert inspected["tracks_total"] == 1 and inspected["playlists_total"] == 1
         assert inspected["playlists"][0]["id"] == "PLAYLIST"
         preview = await plugin.provider.itunes_preview(
             inspected["inspection_id"], inspected["source_digest"],
-            [{"source_root": "G:/Music/", "target_root": "Music"}],
+            [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "filesystem-a"}],
             ["PLAYLIST"],
         )
         assert preview["matched"] == 1 and preview["unresolved"] == 0
         assert preview["selected_playlists"] == 1 and len(preview["preview_digest"]) == 64
         assert plugin.provider._store.get_itunes_import(preview["inspection_id"])["status"] == "previewed"
 
+    mapping = types.SimpleNamespace(provider_instance="filesystem-a", item_id="Music/Artist/Song.mp3")
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(
+        item_id="library-track-1", provider_mappings=[mapping]
+    )
     asyncio.run(run())
     plugin.controller.get.assert_not_called()
+
+
+def _itunes_apply_preview(plugin, *, resolved=True, duplicate=False):
+    source = _write_itunes_xml(plugin)
+    if duplicate:
+        text = source.read_text(encoding="utf-8")
+        member = '<dict><key>Track ID</key><integer>1</integer></dict>'
+        source.write_text(text.replace(member, member + member), encoding="utf-8")
+    filesystem = types.SimpleNamespace(
+        instance_id="filesystem-a", domain="filesystem_local", available=True, is_streaming_provider=False,
+    )
+    plugin.provider.mass.music.providers.append(filesystem)
+    mapping = types.SimpleNamespace(provider_instance="filesystem-a", item_id="Music/Artist/Song.mp3")
+    plugin.controller.get_library_item_by_prov_id.return_value = (
+        types.SimpleNamespace(item_id="library-track-1", provider_mappings=[mapping]) if resolved else None
+    )
+    inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    preview = asyncio.run(plugin.provider.itunes_preview(
+        inspected["inspection_id"], inspected["source_digest"],
+        [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "filesystem-a"}],
+        ["PLAYLIST"],
+    ))
+    return inspected, preview
+
+
+def test_itunes_apply_uses_verified_library_ids_and_preserves_ordered_duplicates(plugin):
+    inspected, preview = _itunes_apply_preview(plugin, duplicate=True)
+    assert preview["matched"] == 2 and preview["unresolved"] == 0
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    destination = types.SimpleNamespace(
+        item_id="itunes-playlist-1",
+        provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="itunes-file")],
+    )
+
+    async def import_playlist(m3u, *, library_matching):
+        assert library_matching is False
+        assert m3u.count("library://track/library-track-1") == 2
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    applied = asyncio.run(plugin.provider.itunes_apply(**args))
+    replay = asyncio.run(plugin.provider.itunes_apply(**args))
+    assert applied["state"] == replay["state"] == "applied"
+    assert applied["source_count"] == 2
+    assert applied["destination"] == {"item_id": "itunes-playlist-1", "provider_instance_id": "builtin"}
+    assert plugin.provider.mass.music.playlists.import_playlist.await_count == 1
+
+
+def test_itunes_apply_fails_closed_for_unresolved_and_requires_library_write(plugin):
+    inspected, preview = _itunes_apply_preview(plugin, resolved=False)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock()
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    with pytest.raises(Exception, match="Explicit consent"):
+        asyncio.run(plugin.provider.itunes_apply(**args))
+    plugin.auth.user.allowed_scopes = {plugin.module.Scope.CONFIG_PROVIDERS_WRITE}
+    with pytest.raises(Exception, match="library write"):
+        asyncio.run(plugin.provider.itunes_apply(**args))
+    plugin.provider.mass.music.playlists.import_playlist.assert_not_called()
+
+
+def test_itunes_preview_rejects_unbound_or_streaming_path_provider(plugin):
+    source = _write_itunes_xml(plugin)
+    inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    with pytest.raises(Exception, match="explicit filesystem"):
+        asyncio.run(plugin.provider.itunes_preview(
+            inspected["inspection_id"], inspected["source_digest"],
+            [{"source_root": "G:/Music/", "target_root": "Music"}], ["PLAYLIST"],
+        ))
+    with pytest.raises(Exception, match="filesystem provider"):
+        asyncio.run(plugin.provider.itunes_preview(
+            inspected["inspection_id"], inspected["source_digest"],
+            [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "spotify-a"}],
+            ["PLAYLIST"],
+        ))
 
 
 def test_diagnostics_report_build_and_redacted_store_health(plugin):

@@ -4,6 +4,9 @@
 
 - Fork frontend v2026.09.20.12 -> v2026.09.20.13
 - Fork frontend v2026.09.20.11 -> v2026.09.20.12
+- Legacy iTunes previews now resolve mapped paths to exact existing Music
+  Assistant library tracks, and an explicit restart-safe apply can create and
+  verify one ordered builtin playlist while preserving duplicates.
 - Fork frontend v2026.09.20.9 -> v2026.09.20.11
 - Music-drive backups now publish a completion record only after independent
   destination hashing matches a stable source snapshot; verify, repair and

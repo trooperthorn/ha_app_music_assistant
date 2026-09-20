@@ -96,7 +96,9 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/provenance` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned typed provenance and effective values; no inline raw payload |
 | `library_enrichment/item_provenance` | `media_type` (`playlist`), `library_item_id` | builtin destination linkage and `current`, `source_changed`, `capture_pending`, `capture_failed`, or `unknown` state |
 | `library_enrichment/itunes_inspect` | `library_path` under the advertised staging directory | bounded XML inventory, stable identities, playlist classifications and old path roots; no MA library write |
-| `library_enrichment/itunes_preview` | `inspection_id`, `source_digest`, explicit `path_mappings`, selected `playlist_ids` | durable digest-bound mapping/selection preview and resolved/unresolved counts; no MA library write |
+| `library_enrichment/itunes_preview` | `inspection_id`, `source_digest`, explicit provider-bound `path_mappings`, selected `playlist_ids` | durable digest-bound actual MA library resolution and ordered preview; no write |
+| `library_enrichment/itunes_apply` | `inspection_id`, `revision`, `source_digest`, `preview_digest`, one `playlist_id`, optional `allow_partial` | explicitly create and verify one ordered builtin playlist; also requires `library.write` |
+| `library_enrichment/itunes_apply_status` | `inspection_id` | durable one-playlist apply state and destination without retrying mutation |
 | `library_enrichment/cancel` | `job_id` | final durable state; an already executing atomic commit can win the cancellation race |
 | `library_enrichment/apply_preview` | `version_id` | exact projection digest, source/projected counts, omissions, partial-consent requirement and existing destination |
 | `library_enrichment/apply` | `version_id`, `expected_digest`, optional `allow_partial` | create and verify one visible builtin playlist; also requires `library.write` |
@@ -128,8 +130,9 @@ Capabilities advertise `provenance_read`, `provenance_api_version: 1`,
 the additive local-library identity snapshot. See `provenance.md` for field and
 state details.
 
-Capabilities advertise `itunes_import`, `itunes_import_api_version: 1`, the
-server-side staging directory and `itunes_apply: false`. Only XML files inside
+Capabilities advertise `itunes_import`, `itunes_import_api_version: 1`,
+`itunes_apply`, `itunes_apply_api_version: 1`, the 10,000-occurrence apply limit,
+and the server-side staging directory. Only XML files inside
 that directory are readable. The parser rejects DTD/entity declarations, binary
 plist payloads, duplicate dictionary keys and over-limit inputs. `.itl` and
 `.itdb` databases are not accepted. A preview requires an unchanged SHA-256,

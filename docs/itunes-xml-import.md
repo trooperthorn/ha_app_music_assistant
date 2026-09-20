@@ -1,9 +1,8 @@
 # Legacy iTunes XML import preview API v1
 
-This slice safely inventories a legacy iTunes XML library and persists an
-explicit playlist/path-mapping preview. It does not create Music Assistant items
-or playlists. Apply remains disabled until candidate verification and partial
-import consent are implemented.
+This integration safely inventories a legacy iTunes XML library, resolves mapped
+paths against tracks already present in Music Assistant, and can explicitly create
+one builtin playlist from one reviewed preview. It never imports or copies audio.
 
 Place the XML export in the server-side import directory advertised by
 `library_enrichment/capabilities`. A client Windows path such as `F:\...` is not
@@ -28,14 +27,30 @@ references and unsupported media remain visible rather than being dropped.
 explicit mappings with `source_prefix`, `target_prefix` and
 `provider_instance_id`. Matching is case-insensitive for legacy Windows paths and
 uses the longest source prefix. Traversal outside a mapped prefix is rejected.
-The returned `preview_digest` binds the source bytes, mappings, selected playlist
-IDs, ordered playlist snapshots and counts. Preview state is revisioned and
-restart-safe in schema v7, while raw XML is not stored in the enrichment database.
+Every mapping must name an available non-streaming provider instance visible to
+the current administrator. A syntactically remapped path is only a candidate.
+Preview calls Music Assistant's local `get_library_item_by_prov_id` lookup and
+accepts a match only when the returned track still contains the exact provider
+instance and item ID. It does not refresh metadata or search a provider.
 
-The next slice must verify mapped provider item IDs against available Music
-Assistant filesystem providers, expose ambiguous/missing review, require explicit
-partial consent and only then materialize selected playlists through supported
-Music Assistant APIs.
+The returned `preview_digest` binds the source bytes, mappings, selected playlist
+IDs, ordered playlist snapshots, actual library track IDs and counts. Preview
+state is revisioned and restart-safe, while raw XML is not stored in the database.
+
+`library_enrichment/itunes_apply` requires exactly one selected playlist, the
+reviewed source/preview digests and revision, the selected playlist ID, provider
+configuration administration, and library-write permission. By default any
+unresolved, ambiguous or unsupported occurrence fails closed. `allow_partial`
+must be explicitly true to omit those visible gaps.
+
+Apply reparses the unchanged source and revalidates every resolved library ID and
+provider mapping before mutation. It creates one ordered M3U using
+`library://track/<id>` entries with library matching disabled, preserving repeated
+occurrences. It then reads the builtin M3U back and requires exact ordered content.
+Schema v8 records durable intent before creation. A restart or failure after
+creation begins becomes `uncertain` and is never automatically retried; committed
+replays are idempotent. Use `library_enrichment/itunes_apply_status` to distinguish
+`not_started`, `prepared`, `creating`, `applied`, `failed`, and `uncertain`.
 
 ## Staged ZIP packages
 

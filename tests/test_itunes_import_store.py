@@ -89,12 +89,43 @@ def test_source_identity_and_bounded_payload_validation_are_atomic(tmp_path):
     store.close()
 
 
+def test_itunes_apply_intent_becomes_uncertain_after_restart_and_is_not_retried(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    staged = store.stage_itunes_import(
+        digest("one"), "LIBRARY", {}, [], ["PLAYLIST-A"]
+    )
+    preview_digest = digest("preview")
+    previewed = store.record_itunes_import_preview(
+        staged["inspection_id"], 0, preview_digest,
+        {"selected_playlists": 1, "selected_occurrences": 2},
+    )
+    job = store.prepare_itunes_apply(
+        staged["inspection_id"], previewed["revision"], preview_digest, digest("projection"),
+        "PLAYLIST-A", "Imported", 2, ["library://track/1", "library://track/1"],
+    )
+    store.mark_itunes_apply_creating(job["id"])
+    store.close()
+
+    reopened = ArchiveStore(path)
+    reopened.recover_itunes_apply_pending()
+    uncertain = reopened.get_itunes_apply(staged["inspection_id"])
+    assert uncertain["state"] == "uncertain"
+    assert reopened.prepare_itunes_apply(
+        staged["inspection_id"], previewed["revision"], preview_digest, digest("projection"),
+        "PLAYLIST-A", "Imported", 2, ["library://track/1", "library://track/1"],
+    )["state"] == "uncertain"
+    reopened.close()
+
+
 def test_v6_migration_is_transactional_and_backup_preserves_import(tmp_path):
     path = tmp_path / "legacy-v6.db"
     store = ArchiveStore(path)
     with store._transaction():
+        store._db.execute("DROP TABLE itunes_apply_jobs")
         store._db.execute("DROP TABLE itunes_import_batches")
         store._db.execute("DROP TABLE itunes_import_documents")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v8_migrated_at'")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v7_migrated_at'")
         store._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (store._schema_digest(),))
         store._db.execute("PRAGMA user_version=6")
@@ -117,7 +148,7 @@ def test_v6_migration_is_transactional_and_backup_preserves_import(tmp_path):
     imported = stage(restored)
     backup = tmp_path / "backup-v7.db"
     manifest = restored.backup(backup)
-    assert manifest["schema_version"] == 7
+    assert manifest["schema_version"] == 8
     reopened = ArchiveStore(backup)
     assert reopened.get_itunes_import(imported["inspection_id"])["playlist_ids"] == ["PLAYLIST-A", "PLAYLIST-B"]
     reopened.close()

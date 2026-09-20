@@ -41,6 +41,7 @@ from .store import ArchiveStore
 
 SUPPORTED_SERVER = "2.10.4"
 MAX_ITUNES_ZIP_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_ITUNES_APPLY_OCCURRENCES = 10000
 
 
 async def setup(mass, manifest, config):
@@ -68,6 +69,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         self._itunes_zip_root = Path("/media/music-assistant-imports")
         await asyncio.to_thread(self._store.recover_pending)
         await asyncio.to_thread(self._store.recover_sync_pending)
+        await asyncio.to_thread(self._store.recover_itunes_apply_pending)
 
     async def loaded_in_mass(self) -> None:
         for command, handler in (
@@ -84,6 +86,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("item_provenance", self.item_provenance),
             ("itunes_inspect", self.itunes_inspect),
             ("itunes_preview", self.itunes_preview),
+            ("itunes_apply", self.itunes_apply),
+            ("itunes_apply_status", self.itunes_apply_status),
             ("cancel", self.cancel),
             ("apply_preview", self.apply_preview),
             ("apply", self.apply),
@@ -172,7 +176,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             "item_provenance_api_version": 1,
             "itunes_import": True,
             "itunes_import_api_version": 1,
-            "itunes_apply": False,
+            "itunes_apply": True,
+            "itunes_apply_api_version": 1,
+            "max_itunes_apply_occurrences": MAX_ITUNES_APPLY_OCCURRENCES,
             "itunes_zip_packages": True,
             "itunes_zip_api_version": 1,
             "itunes_zip_upload": True,
@@ -410,7 +416,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         self, inspection_id: str, source_digest: str, path_mappings: list, playlist_ids: list[str],
     ) -> dict[str, Any]:
         """Persist a digest-bound preview plan; never create or update MA items."""
-        self._authorize()
+        user = self._authorize()
         try:
             inspection = await self._read_store(self._store.get_itunes_import, inspection_id)
         except KeyError:
@@ -425,11 +431,20 @@ class LibraryEnrichmentProvider(PluginProvider):
                 raise InvalidDataError("Path mappings must be objects")
             source_prefix = mapping.get("source_prefix", mapping.get("source_root"))
             target_prefix = mapping.get("target_prefix", mapping.get("target_root"))
-            provider_instance_id = mapping.get("provider_instance_id", "unbound")
+            provider_instance_id = mapping.get("provider_instance_id")
             if not all(isinstance(value, str) and value.strip() for value in (source_prefix, target_prefix)):
                 raise InvalidDataError("Each path mapping requires nonempty source and target roots")
-            if not isinstance(provider_instance_id, str) or not provider_instance_id.strip():
-                raise InvalidDataError("A path mapping provider instance must be a nonempty string")
+            if not isinstance(provider_instance_id, str) or not provider_instance_id.strip() or provider_instance_id == "unbound":
+                raise InvalidDataError("A path mapping requires an explicit filesystem provider instance")
+            provider = next(
+                (candidate for candidate in self.mass.music.providers
+                 if candidate.instance_id == provider_instance_id and candidate.available), None,
+            )
+            if provider is None or getattr(provider, "is_streaming_provider", True):
+                raise InvalidDataError("A path mapping requires an available filesystem provider instance")
+            provider_filter = getattr(user, "provider_filter", None)
+            if provider_filter and provider_instance_id not in provider_filter:
+                raise InsufficientPermissions("The mapped provider is outside the current user's provider access")
             normalized_mappings.append({
                 "source_prefix": source_prefix,
                 "target_prefix": target_prefix,
@@ -454,22 +469,73 @@ class LibraryEnrichmentProvider(PluginProvider):
         ):
             raise InvalidDataError("Select one or more unique importable playlists")
         selected = [by_id[item] for item in playlist_ids]
+        selected_occurrences = sum(playlist["occurrence_count"] for playlist in selected)
+        if selected_occurrences > MAX_ITUNES_APPLY_OCCURRENCES:
+            raise InvalidDataError(f"Selected playlists exceed {MAX_ITUNES_APPLY_OCCURRENCES} occurrences")
         counts = {"matched": 0, "unresolved": 0, "ambiguous": 0, "unsupported": 0}
+        resolved_playlists = []
+        lookup_cache: dict[tuple[str, str], dict[str, Any]] = {}
         for playlist in selected:
+            resolved_rows = []
             for occurrence in playlist["occurrences"]:
                 if occurrence["state"] == "unsupported":
                     counts["unsupported"] += 1
+                    resolved_rows.append({"position": occurrence["position"], "state": "unsupported"})
                 elif occurrence["state"] != "track" or occurrence["path"]["state"] != "mapped":
                     counts["unresolved"] += 1
+                    resolved_rows.append({"position": occurrence["position"], "state": "unresolved"})
                 else:
-                    counts["matched"] += 1
+                    mapped = occurrence["path"]
+                    key = (mapped["provider_instance_id"], mapped["provider_item_id"])
+                    if key not in lookup_cache:
+                        provider = next(
+                            (candidate for candidate in self.mass.music.providers
+                             if candidate.instance_id == key[0] and candidate.available), None,
+                        )
+                        if provider is None:
+                            lookup_cache[key] = {"state": "unresolved"}
+                            resolved = lookup_cache[key]
+                            counts[resolved["state"]] += 1
+                            resolved_rows.append({"position": occurrence["position"], **resolved})
+                            continue
+                        try:
+                            item = await self.mass.music.tracks.get_library_item_by_prov_id(key[1], key[0])
+                        except Exception:
+                            raise InvalidDataError("Music Assistant library lookup failed; preview again") from None
+                        if item is None:
+                            lookup_cache[key] = {"state": "unresolved"}
+                        else:
+                            exact = [
+                                mapping for mapping in getattr(item, "provider_mappings", ())
+                                if str(getattr(mapping, "provider_instance", "")) == key[0]
+                                and str(getattr(mapping, "item_id", "")) == key[1]
+                            ]
+                            item_id = str(getattr(item, "item_id", ""))
+                            if len(exact) == 1 and item_id:
+                                lookup_cache[key] = {
+                                    "state": "matched", "library_item_id": item_id,
+                                    "uri": f"library://track/{item_id}",
+                                    "provider_instance_id": key[0], "provider_item_id": key[1],
+                                }
+                            elif len(exact) > 1:
+                                lookup_cache[key] = {"state": "ambiguous"}
+                            else:
+                                lookup_cache[key] = {"state": "unresolved"}
+                    resolved = lookup_cache[key]
+                    counts[resolved["state"]] += 1
+                    resolved_rows.append({"position": occurrence["position"], **resolved})
+            resolved_playlists.append({
+                "playlist_id": playlist["id"], "name": playlist["name"],
+                "snapshot_id": playlist["snapshot_id"], "rows": resolved_rows,
+            })
         preview_seed = json.dumps(
             {
                 "source_digest": source_digest,
-                "path_mappings": path_mappings,
+                "path_mappings": normalized_mappings,
                 "playlist_ids": playlist_ids,
                 "snapshots": [playlist["snapshot_id"] for playlist in selected],
                 "counts": counts,
+                "playlists": resolved_playlists,
             }, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
         )
         preview_digest = hashlib.sha256(preview_seed.encode()).hexdigest()
@@ -477,13 +543,18 @@ class LibraryEnrichmentProvider(PluginProvider):
             **counts,
             "selected_playlists": len(selected),
             "source_tracks": parsed["tracks_total"],
-            "selected_occurrences": sum(playlist["occurrence_count"] for playlist in selected),
+            "selected_occurrences": selected_occurrences,
+            "playlists": resolved_playlists,
         }
+        projection_digest = hashlib.sha256(json.dumps(
+            resolved_playlists, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        ).encode()).hexdigest()
+        preview["projection_digest"] = projection_digest
         try:
             staged = await self._store_operation(
                 self._store.stage_itunes_import,
                 source_digest, parsed["library_persistent_id"], inspection["source_metadata"],
-                path_mappings, playlist_ids,
+                normalized_mappings, playlist_ids,
             )
             recorded = await self._store_operation(
                 self._store.record_itunes_import_preview,
@@ -499,6 +570,154 @@ class LibraryEnrichmentProvider(PluginProvider):
             "preview_digest": preview_digest,
             **preview,
         }
+
+    @staticmethod
+    def _itunes_apply_result(job: dict | None, inspection_id: str) -> dict[str, Any]:
+        if job is None:
+            return {"api_version": 1, "inspection_id": inspection_id, "state": "not_started",
+                    "playlist_id": None, "source_count": 0, "destination": None, "error": None}
+        destination = None
+        if job.get("destination_item_id"):
+            destination = {"item_id": job["destination_item_id"],
+                           "provider_instance_id": job["destination_provider_instance"]}
+        return {"api_version": 1, "inspection_id": inspection_id, "state": job["state"],
+                "playlist_id": job["playlist_id"], "source_count": job["source_count"],
+                "destination": destination, "error": job.get("error")}
+
+    async def itunes_apply_status(self, inspection_id: str) -> dict[str, Any]:
+        self._authorize()
+        try:
+            await self._read_store(self._store.get_itunes_import, inspection_id)
+        except KeyError:
+            raise InvalidDataError("The iTunes inspection was not found") from None
+        job = await self._read_store(self._store.get_itunes_apply, inspection_id)
+        return self._itunes_apply_result(job, inspection_id)
+
+    async def itunes_apply(
+        self, inspection_id: str, revision: int, source_digest: str, preview_digest: str,
+        playlist_id: str, allow_partial: bool = False,
+    ) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Importing an iTunes playlist requires library write permission")
+        async with self._write_lock:
+            if self._closing:
+                raise InvalidDataError("Archive provider is stopping")
+            operation = asyncio.create_task(self._itunes_apply_locked(
+                inspection_id, revision, source_digest, preview_digest, playlist_id, allow_partial, user,
+            ))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                try:
+                    await operation
+                finally:
+                    raise asyncio.CancelledError from None
+
+    async def _itunes_apply_locked(
+        self, inspection_id: str, expected_revision: int, source_digest: str,
+        expected_preview_digest: str, playlist_id: str, allow_partial: bool, user: Any,
+    ) -> dict[str, Any]:
+        try:
+            batch = await asyncio.to_thread(self._store.get_itunes_import, inspection_id)
+        except KeyError:
+            raise InvalidDataError("The iTunes inspection was not found") from None
+        preview = batch.get("preview") or {}
+        playlists = preview.get("playlists") or []
+        if type(allow_partial) is not bool:
+            raise InvalidDataError("Partial-import consent must be a boolean")
+        if (
+            len(batch.get("playlist_ids", [])) != 1 or len(playlists) != 1
+            or batch["playlist_ids"][0] != playlist_id or playlists[0].get("playlist_id") != playlist_id
+        ):
+            raise InvalidDataError("Apply requires exactly one selected iTunes playlist")
+        has_omissions = any(preview.get(key) != 0 for key in ("unresolved", "ambiguous", "unsupported"))
+        if has_omissions and not allow_partial:
+            raise InvalidDataError("Explicit consent is required to omit unresolved iTunes occurrences")
+        if (
+            batch.get("source_digest") != source_digest
+            or batch.get("preview_digest") != expected_preview_digest
+        ):
+            raise InvalidDataError("The iTunes preview changed; preview again")
+        rows = playlists[0].get("rows", [])
+        source = self._itunes_source_path(batch["source_metadata"]["library_path"])
+        try:
+            parsed, _ = await asyncio.to_thread(
+                self._inspect_itunes_source, source, batch["path_mappings"],
+                batch["source_metadata"].get("xml_member_path"),
+                batch["source_metadata"].get("localization_root") or "iTunes Imported",
+            )
+        except (ITunesXMLImportError, ITunesZipImportError) as err:
+            raise InvalidDataError(str(err)) from None
+        if parsed["source_digest"] != batch["source_digest"]:
+            raise InvalidDataError("The iTunes source changed; inspect and preview again")
+        for row in rows:
+            if row.get("state") != "matched":
+                continue
+            provider = next(
+                (candidate for candidate in self.mass.music.providers
+                 if candidate.instance_id == row["provider_instance_id"] and candidate.available), None,
+            )
+            provider_filter = getattr(user, "provider_filter", None)
+            if (
+                provider is None or getattr(provider, "is_streaming_provider", True)
+                or (provider_filter and row["provider_instance_id"] not in provider_filter)
+            ):
+                raise InsufficientPermissions("The mapped filesystem provider is unavailable to this user")
+            try:
+                item = await self.mass.music.tracks.get_library_item_by_prov_id(
+                    row["provider_item_id"], row["provider_instance_id"]
+                )
+            except Exception:
+                raise InvalidDataError("Music Assistant library lookup failed; preview again") from None
+            exact = [
+                mapping for mapping in getattr(item, "provider_mappings", ())
+                if str(getattr(mapping, "provider_instance", "")) == row["provider_instance_id"]
+                and str(getattr(mapping, "item_id", "")) == row["provider_item_id"]
+            ] if item is not None else []
+            if len(exact) != 1 or str(getattr(item, "item_id", "")) != row["library_item_id"]:
+                raise InvalidDataError("Music Assistant library resolution changed; preview again")
+        uris = [row["uri"] for row in rows if row.get("state") == "matched"]
+        if (not allow_partial and len(uris) != preview.get("selected_occurrences")) or len(uris) > MAX_ITUNES_APPLY_OCCURRENCES:
+            raise InvalidDataError("The iTunes projection is incomplete or exceeds its limit")
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", playlists[0].get("name", "")).strip()[:120]
+        name = name or "Imported iTunes playlist"
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)):
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        try:
+            job = await asyncio.to_thread(
+                self._store.prepare_itunes_apply, inspection_id, expected_revision, expected_preview_digest,
+                preview["projection_digest"], playlists[0]["playlist_id"], name,
+                preview["selected_occurrences"], uris,
+            )
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+        if job["state"] != "prepared":
+            return self._itunes_apply_result(job, inspection_id)
+        started = False
+        try:
+            await asyncio.to_thread(self._store.mark_itunes_apply_creating, job["id"])
+            started = True
+            m3u = "#EXTM3U\n#PLAYLIST:" + name + "\n" + "".join(f"{uri}\n" for uri in uris)
+            destination = await self.mass.music.playlists.import_playlist(m3u, library_matching=False)
+            mapping = next((m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None)
+            if mapping is None:
+                raise InvalidDataError("Created playlist has no expected builtin mapping")
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            persisted = [line.strip() for line in raw.splitlines() if line.strip() and not line.startswith("#")]
+            if persisted != uris:
+                raise InvalidDataError("Created playlist differs from the approved ordered import")
+            job = await asyncio.to_thread(
+                self._store.commit_itunes_apply, job["id"], str(destination.item_id), builtin.instance_id,
+            )
+        except BaseException as err:
+            message = "iTunes playlist creation outcome uncertain" if started else "Unable to prepare iTunes import"
+            await asyncio.to_thread(self._store.fail_itunes_apply, job["id"], message, uncertain=started)
+            if isinstance(err, asyncio.CancelledError):
+                raise
+            raise InvalidDataError(message) from None
+        return self._itunes_apply_result(job, inspection_id)
 
     async def inspect(self, media_type: str, library_item_id: str) -> dict[str, Any]:
         """Hydrate a library record directly, never calling refresh-on-access get()."""
