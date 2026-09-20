@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
 PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
@@ -55,7 +55,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -70,9 +70,15 @@ class ArchiveStore:
                     required.update(("provenance_subjects", "provenance_values", "provenance_overrides"))
                 if version >= 7:
                     required.update(("itunes_import_documents", "itunes_import_batches"))
+                if version >= 8:
+                    required.add("itunes_apply_jobs")
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 staged_v7 = {"itunes_import_documents", "itunes_import_batches"}
-                if actual != required and not (version < 7 and actual == required | staged_v7):
+                staged_v8 = staged_v7 | {"itunes_apply_jobs"}
+                if actual != required and not (
+                    (version < 7 and actual == required | staged_v7)
+                    or (version < 8 and actual == required | staged_v8)
+                ):
                     raise ValueError("Unexpected enrichment database tables; database untouched")
                 identity = self._db.execute("SELECT value FROM metadata WHERE key='store_uuid'").fetchone()
                 if not identity:
@@ -96,6 +102,8 @@ class ArchiveStore:
                     self._migrate_v6()
                 if version <= 6:
                     self._migrate_v7()
+                if version <= 7:
+                    self._migrate_v8()
         except Exception:
             self._db.close()
             raise
@@ -346,6 +354,20 @@ class ArchiveStore:
         self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v7_migrated_at',?)", (now,))
         self._db.execute("PRAGMA user_version=7")
 
+    def _migrate_v8(self) -> None:
+        """Add durable intent for one-playlist legacy imports."""
+        self._db.execute("""CREATE TABLE IF NOT EXISTS itunes_apply_jobs (
+            id TEXT PRIMARY KEY, batch_id TEXT NOT NULL UNIQUE REFERENCES itunes_import_batches(id),
+            preview_revision INTEGER NOT NULL, preview_digest TEXT NOT NULL,
+            projection_digest TEXT NOT NULL, playlist_id TEXT NOT NULL, requested_name TEXT NOT NULL,
+            source_count INTEGER NOT NULL CHECK(source_count>=0), uris_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('prepared','creating','applied','failed','uncertain')),
+            destination_item_id TEXT, destination_provider_instance TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT)""")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v8_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=8")
+
     @staticmethod
     def _bounded_json(value, label: str, expected_type: type, limit: int = 65536) -> str:
         if not isinstance(value, expected_type):
@@ -450,7 +472,7 @@ class ArchiveStore:
         preview_digest = self._sha256(preview_digest, "preview_digest")
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("A non-negative expected revision is required")
-        preview_json = self._bounded_json(preview, "preview", dict)
+        preview_json = self._bounded_json(preview, "preview", dict, 2 * 1024 * 1024)
         with self._transaction():
             current = self._select_itunes_import(batch_id)
             if current["revision"] != expected_revision:
@@ -505,6 +527,132 @@ class ArchiveStore:
                 (error.strip(), _now(), batch_id),
             )
             return self._decode_itunes_import(self._select_itunes_import(batch_id))
+
+    @staticmethod
+    def _decode_itunes_apply(row: sqlite3.Row | None) -> dict | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["uris"] = json.loads(result.pop("uris_json"))
+        return result
+
+    def get_itunes_apply(self, batch_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM itunes_apply_jobs WHERE batch_id=?", (batch_id,)).fetchone()
+            return self._decode_itunes_apply(row)
+
+    def prepare_itunes_apply(
+        self, batch_id: str, expected_revision: int, preview_digest: str, projection_digest: str,
+        playlist_id: str, requested_name: str, source_count: int, uris: list[str],
+    ) -> dict:
+        preview_digest = self._sha256(preview_digest, "preview_digest")
+        projection_digest = self._sha256(projection_digest, "projection_digest")
+        uris_json = self._bounded_json(uris, "uris", list, 2 * 1024 * 1024)
+        if (
+            type(expected_revision) is not int or expected_revision < 0
+            or not isinstance(playlist_id, str) or not playlist_id
+            or not isinstance(requested_name, str) or not requested_name
+            or len(requested_name) > 160 or len(uris) > 10000
+            or type(source_count) is not int or not len(uris) <= source_count <= 10000
+            or not all(isinstance(uri, str) and uri.startswith("library://track/") for uri in uris)
+        ):
+            raise ValueError("A bounded one-playlist apply plan is required")
+        with self._transaction():
+            batch = self._select_itunes_import(batch_id)
+            existing = self._db.execute("SELECT * FROM itunes_apply_jobs WHERE batch_id=?", (batch_id,)).fetchone()
+            if existing is not None:
+                decoded = self._decode_itunes_apply(existing)
+                if (
+                    existing["preview_digest"] != preview_digest
+                    or existing["projection_digest"] != projection_digest
+                    or existing["playlist_id"] != playlist_id
+                ):
+                    raise ValueError("iTunes apply intent conflicts with the existing job")
+                return decoded
+            if (
+                batch["status"] != "previewed" or batch["revision"] != expected_revision
+                or batch["preview_digest"] != preview_digest
+            ):
+                raise ValueError("iTunes import preview changed; preview again")
+            now, job_id = _now(), str(uuid.uuid4())
+            self._db.execute(
+                """INSERT INTO itunes_apply_jobs
+                (id,batch_id,preview_revision,preview_digest,projection_digest,playlist_id,requested_name,
+                 source_count,uris_json,state,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,'prepared',?,?)""",
+                (job_id, batch_id, batch["preview_revision"], preview_digest, projection_digest,
+                 playlist_id, requested_name, source_count, uris_json, now, now),
+            )
+            return self._decode_itunes_apply(
+                self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            )
+
+    def mark_itunes_apply_creating(self, job_id: str) -> dict:
+        with self._transaction():
+            row = self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["state"] != "prepared":
+                raise ValueError("iTunes apply job is not prepared")
+            self._db.execute(
+                "UPDATE itunes_apply_jobs SET state='creating',updated_at=? WHERE id=?", (_now(), job_id)
+            )
+            return self._decode_itunes_apply(
+                self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            )
+
+    def commit_itunes_apply(
+        self, job_id: str, destination_item_id: str, destination_provider_instance: str,
+    ) -> dict:
+        if not all(isinstance(value, str) and value for value in (destination_item_id, destination_provider_instance)):
+            raise ValueError("iTunes apply destination is required")
+        with self._transaction():
+            row = self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["state"] not in ("creating", "uncertain"):
+                raise ValueError("iTunes apply job is not creating")
+            now = _now()
+            result = {
+                "created_playlists": 1, "imported_tracks": len(json.loads(row["uris_json"])),
+                "source_tracks": row["source_count"],
+                "destination_item_id": destination_item_id,
+                "destination_provider_instance": destination_provider_instance,
+            }
+            result_json = self._bounded_json(result, "committed_result", dict, 262144)
+            self._db.execute(
+                """UPDATE itunes_apply_jobs SET state='applied',destination_item_id=?,
+                destination_provider_instance=?,error=NULL,updated_at=? WHERE id=?""",
+                (destination_item_id, destination_provider_instance, now, job_id),
+            )
+            self._db.execute(
+                """UPDATE itunes_import_batches SET status='committed',revision=revision+1,
+                committed_result_json=?,error=NULL,updated_at=? WHERE id=?""",
+                (result_json, now, row["batch_id"]),
+            )
+            return self._decode_itunes_apply(
+                self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            )
+
+    def fail_itunes_apply(self, job_id: str, error: str, *, uncertain: bool) -> dict:
+        if not isinstance(error, str) or not error or len(error) > 2048:
+            raise ValueError("A bounded iTunes apply error is required")
+        with self._transaction():
+            row = self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["state"] == "applied":
+                raise ValueError("iTunes apply job cannot fail")
+            state = "uncertain" if uncertain or row["state"] == "creating" else "failed"
+            self._db.execute(
+                "UPDATE itunes_apply_jobs SET state=?,error=?,updated_at=? WHERE id=?",
+                (state, error, _now(), job_id),
+            )
+            return self._decode_itunes_apply(
+                self._db.execute("SELECT * FROM itunes_apply_jobs WHERE id=?", (job_id,)).fetchone()
+            )
+
+    def recover_itunes_apply_pending(self) -> None:
+        with self._transaction():
+            now = _now()
+            self._db.execute(
+                """UPDATE itunes_apply_jobs SET state='uncertain',error='Interrupted during playlist creation',updated_at=?
+                WHERE state='creating'""", (now,)
+            )
 
     @staticmethod
     def _json_object(value: dict | None, label: str) -> str:
