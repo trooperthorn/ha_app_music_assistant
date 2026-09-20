@@ -30,9 +30,9 @@ FROM ghcr.io/music-assistant/server:${SERVER_VERSION}@${SERVER_DIGEST}
 
 # release tag on trooperthorn/HA_int_MA-UI, the wheel it carries and its
 # sha256; empty FRONTEND_WHEEL keeps the upstream frontend (bootstrap only)
-ARG FRONTEND_RELEASE="v2026.09.20.2"
-ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.20.2-py3-none-any.whl"
-ARG FRONTEND_SHA256="5e15d1f5c4468386c3705fd86fbfa54f0c880e8c0f09dc817a7afa51f24eb2bb"
+ARG FRONTEND_RELEASE="v2026.09.20.3"
+ARG FRONTEND_WHEEL="music_assistant_frontend-2026.9.20.3-py3-none-any.whl"
+ARG FRONTEND_SHA256="4e40a997de4ce7da1dbaa81b244f6974be7e4c06fc3c08e390e9c0102672bacd"
 
 # The frontend version this server release pins for itself. The fork wheel is
 # installed over that package with --no-deps, so the server's own expectation

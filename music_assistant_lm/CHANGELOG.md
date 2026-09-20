@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.2 -> v2026.09.20.3
 - Fork frontend v2026.09.20.1 -> v2026.09.20.2
 - Library Enrichment can explicitly project a committed archive version into a
   visible builtin playlist with omission review, ordered-reference verification,
