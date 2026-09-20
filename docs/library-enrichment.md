@@ -56,6 +56,9 @@ provider before its commands are registered. It never auto-starts a capture.
   committed immutable payload without refreshing Spotify or Music Assistant.
 - Playlist item provenance links known builtin archive and playback destinations
   to their subscription, snapshots, and durable check state.
+- A staged legacy iTunes XML export can be inspected with bounded parsing and
+  explicit path mappings. The source digest, selection and preview are durable;
+  this slice performs no Music Assistant library write.
 
 These are metadata/reference archives, not downloaded audio. A visible applied
 playlist contains Spotify references and does not establish local playback. This
@@ -85,6 +88,8 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/versions` | `subscription_id`, optional `limit` (1..200, default 50), `offset` | newest-first version metadata; stable timestamp/ID ordering |
 | `library_enrichment/provenance` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned typed provenance and effective values; no inline raw payload |
 | `library_enrichment/item_provenance` | `media_type` (`playlist`), `library_item_id` | builtin destination linkage and `current`, `source_changed`, `capture_pending`, `capture_failed`, or `unknown` state |
+| `library_enrichment/itunes_inspect` | `library_path` under the advertised staging directory | bounded XML inventory, stable identities, playlist classifications and old path roots; no MA library write |
+| `library_enrichment/itunes_preview` | `inspection_id`, `source_digest`, explicit `path_mappings`, selected `playlist_ids` | durable digest-bound mapping/selection preview and resolved/unresolved counts; no MA library write |
 | `library_enrichment/cancel` | `job_id` | final durable state; an already executing atomic commit can win the cancellation race |
 | `library_enrichment/apply_preview` | `version_id` | exact projection digest, source/projected counts, omissions, partial-consent requirement and existing destination |
 | `library_enrichment/apply` | `version_id`, `expected_digest`, optional `allow_partial` | create and verify one visible builtin playlist; also requires `library.write` |
@@ -113,6 +118,14 @@ contract and current boundary.
 Capabilities advertise `provenance_read`, `provenance_api_version: 1`,
 `max_provenance_page: 200`, `raw_payload_inline: false`, `item_provenance`, and
 `item_provenance_api_version: 1`. See `provenance.md` for field and state details.
+
+Capabilities advertise `itunes_import`, `itunes_import_api_version: 1`, the
+server-side staging directory and `itunes_apply: false`. Only XML files inside
+that directory are readable. The parser rejects DTD/entity declarations, binary
+plist payloads, duplicate dictionary keys and over-limit inputs. `.itl` and
+`.itdb` databases are not accepted. A preview requires an unchanged SHA-256,
+explicit longest-prefix path mappings and at least one importable playlist. See
+`itunes-xml-import.md` for the current boundary.
 
 `prefer_local` selects an approved local URI and otherwise records an explicit
 Spotify fallback. `prefer_spotify` selects Spotify and falls back to an approved

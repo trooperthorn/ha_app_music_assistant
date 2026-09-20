@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
 PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
@@ -55,7 +55,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, 5, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -68,8 +68,11 @@ class ArchiveStore:
                     required.update(("playback_policies", "playback_projections"))
                 if version >= 6:
                     required.update(("provenance_subjects", "provenance_values", "provenance_overrides"))
+                if version >= 7:
+                    required.update(("itunes_import_documents", "itunes_import_batches"))
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if actual != required:
+                staged_v7 = {"itunes_import_documents", "itunes_import_batches"}
+                if actual != required and not (version < 7 and actual == required | staged_v7):
                     raise ValueError("Unexpected enrichment database tables; database untouched")
                 identity = self._db.execute("SELECT value FROM metadata WHERE key='store_uuid'").fetchone()
                 if not identity:
@@ -91,6 +94,8 @@ class ArchiveStore:
                     self._migrate_v5()
                 if version <= 5:
                     self._migrate_v6()
+                if version <= 6:
+                    self._migrate_v7()
         except Exception:
             self._db.close()
             raise
@@ -311,6 +316,195 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT INTO metadata VALUES ('schema_v6_migrated_at',?)", (now,))
         self._db.execute("PRAGMA user_version=6")
+
+    def _migrate_v7(self) -> None:
+        """Add restart-safe staged iTunes imports without retaining source XML."""
+        self._db.execute("""CREATE TABLE IF NOT EXISTS itunes_import_documents (
+            id TEXT PRIMARY KEY, source_digest TEXT NOT NULL UNIQUE,
+            library_persistent_id TEXT NOT NULL, source_metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL)""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS itunes_import_batches (
+            id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES itunes_import_documents(id),
+            plan_digest TEXT NOT NULL, path_mappings_json TEXT NOT NULL,
+            playlist_ids_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('staged','previewed','committed','failed')),
+            revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),
+            preview_revision INTEGER NOT NULL DEFAULT 0 CHECK(preview_revision>=0),
+            preview_digest TEXT, preview_json TEXT,
+            committed_result_json TEXT, error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(document_id,plan_digest),
+            CHECK((preview_digest IS NULL AND preview_json IS NULL AND preview_revision=0)
+               OR (preview_digest IS NOT NULL AND preview_json IS NOT NULL AND preview_revision>0)),
+            CHECK((status='committed' AND committed_result_json IS NOT NULL)
+               OR (status!='committed' AND committed_result_json IS NULL)))""")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS itunes_import_batches_document ON itunes_import_batches(document_id,created_at,id)"
+        )
+        now = _now()
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v7_migrated_at',?)", (now,))
+        self._db.execute("PRAGMA user_version=7")
+
+    @staticmethod
+    def _bounded_json(value, label: str, expected_type: type, limit: int = 65536) -> str:
+        if not isinstance(value, expected_type):
+            raise ValueError(f"{label} must be a {expected_type.__name__}")
+        encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > limit:
+            raise ValueError(f"{label} exceeds {limit} bytes")
+        return encoded
+
+    @staticmethod
+    def _sha256(value: str, label: str) -> str:
+        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdefABCDEF" for char in value):
+            raise ValueError(f"{label} must be a SHA-256 digest")
+        return value.lower()
+
+    @staticmethod
+    def _decode_itunes_import(row: sqlite3.Row) -> dict:
+        result = dict(row)
+        result["inspection_id"] = result.pop("id")
+        result["source_metadata"] = json.loads(result.pop("source_metadata_json"))
+        result["path_mappings"] = json.loads(result.pop("path_mappings_json"))
+        result["playlist_ids"] = json.loads(result.pop("playlist_ids_json"))
+        result["preview"] = json.loads(result.pop("preview_json")) if result.get("preview_json") is not None else None
+        result.pop("preview_json", None)
+        result["committed_result"] = (
+            json.loads(result.pop("committed_result_json"))
+            if result.get("committed_result_json") is not None else None
+        )
+        result.pop("committed_result_json", None)
+        return result
+
+    def stage_itunes_import(
+        self, source_digest: str, library_persistent_id: str, source_metadata: dict,
+        path_mappings: list, playlist_ids: list[str],
+    ) -> dict:
+        """Persist an immutable source identity and idempotent import plan."""
+        source_digest = self._sha256(source_digest, "source_digest")
+        if (
+            not isinstance(library_persistent_id, str)
+            or not 1 <= len(library_persistent_id.strip()) <= 128
+            or not isinstance(playlist_ids, list)
+            or not all(isinstance(item, str) and 1 <= len(item) <= 256 for item in playlist_ids)
+            or len(playlist_ids) != len(set(playlist_ids))
+        ):
+            raise ValueError("A bounded library ID and unique playlist IDs are required")
+        metadata_json = self._bounded_json(source_metadata, "source_metadata", dict)
+        mappings_json = self._bounded_json(path_mappings, "path_mappings", list)
+        playlists_json = self._bounded_json(playlist_ids, "playlist_ids", list)
+        plan_digest = hashlib.sha256(f"{mappings_json}\n{playlists_json}".encode()).hexdigest()
+        now = _now()
+        with self._transaction():
+            document = self._db.execute(
+                "SELECT * FROM itunes_import_documents WHERE source_digest=?", (source_digest,)
+            ).fetchone()
+            if document is None:
+                document_id = str(uuid.uuid4())
+                self._db.execute(
+                    "INSERT INTO itunes_import_documents VALUES (?,?,?,?,?)",
+                    (document_id, source_digest, library_persistent_id.strip(), metadata_json, now),
+                )
+            else:
+                if (
+                    document["library_persistent_id"] != library_persistent_id.strip()
+                    or document["source_metadata_json"] != metadata_json
+                ):
+                    raise ValueError("Source digest metadata conflict")
+                document_id = document["id"]
+            row = self._db.execute(
+                "SELECT b.*,d.source_digest,d.library_persistent_id,d.source_metadata_json "
+                "FROM itunes_import_batches b JOIN itunes_import_documents d ON d.id=b.document_id "
+                "WHERE b.document_id=? AND b.plan_digest=?",
+                (document_id, plan_digest),
+            ).fetchone()
+            if row is None:
+                batch_id = str(uuid.uuid4())
+                self._db.execute(
+                    """INSERT INTO itunes_import_batches
+                    (id,document_id,plan_digest,path_mappings_json,playlist_ids_json,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,'staged',?,?)""",
+                    (batch_id, document_id, plan_digest, mappings_json, playlists_json, now, now),
+                )
+                row = self._select_itunes_import(batch_id)
+            return self._decode_itunes_import(row)
+
+    def _select_itunes_import(self, batch_id: str) -> sqlite3.Row:
+        row = self._db.execute(
+            "SELECT b.*,d.source_digest,d.library_persistent_id,d.source_metadata_json "
+            "FROM itunes_import_batches b JOIN itunes_import_documents d ON d.id=b.document_id WHERE b.id=?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(batch_id)
+        return row
+
+    def get_itunes_import(self, batch_id: str) -> dict:
+        with self._lock:
+            return self._decode_itunes_import(self._select_itunes_import(batch_id))
+
+    def record_itunes_import_preview(
+        self, batch_id: str, expected_revision: int, preview_digest: str, preview: dict,
+    ) -> dict:
+        preview_digest = self._sha256(preview_digest, "preview_digest")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("A non-negative expected revision is required")
+        preview_json = self._bounded_json(preview, "preview", dict)
+        with self._transaction():
+            current = self._select_itunes_import(batch_id)
+            if current["revision"] != expected_revision:
+                raise ValueError("iTunes import revision conflict")
+            if current["status"] not in ("staged", "previewed"):
+                raise ValueError("iTunes import cannot be previewed in its current state")
+            self._db.execute(
+                """UPDATE itunes_import_batches SET status='previewed',revision=revision+1,
+                preview_revision=preview_revision+1,preview_digest=?,preview_json=?,error=NULL,updated_at=? WHERE id=?""",
+                (preview_digest, preview_json, _now(), batch_id),
+            )
+            return self._decode_itunes_import(self._select_itunes_import(batch_id))
+
+    def commit_itunes_import(
+        self, batch_id: str, expected_revision: int, preview_digest: str, committed_result: dict,
+    ) -> dict:
+        preview_digest = self._sha256(preview_digest, "preview_digest")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("A non-negative expected revision is required")
+        result_json = self._bounded_json(committed_result, "committed_result", dict, 262144)
+        with self._transaction():
+            current = self._select_itunes_import(batch_id)
+            if current["status"] == "committed":
+                if current["preview_digest"] == preview_digest and current["committed_result_json"] == result_json:
+                    return self._decode_itunes_import(current)
+                raise ValueError("iTunes import is already committed")
+            if current["revision"] != expected_revision:
+                raise ValueError("iTunes import revision conflict")
+            if current["status"] != "previewed" or current["preview_digest"] != preview_digest:
+                raise ValueError("iTunes import preview does not match")
+            self._db.execute(
+                """UPDATE itunes_import_batches SET status='committed',revision=revision+1,
+                committed_result_json=?,error=NULL,updated_at=? WHERE id=?""",
+                (result_json, _now(), batch_id),
+            )
+            return self._decode_itunes_import(self._select_itunes_import(batch_id))
+
+    def fail_itunes_import(self, batch_id: str, expected_revision: int, error: str) -> dict:
+        if (
+            type(expected_revision) is not int or expected_revision < 0
+            or not isinstance(error, str) or not error.strip() or len(error) > 2048
+        ):
+            raise ValueError("A revision and bounded error are required")
+        with self._transaction():
+            current = self._select_itunes_import(batch_id)
+            if current["revision"] != expected_revision:
+                raise ValueError("iTunes import revision conflict")
+            if current["status"] == "committed":
+                raise ValueError("Committed iTunes import cannot fail")
+            self._db.execute(
+                "UPDATE itunes_import_batches SET status='failed',revision=revision+1,error=?,updated_at=? WHERE id=?",
+                (error.strip(), _now(), batch_id),
+            )
+            return self._decode_itunes_import(self._select_itunes_import(batch_id))
 
     @staticmethod
     def _json_object(value: dict | None, label: str) -> str:
