@@ -69,7 +69,7 @@ action is dropped.
 
 ## 3. Deferred features — rescoped 2026-09-19
 
-### 3a. Import Spotify playlists — smaller than originally scoped
+### 3a. Import Spotify playlists: destination RESOLVED, two gaps left
 
 The matching engine this needs largely already exists upstream:
 [server#3387](https://github.com/music-assistant/server/pull/3387) (merged
@@ -83,20 +83,65 @@ which re-matches tracks if the original import source later disappears.
 (`ImportPlaylistDialog.vue`, `ItemContextMenu.vue`'s M3U8 export,
 `api.importPlaylist`/`api.exportPlaylist`).
 
-**What's actually still missing**: importing into a **local playlist file on
-the filesystem** specifically, as opposed to a builtin/library playlist.
-Upstream's import destination is always a builtin playlist, not an arbitrary
-`.m3u` on disk.
+**The "filesystem file destination" gap recorded here before was based on a
+false premise and is withdrawn.** It claimed the missing piece was importing
+into a local `.m3u` on disk rather than a builtin playlist. A builtin
+playlist already is a local `.m3u` on disk: `BuiltinProvider` keeps them in
+`<storage_path>/playlists/` and writes each one with `_write_m3u_file`, so
+under this app's `--data-dir /data` they are `/data/playlists/*.m3u`, inside
+the persisted volume and covered by the app backup. Server 2.11.0b2 is the
+same. There was never a database-versus-file choice to make.
 
-**Decision needed (Sean)**: is a builtin-playlist destination good enough,
-or does the filesystem-file destination specifically matter (e.g. for
-syncing to another tool)? If the latter, scope a small filesystem-write step
-on top of the existing import pipeline — much smaller than the originally
-assumed "build Spotify OAuth + MusicBrainz matching from scratch," since
-matching is already solved.
+**Resolved**: playlist import keeps the builtin destination and nothing is
+built for it. A filesystem destination is rejected, not deferred: its
+`add_playlist_tracks` resolves every entry through `get_track(file_path)`,
+so it can only hold tracks that exist as local files, which is the opposite
+of a streaming playlist import; filesystem track identity is the file path
+with no content hash, so reorganizing the library orphans entries silently
+and destroys library rows; and both
+`playlist_bridge._resolve_destination` and server 2.11.0b2's own
+`migrate_playlist` already refuse any destination that is neither `builtin`
+nor a streaming provider. Full reasoning and source references are in
+`docs/decisions.md`, "Playlist import keeps the builtin destination".
 
-**Status**: waiting on Sean's decision above; not blocked on any missing
-server capability.
+Two real gaps surfaced while resolving that. Both are optional and each
+needs a product call before any code.
+
+**Gap 1, portability (decision needed, Sean)**: the builtin `.m3u` files and
+`export_playlist` both emit Music Assistant URIs, because both go through
+`media_item_to_playlist_item` and `generate_m3u`. Neither is readable by an
+external player, so "sync to another tool" is not satisfied today by either
+destination. Closing this means a portable export that rewrites path lines to
+real file paths for tracks carrying a filesystem provider mapping, and
+reports the tracks it had to omit. Additive, no upstream conflict. Worth
+doing only if an external tool actually has to read these files.
+
+**Gap 2, import matching is a fallback and not a preference (decision
+needed, Sean)**: `match_imported_playlist_tracks` only considers an entry
+when the URI's own provider is unavailable, so with Spotify configured a
+Spotify entry is never re-resolved to a local file. `match_providers` (which
+the fork frontend already passes) filters which providers get searched once
+that fallback triggers; it cannot express "prefer local even though Spotify
+works". Where several providers match the same ISRC the winner is whatever
+`get_unique_providers()` yields first, which this fork does not control. So
+of the three plausible import modes, streaming-only works fully today,
+local-only works only if the source provider is absent, and an on-demand
+choice between them is not expressible. Closing this suits a
+`playlist_bridge` command that re-resolves a playlist after import, needing
+no server edit.
+
+**Deferred, not needed yet**: a separate SQLite database for import
+provenance. Feasible and a clean fit (`aiosqlite` is already a server
+dependency, and `<storage_path>/<domain>/` is the established place for
+provider-owned state, so it would live in `/data` and be backed up), and it
+would have to be its own file rather than a table in `library.db`, which gets
+removed and recreated empty on a failed migration. Deferred because unmatched
+entries already persist with their ISRC and MusicBrainz id and are retried
+every 24 hours. It would only add provenance, idempotent re-sync and match
+auditing, which pay off only if recurring incremental re-sync is wanted.
+
+**Status**: destination resolved, no work pending. Gaps 1 and 2 are waiting
+on Sean and are not blocked by any missing server capability.
 
 ### 3b. Equalizer — DONE, was already fully shipped before this was written
 
