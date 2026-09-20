@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,21 @@ def _fill(root: Path, files: dict[str, bytes]) -> None:
         path.write_bytes(data)
 
 
+def _mark_complete(backup: Path) -> None:
+    manifest = backup / wrapper.MANIFEST_NAME
+    (backup / wrapper.COMPLETION_NAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "complete",
+                "manifest": wrapper.MANIFEST_NAME,
+                "manifest_sha256": wrapper.sha256_of(manifest),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_manifest_verify_and_restore_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     drive = tmp_path / "drive"
     backup = tmp_path / "backup"
@@ -42,6 +59,7 @@ def test_manifest_verify_and_restore_round_trip(tmp_path: Path, capsys: pytest.C
     _fill(backup, {"A/one.flac": b"one", "A/two.flac": b"two", "B/three.mp3": b"three"})
 
     count = wrapper.write_manifest(drive, backup / wrapper.MANIFEST_NAME)
+    _mark_complete(backup)
     assert count == 3
     entries = wrapper.read_manifest(backup / wrapper.MANIFEST_NAME)
     assert set(entries) == {"A/one.flac", "A/two.flac", "B/three.mp3"}
@@ -69,8 +87,158 @@ def test_verify_and_restore_need_their_inputs(tmp_path: Path, capsys: pytest.Cap
     wrapper.task_verify(tmp_path / "drive", tmp_path / "backup")
     wrapper.task_restore(tmp_path / "drive", tmp_path / "backup")
     out = capsys.readouterr().out
-    assert "verify: no manifest" in out
+    assert "verify: no valid completed backup set" in out
     assert "restore: no verify report" in out
+
+
+def _copying_rsync(source: Path):
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        destination = Path(cmd[-1].rstrip("/"))
+        for child in list(destination.iterdir()):
+            if child.name in {wrapper.MANIFEST_NAME, wrapper.COMPLETION_NAME, wrapper.REPORT_NAME}:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for child in source.iterdir():
+            if child.name in wrapper.SKIP_DIRS:
+                continue
+            target = destination / child.name
+            if child.is_dir():
+                shutil.copytree(child, target)
+            else:
+                shutil.copy2(child, target)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return run
+
+
+def test_backup_publishes_only_after_destination_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drive = tmp_path / "drive"
+    backup = tmp_path / "backup"
+    _fill(drive, {"A/one.flac": b"one", "B/two.mp3": b"two"})
+    backup.mkdir()
+    monkeypatch.setattr(wrapper.subprocess, "run", _copying_rsync(drive))
+
+    assert wrapper.task_backup(drive, backup) is True
+    assert wrapper.completed_backup_is_valid(backup, verify_files=True)
+    metadata = json.loads((backup / wrapper.COMPLETION_NAME).read_text(encoding="utf-8"))
+    assert metadata["file_count"] == 2
+    assert metadata["total_bytes"] == 6
+
+    (backup / "A/one.flac").write_bytes(b"corrupt")
+    assert not wrapper.completed_backup_is_valid(backup, verify_files=True)
+
+
+def test_backup_rejects_a_source_changed_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    drive = tmp_path / "drive"
+    backup = tmp_path / "backup"
+    _fill(drive, {"one.flac": b"known-good"})
+    backup.mkdir()
+    base_run = _copying_rsync(drive)
+    monkeypatch.setattr(wrapper.subprocess, "run", base_run)
+    assert wrapper.task_backup(drive, backup) is True
+    old_manifest = (backup / wrapper.MANIFEST_NAME).read_bytes()
+    (drive / "one.flac").write_bytes(b"before")
+
+    def copy_then_change(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = base_run(cmd, **kwargs)
+        (drive / "one.flac").write_bytes(b"after")
+        return result
+
+    monkeypatch.setattr(wrapper.subprocess, "run", copy_then_change)
+    assert wrapper.task_backup(drive, backup) is False
+    assert wrapper.completed_backup_is_valid(backup, verify_files=True)
+    assert (backup / "one.flac").read_bytes() == b"known-good"
+    assert (backup / wrapper.MANIFEST_NAME).read_bytes() == old_manifest
+    assert "source changed while it was being copied" in capsys.readouterr().out
+
+
+def test_backup_rejects_destination_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    drive = tmp_path / "drive"
+    backup = tmp_path / "backup"
+    _fill(drive, {"one.flac": b"source"})
+    backup.mkdir()
+    base_run = _copying_rsync(drive)
+
+    def corrupt_copy(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = base_run(cmd, **kwargs)
+        (Path(cmd[-1].rstrip("/")) / "one.flac").write_bytes(b"wrong")
+        return result
+
+    monkeypatch.setattr(wrapper.subprocess, "run", corrupt_copy)
+    assert wrapper.task_backup(drive, backup) is False
+    assert not (backup / wrapper.COMPLETION_NAME).exists()
+    assert "destination bytes do not match" in capsys.readouterr().out
+
+
+def test_interrupted_promotion_recovers_previous_set(tmp_path: Path) -> None:
+    backup = tmp_path / "backup"
+    previous = tmp_path / "backup.previous"
+    _fill(previous, {"one.flac": b"known-good"})
+    wrapper.write_manifest(previous, previous / wrapper.MANIFEST_NAME, {wrapper.MANIFEST_NAME})
+    _mark_complete(previous)
+
+    assert wrapper.completed_backup_is_valid(backup, verify_files=True)
+    assert (backup / "one.flac").read_bytes() == b"known-good"
+    assert not previous.exists()
+
+
+def test_restore_rejects_stale_and_unsafe_reports(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    drive = tmp_path / "drive"
+    backup = tmp_path / "backup"
+    _fill(drive, {"one.flac": b"damaged"})
+    _fill(backup, {"one.flac": b"good"})
+    wrapper.write_manifest(backup, backup / wrapper.MANIFEST_NAME, {wrapper.MANIFEST_NAME})
+    _mark_complete(backup)
+
+    (backup / wrapper.REPORT_NAME).write_text("manifest_sha256\tstale\nchanged\tone.flac\n", encoding="utf-8")
+    wrapper.task_restore(drive, backup)
+    assert (drive / "one.flac").read_bytes() == b"damaged"
+    assert "does not belong to this backup set" in capsys.readouterr().out
+
+    digest = wrapper.sha256_of(backup / wrapper.MANIFEST_NAME)
+    outside = tmp_path / "outside.flac"
+    outside.write_bytes(b"leave-me")
+    (backup / wrapper.REPORT_NAME).write_text(
+        f"manifest_sha256\t{digest}\nchanged\t../outside.flac\n",
+        encoding="utf-8",
+    )
+    wrapper.task_restore(drive, backup)
+    assert outside.read_bytes() == b"leave-me"
+    assert "refused invalid path" in capsys.readouterr().out
+
+
+def test_restore_keeps_original_target_when_copy_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drive = tmp_path / "drive"
+    backup = tmp_path / "backup"
+    _fill(drive, {"one.flac": b"damaged"})
+    _fill(backup, {"one.flac": b"good"})
+    wrapper.write_manifest(backup, backup / wrapper.MANIFEST_NAME, {wrapper.MANIFEST_NAME})
+    _mark_complete(backup)
+    digest = wrapper.sha256_of(backup / wrapper.MANIFEST_NAME)
+    (backup / wrapper.REPORT_NAME).write_text(
+        f"manifest_sha256\t{digest}\nchanged\tone.flac\n",
+        encoding="utf-8",
+    )
+
+    def partial_copy(_source: Path, destination: Path) -> None:
+        destination.write_bytes(b"partial")
+        raise OSError("simulated interruption")
+
+    monkeypatch.setattr(wrapper.shutil, "copyfile", partial_copy)
+    wrapper.task_restore(drive, backup)
+    assert (drive / "one.flac").read_bytes() == b"damaged"
+    assert not list(drive.glob(".*.restore.*.tmp"))
 
 
 @pytest.fixture
@@ -132,7 +300,7 @@ def test_a_dirty_drive_mounts_read_only_and_repair_needs_a_backup(
     monkeypatch.setattr(wrapper, "read_options", lambda: {"music_drive": "/dev/sda2", "music_drive_task": "repair"})
     wrapper.main([])
     out = capsys.readouterr().out
-    assert "repair: refused, no backup manifest" in out
+    assert "repair: refused, no completed verified backup set" in out
     assert "mounting read-only" in out
     mount_call = next(cmd for cmd in fake_host.calls if cmd[0] == "mount")
     assert mount_call[4].endswith(",ro")
@@ -142,6 +310,7 @@ def test_a_dirty_drive_mounts_read_only_and_repair_needs_a_backup(
     manifest = tmp_path / "share" / "musicnix" / wrapper.MANIFEST_NAME
     manifest.parent.mkdir(parents=True)
     manifest.write_text("", encoding="utf-8")
+    _mark_complete(manifest.parent)
     fake_host.calls.clear()
     wrapper.main([])
     order = [cmd[:2] for cmd in fake_host.calls if cmd[0] in ("fsck.exfat", "mount")]
