@@ -68,6 +68,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("status", self.status),
             ("version", self.archive_version),
             ("versions", self.archive_versions),
+            ("provenance", self.provenance),
+            ("item_provenance", self.item_provenance),
             ("cancel", self.cancel),
             ("apply_preview", self.apply_preview),
             ("apply", self.apply),
@@ -142,6 +144,12 @@ class LibraryEnrichmentProvider(PluginProvider):
             "source_listing": True,
             "preview_preconditions": True,
             "version_listing": True,
+            "provenance_read": True,
+            "provenance_api_version": 1,
+            "max_provenance_page": 200,
+            "raw_payload_inline": False,
+            "item_provenance": True,
+            "item_provenance_api_version": 1,
             "inspection": "library_only_no_refresh",
             "mirror_apply": False,
             "archive_apply": True,
@@ -377,6 +385,198 @@ class LibraryEnrichmentProvider(PluginProvider):
     async def archive_versions(self, subscription_id: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         self._authorize()
         return await self._read_store(self._store.list_versions, subscription_id, limit, offset)
+
+    @staticmethod
+    def _spotify_provenance_values(
+        version_id: str, occurrence: dict[str, Any], fetched_at: str
+    ) -> list[dict[str, Any]]:
+        """Parse a fixed, typed subset of an immutable Spotify occurrence."""
+        position = occurrence["position"]
+        raw = occurrence.get("source_payload")
+        item_key = "item" if isinstance(raw, dict) and "item" in raw else "track"
+        item = raw.get(item_key) if isinstance(raw, dict) else None
+        album = item.get("album") if isinstance(item, dict) else None
+        external_ids = item.get("external_ids") if isinstance(item, dict) else None
+        added_by = raw.get("added_by") if isinstance(raw, dict) else None
+        parser_version = "spotify-archive-v1"
+
+        def observation(field_name, container, key, pointer, expected, *, unit=None, date_precision=None):
+            if raw is None:
+                state, value = "not_loaded", None
+            elif not isinstance(container, dict):
+                state, value = "inaccessible", None
+            elif key not in container:
+                state, value = "missing", None
+            else:
+                value = container[key]
+                if value is None:
+                    state = "not_loaded"
+                elif value == "" or value == []:
+                    state = "empty"
+                elif expected(value):
+                    state = "value"
+                else:
+                    state, value = "inaccessible", None
+            result = {
+                "field_name": field_name,
+                "state": state,
+                "source": "spotify.playlist",
+                "fetched_at": fetched_at,
+                "parser_version": parser_version,
+                "raw_reference": {"version_id": version_id, "position": position, "json_pointer": pointer},
+            }
+            if state == "value":
+                result["value"] = value
+            if unit is not None:
+                result["unit"] = unit
+            if date_precision is not None and state == "value":
+                result["date_precision"] = date_precision(value)
+            return result
+
+        def string(value):
+            return isinstance(value, str) and bool(value)
+
+        def integer(value):
+            return type(value) is int
+
+        def boolean(value):
+            return type(value) is bool
+
+        def strings(value):
+            return isinstance(value, list) and all(isinstance(item, str) and item for item in value)
+        artists = item.get("artists") if isinstance(item, dict) else None
+        artist_ids = None
+        if isinstance(artists, list):
+            artist_ids = [artist.get("id") for artist in artists if isinstance(artist, dict) and isinstance(artist.get("id"), str)]
+        artist_container = {"ids": artist_ids} if artists is not None else {}
+
+        def precision(value):
+            declared = album.get("release_date_precision") if isinstance(album, dict) else None
+            if declared in ("year", "month", "day"):
+                return declared
+            return "day" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else "month" if re.fullmatch(r"\d{4}-\d{2}", value) else "year"
+
+        return [
+            observation("spotify_track_id", item, "id", f"/{item_key}/id", string),
+            observation("spotify_album_id", album, "id", f"/{item_key}/album/id", string),
+            observation("spotify_artist_ids", artist_container, "ids", f"/{item_key}/artists", strings),
+            observation("isrc", external_ids, "isrc", f"/{item_key}/external_ids/isrc", string),
+            observation("duration_ms", item, "duration_ms", f"/{item_key}/duration_ms", integer, unit="ms"),
+            observation("explicit", item, "explicit", f"/{item_key}/explicit", boolean),
+            observation("popularity", item, "popularity", f"/{item_key}/popularity", integer),
+            observation("added_at", raw, "added_at", "/added_at", string),
+            observation("added_by_id", added_by, "id", "/added_by/id", string),
+            observation("is_local", raw if isinstance(raw, dict) and "is_local" in raw else item, "is_local", "/is_local", boolean),
+            observation("album_release_date", album, "release_date", f"/{item_key}/album/release_date", string,
+                        date_precision=precision),
+        ]
+
+    async def provenance(self, version_id: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        """Return persisted typed provenance derived only from immutable archive JSON."""
+        self._authorize()
+        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or not 0 <= offset <= 2**31 - 1:
+            raise InvalidDataError("Provenance page requires limit 1..200 and nonnegative offset")
+        try:
+            version = await self._read_store(self._store.get_version, version_id)
+            subscription = await self._read_store(self._store.get_subscription, version["subscription_id"])
+        except KeyError:
+            raise InvalidDataError("Archive version was not found") from None
+        occurrences = version["occurrences"]
+        # Persist each source once per request. Duplicate occurrences retain their own
+        # raw references in the response while sharing the account-scoped subject.
+        persisted: dict[str, dict[str, Any]] = {}
+        for occurrence in occurrences:
+            source_id = occurrence.get("source_item_id")
+            if not isinstance(source_id, str) or not source_id:
+                continue
+            if source_id not in persisted:
+                values = self._spotify_provenance_values(version_id, occurrence, version["created_at"])
+                persisted[source_id] = await self._store_operation(
+                    self._store.upsert_provenance_values, "spotify", subscription["account_id"], "track", source_id, values
+                )
+        page = []
+        for occurrence in occurrences[offset : offset + limit]:
+            source_id = occurrence.get("source_item_id")
+            page.append({
+                "position": occurrence["position"],
+                "state": occurrence.get("state", "invalid"),
+                "source_item_id": source_id,
+                "provenance": persisted.get(source_id) if isinstance(source_id, str) else None,
+            })
+        return {
+            "api_version": 1,
+            "version_id": version_id,
+            "subscription_id": version["subscription_id"],
+            "items": page,
+            "limit": limit,
+            "offset": offset,
+            "total": len(occurrences),
+            "has_more": offset + len(page) < len(occurrences),
+            "raw_payload_inline": False,
+        }
+
+    async def item_provenance(self, media_type: str = "playlist", library_item_id: str = "") -> dict[str, Any]:
+        """Link one builtin playlist destination to its durable archive checkpoints."""
+        self._authorize()
+        if media_type != "playlist" or not isinstance(library_item_id, str) or not library_item_id:
+            raise InvalidDataError("Item provenance supports a nonempty library playlist ID")
+
+        def lookup():
+            for subscription in self._store.list_subscriptions():
+                archive = (
+                    self._store.get_apply_for_version(subscription["applied_version_id"])
+                    if subscription.get("applied_version_id")
+                    else None
+                )
+                playback = self._store.get_playback_projection(subscription["id"])
+                for kind, destination in (("archive", archive), ("playback", playback)):
+                    if destination and str(destination.get("destination_item_id")) == library_item_id:
+                        capture_jobs = [
+                            job for job in self._store.list_jobs() if job["subscription_id"] == subscription["id"]
+                        ]
+                        return subscription, kind, destination, self._store.get_sync_status(subscription["id"]), capture_jobs
+            return None
+
+        found = await self._read_store(lookup)
+        base = {"api_version": 1, "media_type": "playlist", "library_item_id": library_item_id}
+        if found is None:
+            return {**base, "linked": False, "state": "unknown", "destination": None,
+                    "subscription": None, "snapshots": None, "check": None}
+        subscription, kind, destination, sync, capture_jobs = found
+        jobs = sync["jobs"]
+        latest = jobs[-1] if jobs else None
+        if any(job["state"] in ("queued", "running") for job in jobs) or any(job["state"] == "pending" for job in capture_jobs):
+            state = "capture_pending"
+        elif (latest and latest["state"] in ("failed", "cancelled", "interrupted")) or (
+            capture_jobs and capture_jobs[-1]["state"] == "failed"
+        ):
+            state = "capture_failed"
+        elif subscription.get("observed_snapshot") and subscription.get("observed_snapshot") != subscription.get("committed_snapshot"):
+            state = "source_changed"
+        elif subscription.get("committed_version_id"):
+            state = "current"
+        else:
+            state = "unknown"
+        check_state = sync["state"]
+        return {
+            **base,
+            "linked": True,
+            "state": state,
+            "destination": {"kind": kind, "item_id": library_item_id,
+                            "provider_instance_id": destination.get("destination_provider_instance"),
+                            "version_id": destination.get("version_id"), "updated_at": destination.get("updated_at")},
+            "subscription": {key: subscription.get(key) for key in
+                             ("id", "provider_domain", "account_id", "source_playlist_id", "name")},
+            "snapshots": {
+                "observed": {"id": subscription.get("observed_snapshot"), "at": subscription.get("observed_at")},
+                "attempted": {"id": subscription.get("attempted_snapshot"), "at": subscription.get("attempted_at")},
+                "committed": {"id": subscription.get("committed_snapshot"), "at": subscription.get("committed_at"),
+                              "version_id": subscription.get("committed_version_id")},
+            },
+            "check": {"state": latest.get("state") if latest else None,
+                      **{key: check_state.get(key) for key in
+                         ("last_check_at", "last_success_at", "next_check_at", "access_state", "last_error_code")}},
+        }
 
     @staticmethod
     def _match_classification(overlay: dict[str, Any]) -> str:

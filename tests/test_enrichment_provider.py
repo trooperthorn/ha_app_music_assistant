@@ -493,8 +493,120 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 23
+    assert len(plugin.registered) == 25
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
+
+
+def _provenance_fixture(plugin, account="account-a"):
+    store = plugin.provider._store
+    subscription = store.upsert_subscription("spotify", account, "P" * 22, "spotify-a", "Evidence")
+    job = store.begin_capture(subscription["id"], "snapshot")
+    payload = {
+        "added_at": "2026-09-19T12:00:00Z",
+        "added_by": {"id": "user-1"},
+        "is_local": False,
+        "item": {
+            "id": "T" * 22,
+            "type": "track",
+            "external_ids": {"isrc": "USRC17607839"},
+            "duration_ms": 123456,
+            "explicit": True,
+            "popularity": 73,
+            "artists": [{"id": "R" * 22}, {"id": "S" * 22}],
+            "album": {"id": "A" * 22, "release_date": "2024-03", "release_date_precision": "month"},
+        },
+    }
+    version = store.commit_capture(
+        job, snapshot_before="snapshot", snapshot_after="snapshot", total=3,
+        occurrences=[
+            {"position": 0, "state": "track", "source_item_id": "T" * 22, "source_payload": payload},
+            {"position": 1, "state": "track", "source_item_id": "T" * 22, "source_payload": payload},
+            {"position": 2, "state": "null", "source_item_id": None, "source_payload": None},
+        ],
+    )
+    return subscription["id"], version
+
+
+def test_provenance_is_typed_deterministic_redacted_and_never_refreshes(plugin):
+    _, version = _provenance_fixture(plugin)
+    result = asyncio.run(plugin.provider.provenance(version, limit=2))
+    assert result["api_version"] == 1 and result["has_more"] is True
+    assert result["items"][0]["provenance"]["subject"]["id"] == result["items"][1]["provenance"]["subject"]["id"]
+    fields = result["items"][0]["provenance"]["fields"]
+    assert fields["duration_ms"]["effective"]["value"] == 123456
+    assert fields["duration_ms"]["effective"]["unit"] == "ms"
+    assert fields["explicit"]["effective"]["value"] is True
+    assert fields["spotify_artist_ids"]["effective"]["value"] == ["R" * 22, "S" * 22]
+    assert fields["album_release_date"]["effective"]["date_precision"] == "month"
+    assert "source_payload" not in json.dumps(result)
+    plugin.controller.get.assert_not_called()
+    plugin.controller.get_library_item.assert_not_called()
+    plugin.module.preview_playlist.assert_not_called()
+    plugin.module.capture_playlist.assert_not_called()
+
+
+def test_provenance_states_pagination_unknown_version_and_account_isolation(plugin):
+    _, first = _provenance_fixture(plugin, "account-a")
+    _, second = _provenance_fixture(plugin, "account-b")
+    one = asyncio.run(plugin.provider.provenance(first, limit=1, offset=0))
+    two = asyncio.run(plugin.provider.provenance(second, limit=1, offset=0))
+    assert one["items"][0]["provenance"]["subject"]["id"] != two["items"][0]["provenance"]["subject"]["id"]
+    assert asyncio.run(plugin.provider.provenance(first, limit=1, offset=2))["items"][0]["provenance"] is None
+    with pytest.raises(plugin.module.InvalidDataError, match="not found"):
+        asyncio.run(plugin.provider.provenance("unknown"))
+    for kwargs in ({"limit": 0}, {"limit": 201}, {"limit": True}, {"offset": -1}):
+        with pytest.raises(plugin.module.InvalidDataError, match="Provenance page"):
+            asyncio.run(plugin.provider.provenance(first, **kwargs))
+
+
+def test_spotify_provenance_distinguishes_missing_empty_not_loaded_and_inaccessible(plugin):
+    base = {"position": 0, "state": "track", "source_item_id": "T" * 22}
+    missing = plugin.provider._spotify_provenance_values("v", {**base, "source_payload": {"item": {}}}, "at")
+    empty = plugin.provider._spotify_provenance_values(
+        "v", {**base, "source_payload": {"item": {"id": "", "artists": []}}}, "at"
+    )
+    unloaded = plugin.provider._spotify_provenance_values("v", {**base, "source_payload": None}, "at")
+    inaccessible = plugin.provider._spotify_provenance_values(
+        "v", {**base, "source_payload": {"item": "not-an-object"}}, "at"
+    )
+    def by_name(rows):
+        return {row["field_name"]: row for row in rows}
+    assert by_name(missing)["spotify_track_id"]["state"] == "missing"
+    assert by_name(empty)["spotify_track_id"]["state"] == "empty"
+    assert by_name(empty)["spotify_artist_ids"]["state"] == "empty"
+    assert by_name(unloaded)["spotify_track_id"]["state"] == "not_loaded"
+    assert by_name(inaccessible)["spotify_track_id"]["state"] == "inaccessible"
+
+
+def test_item_provenance_links_archive_and_reports_checkpoint_states(plugin):
+    version, _, _ = _apply_fixture(plugin)
+    preview = asyncio.run(plugin.provider.apply_preview(version))
+    asyncio.run(plugin.provider.apply(version, preview["projection_digest"]))
+    current = asyncio.run(plugin.provider.item_provenance("playlist", "123"))
+    assert current["linked"] is True and current["state"] == "current"
+    assert current["destination"]["kind"] == "archive"
+    subscription_id = current["subscription"]["id"]
+    plugin.provider._store.observe(subscription_id, "changed")
+    assert asyncio.run(plugin.provider.item_provenance("playlist", "123"))["state"] == "source_changed"
+    job = plugin.provider._store.begin_capture(subscription_id, "changed")
+    assert asyncio.run(plugin.provider.item_provenance("playlist", "123"))["state"] == "capture_pending"
+    plugin.provider._store.fail_capture(job, "stopped")
+    assert asyncio.run(plugin.provider.item_provenance("playlist", "123"))["state"] == "capture_failed"
+
+
+def test_item_provenance_links_playback_and_unknown_is_explicit(plugin):
+    version, _, _ = _apply_fixture(plugin)
+    subscription = plugin.provider._store.get_version(version)["subscription_id"]
+    digest = "d" * 64
+    plugin.provider._store.prepare_playback_projection(subscription, version, 0, digest, 2, 2, "[]")
+    plugin.provider._store.mark_playback_projection_writing(subscription)
+    plugin.provider._store.commit_playback_projection(subscription, "playback-1", "builtin", digest)
+    linked = asyncio.run(plugin.provider.item_provenance("playlist", "playback-1"))
+    assert linked["linked"] is True and linked["destination"]["kind"] == "playback"
+    unknown = asyncio.run(plugin.provider.item_provenance("playlist", "missing"))
+    assert unknown == {"api_version": 1, "media_type": "playlist", "library_item_id": "missing",
+                       "linked": False, "state": "unknown", "destination": None,
+                       "subscription": None, "snapshots": None, "check": None}
 
 
 def _match_fixture(plugin, *, account="account-a"):
