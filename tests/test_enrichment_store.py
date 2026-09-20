@@ -26,6 +26,39 @@ def capture(store, subscription, snapshot="A", rows=None):
     return store.commit_capture(job, snapshot_before=snapshot, snapshot_after=snapshot, total=len(rows), occurrences=rows)
 
 
+def test_diagnostics_are_bounded_aggregates_without_identifiers_or_errors(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    subscription = subscribe(store, account="private-account", playlist="private-playlist")
+    job = store.begin_capture(subscription, "private-snapshot")
+    store.fail_capture(job, "secret error with /private/path")
+
+    result = store.diagnostics(1)
+
+    assert result["schema_version"] == module.SCHEMA_VERSION
+    assert result["database_bytes"] > 0
+    assert result["counts"]["subscriptions"] == 1
+    assert result["counts"]["jobs"] == 1
+    assert result["queues"]["capture"] == {"failed": 1}
+    assert result["recent_jobs"] == [
+        {
+            "kind": "capture",
+            "state": "failed",
+            "created_at": result["recent_jobs"][0]["created_at"],
+            "updated_at": result["recent_jobs"][0]["updated_at"],
+        }
+    ]
+    serialized = str(result)
+    private_values = (
+        subscription, job, "private-account", "private-playlist", "private-snapshot",
+        "secret error", "/private/path",
+    )
+    for private_value in private_values:
+        assert private_value not in serialized
+    with pytest.raises(ValueError, match="1..100"):
+        store.diagnostics(101)
+    store.close()
+
+
 def test_identity_rename_accounts_and_restart(tmp_path):
     path = tmp_path / "archive.db"
     store = ArchiveStore(path)
