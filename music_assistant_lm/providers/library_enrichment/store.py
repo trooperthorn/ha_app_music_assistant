@@ -684,25 +684,31 @@ class ArchiveStore:
         return result
 
     def get_provenance_overlay(
-        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str,
+        observation_version_id: str | None = None,
     ) -> dict:
         with self._lock:
             subject = self.lookup_provenance_subject(provider_domain, account_id, media_type, source_item_id)
             if subject is None:
                 return {"subject": None, "fields": {}}
             fields = {}
+            observation_filter = " AND raw_version_id=?" if observation_version_id is not None else ""
+            observation_args = (
+                (subject["id"], observation_version_id)
+                if observation_version_id is not None else (subject["id"],)
+            )
             names = {
                 row[0] for row in self._db.execute(
-                    """SELECT field_name FROM provenance_values WHERE subject_id=?
-                    UNION SELECT field_name FROM provenance_overrides WHERE subject_id=?""",
-                    (subject["id"], subject["id"]),
+                    f"SELECT field_name FROM provenance_values WHERE subject_id=?{observation_filter} "  # noqa: S608
+                    "UNION SELECT field_name FROM provenance_overrides WHERE subject_id=?",
+                    (*observation_args, subject["id"]),
                 )
             }
             for field in sorted(names):
                 observation = self._db.execute(
-                    """SELECT * FROM provenance_values WHERE subject_id=? AND field_name=?
-                    ORDER BY fetched_at DESC,created_at DESC,id DESC LIMIT 1""",
-                    (subject["id"], field),
+                    f"SELECT * FROM provenance_values WHERE subject_id=? AND field_name=?{observation_filter} "  # noqa: S608
+                    "ORDER BY fetched_at DESC,created_at DESC,id DESC LIMIT 1",
+                    (subject["id"], field, *((observation_version_id,) if observation_version_id is not None else ())),
                 ).fetchone()
                 override = self._db.execute(
                     """SELECT * FROM provenance_overrides WHERE subject_id=? AND field_name=?

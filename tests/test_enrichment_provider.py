@@ -104,6 +104,7 @@ def plugin(monkeypatch, tmp_path):
         music=types.SimpleNamespace(
             providers=[spotify],
             get_controller=lambda media_type: controller,
+            tracks=controller,
             playlists=types.SimpleNamespace(library_items=AsyncMock(return_value=[])),
         ),
         tasks=types.SimpleNamespace(
@@ -706,6 +707,156 @@ def test_provenance_is_typed_deterministic_redacted_and_never_refreshes(plugin):
     plugin.controller.get_library_item.assert_not_called()
     plugin.module.preview_playlist.assert_not_called()
     plugin.module.capture_playlist.assert_not_called()
+
+
+def test_provenance_adds_distinct_musicbrainz_identities_and_ordered_artist_credits(plugin):
+    _, version = _provenance_fixture(plugin)
+    library_track = types.SimpleNamespace(to_dict=lambda: {
+        "external_ids": [
+            ["musicbrainz_recordingid", "recording-id"],
+            ["musicbrainz_trackid", "release-track-id"],
+        ],
+        "album": {"external_ids": [
+            ["musicbrainz_albumid", "release-id"],
+            ["musicbrainz_releasegroupid", "release-group-id"],
+        ]},
+        "artists": [
+            {"name": "Second Credit", "external_ids": [["musicbrainz_artistid", "artist-2"]]},
+            {"name": "First Credit", "external_ids": [["musicbrainz_artistid", "artist-1"]]},
+        ],
+    })
+    plugin.controller.get_library_item_by_prov_id.return_value = library_track
+
+    result = asyncio.run(plugin.provider.provenance(version, limit=2))
+    fields = result["items"][0]["provenance"]["fields"]
+
+    assert fields["musicbrainz_recording_id"]["effective"]["value"] == "recording-id"
+    assert fields["musicbrainz_release_track_id"]["effective"]["value"] == "release-track-id"
+    assert fields["musicbrainz_release_id"]["effective"]["value"] == "release-id"
+    assert fields["musicbrainz_release_group_id"]["effective"]["value"] == "release-group-id"
+    credits = fields["musicbrainz_artist_credits"]["effective"]["value"]
+    assert [(row["position"], row["musicbrainz_artist_id"]) for row in credits] == [
+        (0, "artist-2"), (1, "artist-1")
+    ]
+    assert fields["musicbrainz_recording_id"]["effective"]["source"] == "music_assistant.library"
+    plugin.controller.get_library_item_by_prov_id.assert_awaited_once_with("T" * 22, "spotify-a")
+    plugin.controller.get_library_item.assert_not_called()
+    plugin.controller.get.assert_not_called()
+
+
+def test_musicbrainz_identity_capability_is_explicit(plugin):
+    capabilities = asyncio.run(plugin.provider.capabilities())
+    assert capabilities["musicbrainz_identity_api_version"] == 1
+
+
+def _next_provenance_version(plugin, subscription_id, snapshot, source_ids):
+    job = plugin.provider._store.begin_capture(subscription_id, snapshot)
+    return plugin.provider._store.commit_capture(
+        job, snapshot_before=snapshot, snapshot_after=snapshot, total=len(source_ids),
+        occurrences=[
+            {"position": position, "state": "track", "source_item_id": source_id,
+             "source_payload": {"item": {"id": source_id}}}
+            for position, source_id in enumerate(source_ids)
+        ],
+    )
+
+
+def test_musicbrainz_identity_snapshot_has_explicit_no_match_state(plugin):
+    _, version = _provenance_fixture(plugin)
+    plugin.controller.get_library_item_by_prov_id.return_value = None
+    missing = asyncio.run(plugin.provider.provenance(version, limit=1))
+    missing_fields = missing["items"][0]["provenance"]["fields"]
+    assert missing_fields["musicbrainz_recording_id"]["effective"]["state"] == "not_loaded"
+    assert missing_fields["musicbrainz_artist_credits"]["effective"]["state"] == "not_loaded"
+
+
+def test_transient_identity_failure_preserves_prior_value_as_stale(plugin):
+    subscription_id, first = _provenance_fixture(plugin)
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(to_dict=lambda: {
+        "external_ids": [["musicbrainz_recordingid", "known-recording"]],
+        "album": None,
+        "artists": [],
+    })
+    asyncio.run(plugin.provider.provenance(first, limit=1))
+    second = _next_provenance_version(plugin, subscription_id, "snapshot-2", ["T" * 22])
+    plugin.controller.get_library_item_by_prov_id.side_effect = RuntimeError("library unavailable")
+    failed = asyncio.run(plugin.provider.provenance(second, limit=1))
+    failed_fields = failed["items"][0]["provenance"]["fields"]
+    assert failed_fields["musicbrainz_recording_id"]["effective"]["state"] == "stale"
+    assert failed_fields["musicbrainz_recording_id"]["effective"]["value"] == "known-recording"
+    assert failed_fields["musicbrainz_release_id"]["effective"]["state"] == "inaccessible"
+
+
+def test_first_identity_read_failure_is_inaccessible_and_retryable(plugin):
+    _, version = _provenance_fixture(plugin)
+    plugin.controller.get_library_item_by_prov_id.side_effect = RuntimeError("library unavailable")
+    failed = asyncio.run(plugin.provider.provenance(version, limit=1))
+    failed_fields = failed["items"][0]["provenance"]["fields"]
+    assert failed_fields["musicbrainz_recording_id"]["effective"]["state"] == "inaccessible"
+    assert failed_fields["musicbrainz_recording_id"]["effective"]["value"] is None
+
+    plugin.controller.get_library_item_by_prov_id.side_effect = None
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(to_dict=lambda: {
+        "external_ids": [["musicbrainz_recordingid", "recovered-recording"]],
+        "album": None,
+        "artists": [],
+    })
+    recovered = asyncio.run(plugin.provider.provenance(version, limit=1))
+    recovered_field = recovered["items"][0]["provenance"]["fields"]["musicbrainz_recording_id"]["effective"]
+    assert recovered_field["state"] == "value"
+    assert recovered_field["value"] == "recovered-recording"
+    assert plugin.controller.get_library_item_by_prov_id.await_count == 2
+
+
+def test_identity_lookup_is_page_bounded_and_deduplicated(plugin):
+    store = plugin.provider._store
+    subscription = store.upsert_subscription("spotify", "account-a", "P" * 22, "spotify-a", "Paged")
+    version = _next_provenance_version(
+        plugin, subscription["id"], "paged", ["A" * 22, "B" * 22, "B" * 22, "C" * 22]
+    )
+    asyncio.run(plugin.provider.provenance(version, limit=2, offset=1))
+    plugin.controller.get_library_item_by_prov_id.assert_awaited_once_with("B" * 22, "spotify-a")
+
+
+def test_identity_overlay_is_frozen_per_archive_version(plugin):
+    subscription_id, first = _provenance_fixture(plugin)
+
+    def track(recording):
+        return types.SimpleNamespace(to_dict=lambda: {
+            "external_ids": [["musicbrainz_recordingid", recording]], "album": None, "artists": []
+        })
+
+    plugin.controller.get_library_item_by_prov_id.return_value = track("recording-a")
+    first_read = asyncio.run(plugin.provider.provenance(first, limit=1))
+    second = _next_provenance_version(plugin, subscription_id, "snapshot-2", ["T" * 22])
+    plugin.controller.get_library_item_by_prov_id.return_value = track("recording-b")
+    second_read = asyncio.run(plugin.provider.provenance(second, limit=1))
+    plugin.controller.get_library_item_by_prov_id.return_value = track("recording-c")
+    first_again = asyncio.run(plugin.provider.provenance(first, limit=1))
+
+    def recording(response):
+        return response["items"][0]["provenance"]["fields"]["musicbrainz_recording_id"]["effective"]["value"]
+
+    assert recording(first_read) == recording(first_again) == "recording-a"
+    assert recording(second_read) == "recording-b"
+    assert plugin.controller.get_library_item_by_prov_id.await_count == 2
+
+
+def test_musicbrainz_identity_parser_does_not_conflate_entities_or_reorder_credits(plugin):
+    item = types.SimpleNamespace(to_dict=lambda: {
+        "external_ids": [["musicbrainz_recordingid", "recording"]],
+        "album": {"external_ids": [["musicbrainz_releasegroupid", "group"]]},
+        "artists": [{"name": "No MBID", "external_ids": []}],
+    })
+    rows = plugin.provider._musicbrainz_identity_values(item, "2026-09-20T12:00:00+00:00")
+    fields = {row["field_name"]: row for row in rows}
+    assert fields["musicbrainz_recording_id"]["value"] == "recording"
+    assert fields["musicbrainz_release_track_id"]["state"] == "missing"
+    assert fields["musicbrainz_release_id"]["state"] == "missing"
+    assert fields["musicbrainz_release_group_id"]["value"] == "group"
+    assert fields["musicbrainz_artist_credits"]["value"] == [{
+        "position": 0, "name": "No MBID", "musicbrainz_artist_id": None, "identity_state": "missing"
+    }]
 
 
 def test_provenance_states_pagination_unknown_version_and_account_isolation(plugin):
