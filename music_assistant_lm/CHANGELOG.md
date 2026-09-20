@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.5 -> v2026.09.20.6
 - Fork frontend v2026.09.20.4 -> v2026.09.20.5
 - Library Enrichment adds revisioned per-subscription playback policies and an
   explicit preview/apply workflow for durable builtin playback projections,
