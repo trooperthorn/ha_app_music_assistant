@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.9 -> v2026.09.20.11
 - Music-drive backups now publish a completion record only after independent
   destination hashing matches a stable source snapshot; verify, repair and
   restore reject incomplete or corrupted recovery sets.
