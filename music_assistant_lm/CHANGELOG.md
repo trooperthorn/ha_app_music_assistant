@@ -5,6 +5,9 @@
 - Music-drive backups now publish a completion record only after independent
   destination hashing matches a stable source snapshot; verify, repair and
   restore reject incomplete or corrupted recovery sets.
+- Library Enrichment adds an admin-only API-v1 diagnostics snapshot with build
+  compatibility, aggregate store/queue counts, database allocation and bounded
+  recent job states while excluding identifiers, paths, payloads and raw errors.
 - Fork frontend v2026.09.20.8 -> v2026.09.20.9
 - Fork frontend v2026.09.20.7 -> v2026.09.20.8
 - Legacy iTunes inspection accepts a safely staged ZIP package, including a

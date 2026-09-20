@@ -47,6 +47,12 @@ The library manager is at `/library` in the app's own interface ("Library
 manager" in the navigation). Its user guide lives in the frontend fork:
 https://github.com/trooperthorn/HA_int_MA-UI/blob/main/docs/LIBRARY-MANAGER.md
 
+Provider-configuration administrators can request
+`library_enrichment/diagnostics` for a bounded operational snapshot. It reports
+build compatibility, aggregate store and queue counts, allocated database
+bytes, and recent job type/state/timestamps. It deliberately excludes raw
+errors, archive payloads, paths, account/source IDs, database IDs, and digests.
+
 ## Updates
 
 Each release of this app pins one upstream server version and one fork

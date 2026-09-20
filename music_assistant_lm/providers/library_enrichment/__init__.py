@@ -72,6 +72,7 @@ class LibraryEnrichmentProvider(PluginProvider):
     async def loaded_in_mass(self) -> None:
         for command, handler in (
             ("capabilities", self.capabilities),
+            ("diagnostics", self.diagnostics),
             ("inspect", self.inspect),
             ("preview", self.preview),
             ("sources", self.sources),
@@ -196,8 +197,28 @@ class LibraryEnrichmentProvider(PluginProvider):
             "playback_strict_signal": "#EXTPROV:local_only||<provider-instance>",
             "liked_songs": False,
             "audio_backup": False,
+            "diagnostics": True,
+            "diagnostics_api_version": 1,
+            "max_diagnostics_recent_jobs": 100,
             "max_items": 10000,
             "access": "provider_configuration_administrators",
+        }
+
+    async def diagnostics(self, recent_limit: int = 20) -> dict[str, Any]:
+        """Return an administrator-only, aggregate and identifier-free health snapshot."""
+        self._authorize()
+        store = await self._read_store(self._store.diagnostics, recent_limit)
+        server_version = version("music-assistant")
+        return {
+            "api_version": 1,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "build": {
+                "server_version": server_version,
+                "frontend_version": version("music-assistant-frontend"),
+                "supported_server": SUPPORTED_SERVER,
+                "server_compatible": server_version == SUPPORTED_SERVER,
+            },
+            "store": store,
         }
 
     async def _itunes_zip_upload(self, request: Any) -> Any:

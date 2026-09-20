@@ -1657,6 +1657,71 @@ class ArchiveStore:
         with self._lock:
             return [dict(row) for row in self._db.execute("SELECT * FROM jobs ORDER BY created_at,id")]
 
+    def diagnostics(self, recent_limit: int = 20) -> dict:
+        """Return bounded aggregate health data without archive identities or payloads."""
+        if type(recent_limit) is not int or not 1 <= recent_limit <= 100:
+            raise ValueError("Recent diagnostics limit must be 1..100")
+        count_tables = (
+            "subscriptions", "jobs", "versions", "occurrences", "apply_jobs",
+            "sync_jobs", "local_assets", "local_asset_locations", "match_sources",
+            "match_candidates", "match_decisions", "playback_policies",
+            "playback_projections", "provenance_subjects", "provenance_values",
+            "provenance_overrides", "itunes_import_documents", "itunes_import_batches",
+        )
+        queue_tables = {
+            "capture": ("jobs", "state"),
+            "sync": ("sync_jobs", "state"),
+            "apply": ("apply_jobs", "state"),
+            "playback": ("playback_projections", "state"),
+            "itunes_import": ("itunes_import_batches", "status"),
+        }
+        timestamp_columns = {
+            "jobs": ("created_at", "finished_at"),
+            "sync_jobs": ("created_at", "finished_at"),
+            "apply_jobs": ("created_at", "updated_at"),
+            "playback_projections": ("created_at", "updated_at"),
+            "itunes_import_batches": ("created_at", "updated_at"),
+        }
+        with self._lock:
+            counts = {
+                table: self._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608 - fixed table allowlist
+                for table in count_tables
+            }
+            queues: dict[str, dict[str, int]] = {}
+            recent = []
+            for kind, (table, state_column) in queue_tables.items():
+                queues[kind] = {
+                    row[0]: row[1]
+                    for row in self._db.execute(
+                        f"SELECT {state_column},COUNT(*) FROM {table} "  # noqa: S608 - fixed allowlist
+                        f"GROUP BY {state_column} ORDER BY {state_column}"
+                    )
+                }
+                created_column, finished_column = timestamp_columns[table]
+                recent.extend(
+                    {
+                        "kind": kind,
+                        "state": row[0],
+                        "created_at": row[1],
+                        "updated_at": row[2],
+                    }
+                    for row in self._db.execute(
+                        f"SELECT {state_column},{created_column},{finished_column} FROM {table} "  # noqa: S608 - fixed allowlist
+                        f"ORDER BY {created_column} DESC LIMIT ?",
+                        (recent_limit,),
+                    )
+                )
+            recent.sort(key=lambda item: item["created_at"], reverse=True)
+            page_size = self._db.execute("PRAGMA page_size").fetchone()[0]
+            page_count = self._db.execute("PRAGMA page_count").fetchone()[0]
+            return {
+                "schema_version": self._db.execute("PRAGMA user_version").fetchone()[0],
+                "counts": counts,
+                "queues": queues,
+                "database_bytes": page_size * page_count,
+                "recent_jobs": recent[:recent_limit],
+            }
+
     def recover_pending(self) -> int:
         """At exclusive provider startup, interrupt unfinished work for explicit fresh retry."""
         with self._transaction():

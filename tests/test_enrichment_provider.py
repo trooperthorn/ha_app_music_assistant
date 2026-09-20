@@ -489,6 +489,7 @@ def test_unauthorized_archive_and_inspection_calls_are_denied(plugin, user):
     plugin.auth.user = user
     for coroutine in (
         plugin.provider.capabilities(),
+        plugin.provider.diagnostics(),
         plugin.provider.inspect("track", "1"),
         plugin.provider.preview("spotify-a", "playlist"),
         plugin.provider.status(),
@@ -510,7 +511,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 27
+    assert len(plugin.registered) == 28
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -552,6 +553,32 @@ def test_itunes_inspect_and_preview_are_staged_digest_bound_and_do_not_write_lib
 
     asyncio.run(run())
     plugin.controller.get.assert_not_called()
+
+
+def test_diagnostics_report_build_and_redacted_store_health(plugin):
+    subscription = plugin.provider._store.upsert_subscription(
+        "spotify", "private-account", "private-playlist", "spotify-a", "Private name"
+    )
+    job = plugin.provider._store.begin_capture(subscription["id"], "private-snapshot")
+    plugin.provider._store.fail_capture(job, "raw secret error")
+
+    result = asyncio.run(plugin.provider.diagnostics(10))
+
+    assert result["api_version"] == 1
+    assert result["build"] == {
+        "server_version": "2.10.4",
+        "frontend_version": "2.10.4",
+        "supported_server": "2.10.4",
+        "server_compatible": True,
+    }
+    assert result["store"]["queues"]["capture"] == {"failed": 1}
+    assert result["store"]["recent_jobs"][0]["kind"] == "capture"
+    serialized = json.dumps(result)
+    for private_value in (
+        subscription["id"], job, "private-account", "private-playlist",
+        "private-snapshot", "Private name", "raw secret error",
+    ):
+        assert private_value not in serialized
 
 
 def test_itunes_import_rejects_paths_outside_staging_and_changed_sources(plugin, tmp_path):
