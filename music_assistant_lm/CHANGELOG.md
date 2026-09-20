@@ -3,6 +3,9 @@
 ## 2026-09-20
 
 - Fork frontend v2026.09.20.3 -> v2026.09.20.4
+- Library Enrichment can review existing merged library-backed mappings as
+  local-match candidates and retain revisioned approvals and rejections without
+  changing Music Assistant mappings or playback routing.
 - Fork frontend v2026.09.20.2 -> v2026.09.20.3
 - Library Enrichment subscriptions support explicit revisioned manual or
   scheduled snapshot checks, durable sync jobs and access state, unchanged-source
