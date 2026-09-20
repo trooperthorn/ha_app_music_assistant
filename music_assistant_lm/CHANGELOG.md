@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.3 -> v2026.09.20.4
 - Fork frontend v2026.09.20.2 -> v2026.09.20.3
 - Library Enrichment subscriptions support explicit revisioned manual or
   scheduled snapshot checks, durable sync jobs and access state, unchanged-source
