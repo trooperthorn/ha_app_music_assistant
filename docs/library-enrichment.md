@@ -59,6 +59,9 @@ provider before its commands are registered. It never auto-starts a capture.
 - A staged legacy iTunes XML export can be inspected with bounded parsing and
   explicit path mappings. The source digest, selection and preview are durable;
   this slice performs no Music Assistant library write.
+- A staged ZIP can transport that XML compactly. The authenticated small-upload
+  route accepts XML-only ZIPs; inspection maps their old paths against existing
+  Music Assistant media without extracting or duplicating audio.
 
 These are metadata/reference archives, not downloaded audio. A visible applied
 playlist contains Spotify references and does not establish local playback. This

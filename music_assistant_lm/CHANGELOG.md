@@ -2,6 +2,9 @@
 
 ## 2026-09-20
 
+- Legacy iTunes inspection accepts a safely staged ZIP package, including a
+  direct authenticated XML-only ZIP upload for compact transport, then maps the
+  archived paths against media already known to Music Assistant.
 - Fork frontend v2026.09.20.6 -> v2026.09.20.7
 - Library Enrichment can safely inspect a staged legacy iTunes XML export and
   persist a digest-bound, revisioned playlist/path-mapping preview without

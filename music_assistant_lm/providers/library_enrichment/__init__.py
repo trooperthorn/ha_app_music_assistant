@@ -10,8 +10,12 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
+import uuid
+import zipfile
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -19,6 +23,7 @@ from typing import Any
 
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     current_user,
+    get_authenticated_user,
     get_current_user,
     has_scope,
     impersonated_user,
@@ -30,10 +35,12 @@ from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 
 from .itunes_xml import ITunesXMLImportError, inspect_itunes_xml
+from .itunes_zip import ITunesZipImportError, inspect_itunes_zip
 from .spotify import SpotifyCaptureError, capture_playlist, preview_playlist
 from .store import ArchiveStore
 
 SUPPORTED_SERVER = "2.10.4"
+MAX_ITUNES_ZIP_UPLOAD_BYTES = 15 * 1024 * 1024
 
 
 async def setup(mass, manifest, config):
@@ -58,6 +65,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         self._store = await asyncio.to_thread(ArchiveStore, Path(self.mass.storage_path) / "library_enrichment" / "enrichment.db")
         self._itunes_import_root = Path(self.mass.storage_path) / "library_enrichment" / "imports"
         await asyncio.to_thread(self._itunes_import_root.mkdir, parents=True, exist_ok=True)
+        self._itunes_zip_root = Path("/media/music-assistant-imports")
         await asyncio.to_thread(self._store.recover_pending)
         await asyncio.to_thread(self._store.recover_sync_pending)
 
@@ -94,6 +102,11 @@ class LibraryEnrichmentProvider(PluginProvider):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
             )
+        self._handles.append(
+            self.mass.webserver.register_dynamic_route(
+                "/library-enrichment/itunes-upload", self._itunes_zip_upload, method="POST"
+            )
+        )
         self.mass.tasks.register_scheduled_task(
             task_id=self._sync_dispatcher_id, name="Check selected archived Spotify playlists",
             handler=self._dispatch_sync, schedule=TaskSchedule.hourly(every=1), initial_delay=60,
@@ -158,8 +171,14 @@ class LibraryEnrichmentProvider(PluginProvider):
             "itunes_import": True,
             "itunes_import_api_version": 1,
             "itunes_apply": False,
-            "itunes_source_modes": ["staged_server_path"],
+            "itunes_zip_packages": True,
+            "itunes_zip_api_version": 1,
+            "itunes_zip_upload": True,
+            "itunes_zip_upload_api_version": 1,
+            "max_itunes_zip_upload_bytes": MAX_ITUNES_ZIP_UPLOAD_BYTES,
+            "itunes_source_modes": ["staged_server_path", "staged_zip"],
             "itunes_import_directory": str(self._itunes_import_root),
+            "itunes_zip_directory": str(self._itunes_zip_root),
             "max_itunes_preview_page": 200,
             "inspection": "library_only_no_refresh",
             "mirror_apply": False,
@@ -181,6 +200,69 @@ class LibraryEnrichmentProvider(PluginProvider):
             "access": "provider_configuration_administrators",
         }
 
+    async def _itunes_zip_upload(self, request: Any) -> Any:
+        """Accept one small XML-only transport ZIP through the authenticated web API."""
+        from aiohttp import web
+
+        user = await get_authenticated_user(request)
+        if user is None:
+            return web.json_response({"error": "authentication_required"}, status=401)
+        if not has_scope(user, Scope.CONFIG_PROVIDERS_WRITE):
+            return web.json_response({"error": "insufficient_permissions"}, status=403)
+        raw_name = request.headers.get("X-Filename", "iTunes Library.zip").strip()
+        filename = Path(raw_name).name
+        if (
+            not filename or filename != raw_name or len(filename) > 160
+            or Path(filename).suffix.casefold() != ".zip"
+        ):
+            return web.json_response({"error": "invalid_zip_filename"}, status=400)
+        declared = request.content_length
+        if declared is not None and (declared < 1 or declared > MAX_ITUNES_ZIP_UPLOAD_BYTES):
+            return web.json_response({"error": "zip_upload_size_limit"}, status=413)
+        try:
+            await asyncio.to_thread(self._itunes_zip_root.mkdir, parents=True, exist_ok=True)
+        except OSError:
+            return web.json_response({"error": "itunes_media_staging_unavailable"}, status=503)
+        data = bytearray()
+        async for chunk in request.content.iter_chunked(1024 * 1024):
+            data.extend(chunk)
+            if len(data) > MAX_ITUNES_ZIP_UPLOAD_BYTES:
+                return web.json_response({"error": "zip_upload_size_limit"}, status=413)
+        if not data:
+            return web.json_response({"error": "empty_zip_upload"}, status=400)
+        digest = hashlib.sha256(data).hexdigest()
+        destination = self._itunes_zip_root / f"itunes-library-{digest[:12]}.zip"
+        temporary = self._itunes_zip_root / f".{destination.name}.{uuid.uuid4().hex}.part"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            package = await asyncio.to_thread(inspect_itunes_zip, temporary)
+            if package["package"]["media_files_total"]:
+                raise ITunesZipImportError("Upload ZIP must contain the iTunes XML only; media stays in Music Assistant")
+            if destination.exists():
+                if await asyncio.to_thread(self._sha256_file, destination) != digest:
+                    raise ITunesZipImportError("Staged ZIP name conflicts with different content")
+                temporary.unlink(missing_ok=True)
+            else:
+                temporary.replace(destination)
+        except (OSError, ITunesZipImportError) as err:
+            temporary.unlink(missing_ok=True)
+            return web.json_response({"error": "invalid_itunes_zip", "detail": str(err)}, status=400)
+        return web.json_response(
+            {"api_version": 1, "library_path": str(destination), "source_digest": digest,
+             "package": package["package"]}
+        )
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while block := handle.read(1024 * 1024):
+                digest.update(block)
+        return digest.hexdigest()
+
     def _itunes_source_path(self, library_path: str) -> Path:
         if not isinstance(library_path, str) or not library_path.strip():
             raise InvalidDataError("Select an XML file in the configured iTunes import directory")
@@ -192,9 +274,55 @@ class LibraryEnrichmentProvider(PluginProvider):
             root = self._itunes_import_root.resolve(strict=True)
         except OSError as err:
             raise InvalidDataError("The staged iTunes XML file is not readable") from err
-        if not resolved.is_relative_to(root) or resolved.suffix.casefold() != ".xml" or not resolved.is_file():
-            raise InvalidDataError("iTunes imports require an XML file inside the configured import directory")
+        allowed_roots = [root]
+        if resolved.suffix.casefold() == ".zip":
+            try:
+                allowed_roots.append(self._itunes_zip_root.resolve(strict=True))
+            except OSError:
+                pass
+        if (
+            not any(resolved.is_relative_to(candidate) for candidate in allowed_roots)
+            or resolved.suffix.casefold() not in (".xml", ".zip")
+            or not resolved.is_file()
+        ):
+            raise InvalidDataError("iTunes imports require a staged XML or ZIP file inside an advertised directory")
         return resolved
+
+    def _inspect_itunes_source(
+        self, source: Path, path_mappings: list[dict] | None = None,
+        xml_member_path: str | None = None, localization_root: str = "iTunes Imported",
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if source.suffix.casefold() == ".xml":
+            return inspect_itunes_xml(source, path_mappings=path_mappings), None
+        package = inspect_itunes_zip(
+            source, xml_member_path=xml_member_path, localization_root=localization_root,
+        )
+        try:
+            with zipfile.ZipFile(source) as archive:
+                info = archive.getinfo(package["package"]["selected_xml_path"])
+                if info.file_size > 128 * 1024 * 1024:
+                    raise ITunesZipImportError("Selected iTunes XML exceeds the supported size limit")
+                xml_data = archive.read(info)
+        except (OSError, KeyError, RuntimeError, zipfile.BadZipFile) as err:
+            raise ITunesZipImportError("Selected iTunes XML cannot be read") from err
+        if hashlib.sha256(xml_data).hexdigest() != package["itunes_xml"]["sha256"]:
+            raise ITunesZipImportError("Selected iTunes XML changed during package inspection")
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".xml", prefix="itunes-zip-", dir=self._itunes_import_root, delete=False,
+            ) as temporary:
+                temporary.write(xml_data)
+                temporary.flush()
+                temporary_path = Path(temporary.name)
+            parsed = inspect_itunes_xml(temporary_path, path_mappings=path_mappings)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        parsed["source"]["path"] = str(source)
+        parsed["source_digest"] = package["archive"]["sha256"]
+        parsed["source"] = package["archive"]
+        return parsed, package
 
     @staticmethod
     def _itunes_public_inspection(parsed: dict[str, Any], inspection_id: str, revision: int) -> dict[str, Any]:
@@ -222,14 +350,21 @@ class LibraryEnrichmentProvider(PluginProvider):
             ],
         }
 
-    async def itunes_inspect(self, library_path: str) -> dict[str, Any]:
+    async def itunes_inspect(
+        self, library_path: str, xml_member_path: str = "", localization_root: str = "iTunes Imported",
+    ) -> dict[str, Any]:
         """Inspect one staged legacy XML library without changing the MA library."""
         self._authorize()
         source = self._itunes_source_path(library_path)
         try:
-            parsed = await asyncio.to_thread(inspect_itunes_xml, source)
+            parsed, package = await asyncio.to_thread(
+                self._inspect_itunes_source, source, None, xml_member_path or None, localization_root,
+            )
             metadata = {
                 "library_path": str(source),
+                "source_kind": "zip" if package else "xml",
+                "xml_member_path": package["package"]["selected_xml_path"] if package else None,
+                "localization_root": localization_root if package else None,
                 "library_date": parsed["library_date"],
                 "library_version": parsed["library_version"],
                 "tracks_total": parsed["tracks_total"],
@@ -241,9 +376,13 @@ class LibraryEnrichmentProvider(PluginProvider):
                 self._store.stage_itunes_import,
                 parsed["source_digest"], parsed["library_persistent_id"], metadata, [], [],
             )
-        except (ITunesXMLImportError, ValueError) as err:
+        except (ITunesXMLImportError, ITunesZipImportError, ValueError) as err:
             raise InvalidDataError(str(err)) from None
-        return self._itunes_public_inspection(parsed, staged["inspection_id"], staged["revision"])
+        result = self._itunes_public_inspection(parsed, staged["inspection_id"], staged["revision"])
+        result["source_kind"] = "zip" if package else "xml"
+        result["package"] = package["package"] if package else None
+        result["localization"] = package["localization"] if package else None
+        return result
 
     async def itunes_preview(
         self, inspection_id: str, source_digest: str, path_mappings: list, playlist_ids: list[str],
@@ -276,8 +415,12 @@ class LibraryEnrichmentProvider(PluginProvider):
             })
         source = self._itunes_source_path(inspection["source_metadata"]["library_path"])
         try:
-            parsed = await asyncio.to_thread(inspect_itunes_xml, source, path_mappings=normalized_mappings)
-        except ITunesXMLImportError as err:
+            parsed, package = await asyncio.to_thread(
+                self._inspect_itunes_source, source, normalized_mappings,
+                inspection["source_metadata"].get("xml_member_path"),
+                inspection["source_metadata"].get("localization_root") or "iTunes Imported",
+            )
+        except (ITunesXMLImportError, ITunesZipImportError) as err:
             raise InvalidDataError(str(err)) from None
         if parsed["source_digest"] != source_digest:
             raise InvalidDataError("The iTunes XML changed after inspection")
