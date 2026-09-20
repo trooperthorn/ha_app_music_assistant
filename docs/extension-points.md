@@ -25,7 +25,7 @@ edit is only for changing behavior that already lives inside an existing
 file we don't own (e.g. teaching an existing entity a new command). Anything
 that can instead be *added* — a new source of metadata, a new way to
 analyze audio, a new background capability or API command — should be a new
-provider, because it survives every future server bump automatically.
+provider, because it avoids editing existing upstream modules. Provider APIs, models, and feature flags still require compatibility checks for each server bump.
 
 This doc describes the three provider base classes that matter for that
 choice, what each one can touch, real upstream examples of each, and how to

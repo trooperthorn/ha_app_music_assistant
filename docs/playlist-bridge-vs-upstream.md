@@ -1,12 +1,13 @@
 # playlist_bridge vs upstream #5989
 
-The verdict, stated up front: once the pinned server reaches 2.11.0, drop
-`playlist_bridge`. Do not keep it and do not modify it into a permanent
-fixture. Upstream's own `migrate_playlist` (server PR #5989, merged
-2026-09-03, shipping in server 2.11.0) is a strict superset of what this
-plugin does and is more thoroughly hardened. There is no capability this
-plugin has that #5989 lacks. This document exists so that decision is a
-two-minute read at retirement time, not a re-investigation.
+Retirement must be split by responsibility. At the 2.11 boundary, verify migration
+parity and move frontend migration calls to the supported upstream command. Do not
+remove archival merely because upstream gained playlist migration. The bridge's
+name-based bulk copy is distinct from durable source archival, and must be retained
+or deliberately replaced before the bridge can be removed. The experimental
+`library_enrichment` provider now owns selected source captures and independent
+checkpoints; it does not yet replace builtin mirror application or bulk controls.
+The pin tripwire requires an explicit review, not automatic deletion.
 
 ## Why the bridge exists, and what it covers
 

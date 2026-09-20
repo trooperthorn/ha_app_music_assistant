@@ -14,8 +14,8 @@ would import those bugs into this fork.
 
 Upstream later landed a reworked version in server PR #5989 (merged
 2026-09-03) under that same command name, shipping in server 2.11.0. This
-plugin is therefore a bridge for the 2.10.x line only, and is retired when
-the pin crosses 2.11.0. ``tests/test_patches.py`` carries the tripwire that
+plugin bridges migration on the 2.10.x line. At 2.11.0, migration parity
+and archival replacement must be reviewed separately before retirement. ``tests/test_patches.py`` carries the tripwire that
 fails the build at that point; see docs/decisions.md.
 
 Every other patch in this directory edits an already-existing installed
