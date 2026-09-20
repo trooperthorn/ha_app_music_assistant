@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.4 -> v2026.09.20.5
 - Fork frontend v2026.09.20.3 -> v2026.09.20.4
 - Library Enrichment can review existing merged library-backed mappings as
   local-match candidates and retain revisioned approvals and rejections without
