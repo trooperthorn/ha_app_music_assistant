@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import sys
+import threading
 import types
 from contextvars import ContextVar
 from enum import StrEnum
@@ -73,8 +74,12 @@ def plugin(monkeypatch, tmp_path):
     provider.mass = types.SimpleNamespace(
         storage_path=str(tmp_path),
         webserver=types.SimpleNamespace(auth=types.SimpleNamespace(get_user=AsyncMock(return_value=auth.user))),
-        music=types.SimpleNamespace(providers=[spotify], get_controller=lambda media_type: controller),
-        tasks=types.SimpleNamespace(run_background_task=schedule, unregister_scheduled_task_and_wait=AsyncMock()),
+        music=types.SimpleNamespace(
+            providers=[spotify],
+            get_controller=lambda media_type: controller,
+            playlists=types.SimpleNamespace(library_items=AsyncMock(return_value=[])),
+        ),
+        tasks=types.SimpleNamespace(run_background_task=schedule, unregister_scheduled_task_and_wait=AsyncMock(return_value=True)),
         register_api_command=lambda command, handler, required_scope: registered.append((command, required_scope)) or (lambda: None),
     )
     preview = {"account_id": "account-a", "snapshot_id": "A", "name": "Same name", "total": 3}
@@ -122,6 +127,8 @@ def test_unauthorized_archive_and_inspection_calls_are_denied(plugin, user):
         plugin.provider.status(),
         plugin.provider.capture("spotify-a", "playlist"),
         plugin.provider.archive_version("unknown"),
+        plugin.provider.archive_versions("unknown"),
+        plugin.provider.sources("spotify-a"),
         plugin.provider.cancel("unknown"),
     ):
         with pytest.raises(Exception, match="permission"):
@@ -133,7 +140,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 7
+    assert len(plugin.registered) == 9
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -218,6 +225,129 @@ def test_cancel_before_worker_starts_has_durable_failed_state(plugin):
         assert cancelled["cancelled"] is True
         assert (await plugin.provider.status())["jobs"][0]["state"] == "failed"
         plugin.module.capture_playlist.assert_not_called()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("expected", [{"expected_account_id": "another-account"}, {"expected_snapshot_id": "stale"}])
+def test_capture_preconditions_reject_stale_preview_without_writes(plugin, expected):
+    async def run():
+        with pytest.raises(Exception, match="preview again"):
+            await plugin.provider.capture("spotify-a", "playlist", **expected)
+        assert await plugin.provider.status() == {"subscriptions": [], "jobs": []}
+        assert not plugin.handlers
+
+    asyncio.run(run())
+
+
+def test_source_listing_is_library_only_scoped_and_paginated(plugin):
+    def mapping(source_id, instance="spotify-a"):
+        return types.SimpleNamespace(provider_domain="spotify", provider_instance=instance, item_id=source_id)
+
+    rows = [
+        types.SimpleNamespace(item_id="1", name="Same name", provider_mappings=[mapping("A" * 22), mapping("B" * 22, "private")]),
+        types.SimpleNamespace(item_id="2", name="Liked songs", provider_mappings=[mapping("liked")]),
+        types.SimpleNamespace(item_id="3", name="Next page", provider_mappings=[mapping("C" * 22)]),
+    ]
+    plugin.provider.mass.music.playlists.library_items.return_value = rows
+    result = asyncio.run(plugin.provider.sources("spotify-a", limit=2, offset=10))
+    assert result["items"] == [{"source_playlist_id": "A" * 22, "name": "Same name", "library_item_id": "1"}]
+    assert result["excluded"] == [{"name": "Liked songs", "library_item_id": "2", "reason": "unsupported_source_identity"}]
+    assert result["has_more"] is True
+    assert result["scope"] == "imported_library_only"
+    plugin.provider.mass.music.playlists.library_items.assert_awaited_once_with(
+        provider="spotify-a", summary=True, limit=3, offset=10, order_by="name", collapse_collections=False
+    )
+    plugin.module.preview_playlist.assert_not_called()
+    plugin.controller.get.assert_not_called()
+    assert plugin.provider._store.list_subscriptions() == []
+
+
+@pytest.mark.parametrize("args", [{"limit": 0}, {"limit": 201}, {"limit": True}, {"offset": -1}])
+def test_source_listing_rejects_unbounded_pages(plugin, args):
+    with pytest.raises(Exception, match="Source page"):
+        asyncio.run(plugin.provider.sources("spotify-a", **args))
+    plugin.provider.mass.music.playlists.library_items.assert_not_called()
+
+
+def test_cancel_timeout_does_not_report_success_or_fail_active_job(plugin):
+    async def run():
+        result = await plugin.provider.capture("spotify-a", "playlist")
+        plugin.provider.mass.tasks.unregister_scheduled_task_and_wait.return_value = False
+        cancelled = await plugin.provider.cancel(result["job_id"])
+        assert cancelled == {"job_id": result["job_id"], "state": "stopping", "cancelled": False}
+        assert (await plugin.provider.status())["jobs"][0]["state"] == "pending"
+        assert result["job_id"] in plugin.provider._jobs
+
+    asyncio.run(run())
+
+
+def test_unload_timeout_leaves_archive_open_for_unwinding_job(plugin):
+    async def run():
+        await plugin.provider.capture("spotify-a", "playlist")
+        plugin.provider.mass.tasks.unregister_scheduled_task_and_wait.return_value = False
+        with pytest.raises(Exception, match="still stopping"):
+            await plugin.provider.unload()
+        assert plugin.provider._store.list_jobs()[0]["state"] == "pending"
+        with pytest.raises(Exception, match="stopping"):
+            await plugin.provider.status()
+        with pytest.raises(Exception, match="stopping"):
+            await plugin.provider.capture("spotify-a", "playlist")
+
+    asyncio.run(run())
+
+
+def test_version_listing_retains_old_captures_without_loading_occurrences(plugin):
+    async def run():
+        result = await plugin.provider.capture("spotify-a", "playlist")
+        await plugin.handlers[-1]["handler"]()
+        versions = await plugin.provider.archive_versions(result["subscription_id"])
+        assert len(versions) == 1
+        assert versions[0]["snapshot_id"] == "A"
+        assert "occurrences" not in versions[0]
+
+    asyncio.run(run())
+
+
+def test_request_cancellation_during_sqlite_preparation_finishes_job_before_unlock(plugin, monkeypatch):
+    async def run():
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        original = plugin.provider._store.begin_capture
+
+        def delayed_begin(*args):
+            job = original(*args)
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=5)
+            return job
+
+        monkeypatch.setattr(plugin.provider._store, "begin_capture", delayed_begin)
+        request = asyncio.create_task(plugin.provider.capture("spotify-a", "playlist"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        request.cancel()
+        await asyncio.sleep(0)
+        assert plugin.provider._write_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert plugin.provider._store.list_jobs()[0]["state"] == "failed"
+        assert not plugin.provider._jobs
+        assert not plugin.handlers
+        assert not plugin.provider._write_lock.locked()
+        # No orphan pending constraint prevents an explicit retry.
+        await plugin.provider.capture("spotify-a", "playlist")
+
+    asyncio.run(run())
+
+
+def test_safe_adapter_failure_reason_survives_in_job_without_raw_provider_details(plugin):
+    async def run():
+        await plugin.provider.capture("spotify-a", "playlist")
+        plugin.module.capture_playlist.side_effect = plugin.module.SpotifyCaptureError("Playlist pagination was incomplete or changed")
+        with pytest.raises(Exception, match="previous committed"):
+            await plugin.handlers[-1]["handler"]()
+        assert (await plugin.provider.status())["jobs"][0]["error"] == "Playlist pagination was incomplete or changed"
 
     asyncio.run(run())
 

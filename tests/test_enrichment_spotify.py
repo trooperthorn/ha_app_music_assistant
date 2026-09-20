@@ -62,6 +62,7 @@ def test_preview_is_fresh_metadata_only_and_uses_authenticated_account():
     assert result["account_id"] == "authenticated-listener"
     assert result["snapshot_id"] == "snapshot-A"
     assert result["total"] == 1
+    assert result["eligible"] and not result["items_access_verified"]
     assert [call[0] for call in provider.calls] == ["me", f"playlists/{PLAYLIST}", "me"]
 
 
@@ -159,8 +160,9 @@ def test_access_denied_does_not_produce_an_archive():
             raise MediaNotFoundError()
 
     provider.mutate = mutate
-    with pytest.raises(MediaNotFoundError):
+    with pytest.raises(spotify.SpotifyCaptureError, match="access is denied") as error:
         asyncio.run(spotify.capture_playlist(provider, PLAYLIST))
+    assert error.value.reason == "source_inaccessible"
 
 
 def test_limit_rejects_before_paging_and_liked_songs_is_unsupported():
@@ -170,3 +172,67 @@ def test_limit_rejects_before_paging_and_liked_songs_is_unsupported():
     assert not any(call[0].endswith("/items") for call in provider.calls)
     with pytest.raises(spotify.SpotifyCaptureError, match="concrete"):
         asyncio.run(spotify.preview_playlist(provider, "liked-songs-spotify-instance"))
+
+
+def test_invalid_and_restricted_entries_remain_distinct_from_null_placeholders():
+    rows = ["bad-wrapper", {}, {"item": []}, {"item": {}}, {"item": {"id": 23}},
+            {"item": {"id": "x", "restrictions": {"reason": "market"}}},
+            {"item": {"type": "audiobook"}}, {"item": None, "track": {"id": "stale"}}]
+    result = asyncio.run(spotify.capture_playlist(Provider(rows), PLAYLIST))
+    entries = result["occurrences"]
+    assert [row["state"] for row in entries] == ["invalid", "invalid", "invalid", "unavailable", "unavailable",
+                                                "unavailable", "unsupported", "null"]
+    assert [row["source_payload"] for row in entries] == rows
+    assert entries[4]["source_item_id"] is None
+    assert entries[-1]["source_item_id"] is None
+
+
+@pytest.mark.parametrize("field,value", [("offset", False), ("total", True), ("offset", 0.0), ("total", 1.0)])
+def test_rejects_noninteger_pagination_values(field, value):
+    provider = Provider()
+    original = provider._get_data
+
+    async def malformed(endpoint, **kwargs):
+        result = await original(endpoint, **kwargs)
+        if endpoint.endswith("/items"):
+            result[field] = value
+        return result
+
+    provider._get_data = malformed
+    with pytest.raises(spotify.SpotifyCaptureError, match="pagination"):
+        asyncio.run(spotify.capture_playlist(provider, PLAYLIST))
+
+
+def test_session_change_inside_authentication_rejects_before_request():
+    provider = Provider()
+
+    async def changing_auth(**kwargs):
+        provider.dev_session_active = False
+        return {"access_token": "fake-session-value"}
+
+    provider._get_auth_info = changing_auth
+    with pytest.raises(spotify.SpotifyCaptureError, match="during authentication"):
+        asyncio.run(spotify.preview_playlist(provider, PLAYLIST))
+    assert provider.calls == []
+
+
+def test_empty_playlist_is_a_complete_capture_without_item_requests():
+    provider = Provider([])
+    result = asyncio.run(spotify.capture_playlist(provider, PLAYLIST))
+    assert result["total"] == 0 and result["occurrences"] == []
+    assert provider.metadata_reads == 2
+    assert not any(call[0].endswith("/items") for call in provider.calls)
+
+
+def test_provider_token_refresh_for_same_account_keeps_capture_consistent():
+    provider = Provider([None] * 51)
+
+    def refresh(instance, endpoint, kwargs):
+        if endpoint.endswith("/items") and kwargs["offset"] == 0:
+            instance.token = "rotated-fake-session"  # noqa: S105 - fake provider credential
+
+    provider.mutate = refresh
+    result = asyncio.run(spotify.capture_playlist(provider, PLAYLIST))
+    assert result["account_id"] == "authenticated-listener"
+    assert len(result["occurrences"]) == 51
+    assert len([call for call in provider.calls if call[0] == "me"]) == 3

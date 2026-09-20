@@ -192,3 +192,72 @@ def test_structural_schema_change_fails_closed(tmp_path):
         db.execute("ALTER TABLE jobs ADD COLUMN unexpected TEXT")
     with pytest.raises(ValueError, match="schema digest"):
         ArchiveStore(path)
+
+
+def test_version_history_is_bounded_stable_and_account_scoped(tmp_path, monkeypatch):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    other = subscribe(store, account="other")
+    monkeypatch.setattr(module, "_now", lambda: "2026-09-20T00:00:00+00:00")
+    ids = [capture(store, sub, snapshot=str(index)) for index in range(3)]
+    capture(store, other)
+    rows = store.list_versions(sub)
+    assert [row["id"] for row in rows] == sorted(ids, reverse=True)
+    assert store.list_versions(sub, limit=1, offset=1) == rows[1:2]
+    assert store.list_versions(sub, offset=100) == []
+    assert all("occurrences" not in row and row["content_digest"] and row["total"] == 1 for row in rows)
+    with pytest.raises(KeyError):
+        store.list_versions("unknown")
+    for limit, offset in [(0, 0), (201, 0), (True, 0), (1, -1), (1, False), (1, 2**31)]:
+        with pytest.raises(ValueError):
+            store.list_versions(sub, limit, offset)
+    store.close()
+
+
+@pytest.mark.parametrize("failure", ["serialization", "publication"])
+def test_backup_manifest_failure_leaves_no_published_recovery_set(tmp_path, monkeypatch, failure):
+    store = ArchiveStore(tmp_path / "archive.db")
+    capture(store, subscribe(store))
+    destination = tmp_path / "backup.db"
+
+    def broken_dump(value, handle, **kwargs):
+        handle.write("{partial")
+        raise OSError("injected manifest serialization failure")
+
+    def broken_link(*args):
+        raise OSError("injected manifest publication failure")
+
+    if failure == "serialization":
+        monkeypatch.setattr(module.json, "dump", broken_dump)
+    else:
+        monkeypatch.setattr(module.os, "link", broken_link)
+    with pytest.raises(OSError):
+        store.backup(destination)
+    assert not destination.exists()
+    assert not destination.with_suffix(".db.manifest.json").exists()
+    assert list(tmp_path.glob(".*.manifest.tmp")) == []
+    store.close()
+
+
+def test_backup_refuses_orphan_manifest_without_changing_it(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    destination = tmp_path / "backup.db"
+    manifest = destination.with_suffix(".db.manifest.json")
+    manifest.write_text("existing evidence", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        store.backup(destination)
+    assert manifest.read_text(encoding="utf-8") == "existing evidence"
+    assert not destination.exists()
+    store.close()
+
+
+def test_backup_rejects_schema_changed_after_open(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    with sqlite3.connect(path) as db:
+        db.execute("ALTER TABLE jobs ADD COLUMN unexpected TEXT")
+    destination = tmp_path / "backup.db"
+    with pytest.raises(ValueError, match="schema"):
+        store.backup(destination)
+    assert not destination.exists()
+    store.close()

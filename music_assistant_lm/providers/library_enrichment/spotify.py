@@ -15,6 +15,10 @@ from typing import Any
 class SpotifyCaptureError(ValueError):
     """Source cannot be captured completely and consistently."""
 
+    def __init__(self, message: str, *, reason: str = "invalid_source") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 def _validate(provider: Any, playlist_id: str, max_items: int) -> None:
     if not isinstance(playlist_id, str) or not re.fullmatch(r"[A-Za-z0-9]{22}", playlist_id):
@@ -38,14 +42,24 @@ class _Session:
         if bool(self.provider.dev_session_active) != self.dev_active:
             raise SpotifyCaptureError("Spotify session selection changed during capture")
         auth = await self.provider._get_auth_info(use_global_session=self.use_global)
+        if bool(self.provider.dev_session_active) != self.dev_active:
+            raise SpotifyCaptureError("Spotify session selection changed during authentication", reason="session_changed")
+        if not isinstance(auth, dict) or not isinstance(auth.get("access_token"), str) or not auth["access_token"]:
+            raise SpotifyCaptureError("Authenticated Spotify session is unavailable", reason="authentication_unavailable")
         if self.account_id is not None and auth.get("access_token") != self.checked_token and endpoint != "me":
             identity = await self.provider._get_data("me", use_global_session=self.use_global, auth_info=auth)
-            if identity.get("id") != self.account_id:
+            if not isinstance(identity, dict) or identity.get("id") != self.account_id:
                 raise SpotifyCaptureError("Spotify account changed during capture")
             self.checked_token = auth.get("access_token")
         result = await self.provider._get_data(
+            # Bind this response to the token whose account was checked. In-flight
+            # expiry may exhaust upstream retries; failing closed is preferable to
+            # silently switching authorization during a response. Normal proactive
+            # refresh still runs through _get_auth_info before every request.
             endpoint, use_global_session=self.use_global, auth_info=auth, **kwargs
         )
+        if bool(self.provider.dev_session_active) != self.dev_active:
+            raise SpotifyCaptureError("Spotify session selection changed during capture", reason="session_changed")
         if not isinstance(result, dict):
             raise SpotifyCaptureError("Malformed Spotify response")
         if endpoint == "me":
@@ -75,21 +89,29 @@ def _metadata(raw: dict[str, Any], max_items: int) -> dict[str, Any]:
 
 
 def _occurrence(position: int, raw: Any) -> dict[str, Any]:
-    item = (raw.get("item") or raw.get("track")) if isinstance(raw, dict) else None
-    item = item if isinstance(item, dict) else {}
-    if isinstance(raw, dict) and (raw.get("is_local") or item.get("is_local")):
+    # An explicit null in the new shape must not resurrect a legacy track field.
+    payload = raw.get("item") if isinstance(raw, dict) and "item" in raw else raw.get("track") if isinstance(raw, dict) else None
+    item = payload if isinstance(payload, dict) else {}
+    source_id = item.get("id")
+    source_id = source_id if isinstance(source_id, str) and source_id else None
+    if raw is not None and (
+        not isinstance(raw, dict) or not any(key in raw for key in ("item", "track"))
+        or (payload is not None and not isinstance(payload, dict))
+    ):
+        state = "invalid"
+    elif isinstance(raw, dict) and (raw.get("is_local") is True or item.get("is_local") is True):
         state = "local"
     elif item.get("type") == "episode":
         state = "episode"
-    elif not item:
+    elif payload is None:
         state = "null"
-    elif not item.get("id") or item.get("is_playable") is False:
-        state = "unavailable"
     elif item.get("type") not in (None, "track"):
         state = "unsupported"
+    elif not source_id or item.get("is_playable") is False or item.get("restrictions"):
+        state = "unavailable"
     else:
         state = "track"
-    return {"position": position, "source_item_id": item.get("id"), "state": state, "source_payload": deepcopy(raw)}
+    return {"position": position, "source_item_id": source_id, "state": state, "source_payload": deepcopy(raw)}
 
 
 async def _read(provider: Any, playlist_id: str, max_items: int, capture: bool, on_page: Any) -> dict[str, Any]:
@@ -101,8 +123,10 @@ async def _read(provider: Any, playlist_id: str, max_items: int, capture: bool, 
         except Exception as exc:
             # Exactly the pinned provider's restricted-playlist fallback; restart the whole
             # traversal so observations from two authorization contexts cannot be combined.
-            if exc.__class__.__name__ != "MediaNotFoundError" or use_global or not provider.dev_session_active or attempt:
+            if exc.__class__.__name__ != "MediaNotFoundError":
                 raise
+            if use_global or not provider.dev_session_active or attempt:
+                raise SpotifyCaptureError("Playlist is unavailable or access is denied", reason="source_inaccessible") from None
             use_global = True
             if capture:
                 await provider._set_playlist_requires_global_token(playlist_id)
@@ -118,7 +142,8 @@ async def _read_session(provider: Any, playlist_id: str, max_items: int, capture
     if not capture:
         if await session.account() != account:
             raise SpotifyCaptureError("Spotify account changed during preview")
-        return result
+        return {**result, "eligible": True, "eligibility": "metadata_only", "items_access_verified": False,
+                "eligibility_reasons": ["Metadata and size permit a capture attempt; item access is checked during capture"]}
     occurrences: list[Any] = []
     while len(occurrences) < before["total"]:
         offset = len(occurrences)
@@ -126,7 +151,9 @@ async def _read_session(provider: Any, playlist_id: str, max_items: int, capture
         page = await session.request(f"{endpoint}/items", offset=offset, limit=limit)
         rows = page.get("items")
         if (
-            page.get("total") != before["total"]
+            type(page.get("total")) is not int
+            or type(page.get("offset")) is not int
+            or page.get("total") != before["total"]
             or page.get("offset") != offset
             or not isinstance(rows, list)
             or len(rows) != limit

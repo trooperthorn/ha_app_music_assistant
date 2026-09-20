@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -49,7 +50,10 @@ class ArchiveStore:
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if actual != required:
                     raise ValueError("Unexpected enrichment database tables; database untouched")
-                self.store_uuid = self._db.execute("SELECT value FROM metadata WHERE key='store_uuid'").fetchone()[0]
+                identity = self._db.execute("SELECT value FROM metadata WHERE key='store_uuid'").fetchone()
+                if not identity:
+                    raise ValueError("Enrichment store identity is missing")
+                self.store_uuid = identity[0]
                 uuid.UUID(self.store_uuid)
                 schema_digest = self._db.execute("SELECT value FROM metadata WHERE key='schema_digest'").fetchone()
                 if not schema_digest or schema_digest[0] != self._schema_digest():
@@ -254,6 +258,20 @@ class ArchiveStore:
             result["occurrences"] = [json.loads(payload) for payload in payloads]
             return result
 
+    def list_versions(self, subscription_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
+        """Return bounded metadata newest-first, using ID to break timestamp ties."""
+        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or not 0 <= offset <= 2**31 - 1:
+            raise ValueError("Expected limit 1..200 and offset 0..2147483647")
+        with self._lock:
+            self.get_subscription(subscription_id)
+            return [
+                dict(row)
+                for row in self._db.execute(
+                    "SELECT * FROM versions WHERE subscription_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                    (subscription_id, limit, offset),
+                )
+            ]
+
     def backup(self, destination: str | Path) -> dict:
         """Create a new SQLite recovery image and verify its actual destination bytes.
 
@@ -262,11 +280,17 @@ class ArchiveStore:
         """
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path = destination.with_suffix(destination.suffix + ".manifest.json")
+        if manifest_path.exists():
+            raise FileExistsError(manifest_path)
+        temporary_manifest = destination.with_name(f".{destination.name}.{uuid.uuid4()}.manifest.tmp")
         with destination.open("xb"):
             pass
         try:
             with self._lock, closing(sqlite3.connect(destination)) as target:
                 self._db.backup(target)
+            # Reopen the completed destination independently; do not trust source-side checks.
+            with closing(sqlite3.connect(destination.resolve().as_uri() + "?mode=ro", uri=True)) as target:
                 if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("Backup integrity verification failed")
                 if target.execute("PRAGMA foreign_key_check").fetchone():
@@ -278,6 +302,14 @@ class ArchiveStore:
                     ]
                     if len(payloads) != total or _digest(payloads) != digest:
                         raise ValueError("Backup version content digest mismatch")
+                if target.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise ValueError("Backup schema version mismatch")
+                metadata = dict(target.execute("SELECT key,value FROM metadata"))
+                schema_digest = _digest(
+                    [row[0] for row in target.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")]
+                )
+                if metadata.get("schema_digest") != schema_digest or metadata.get("store_uuid") != self.store_uuid:
+                    raise ValueError("Backup schema or identity mismatch")
             manifest = {
                 "store_uuid": self.store_uuid,
                 "schema_version": SCHEMA_VERSION,
@@ -285,9 +317,15 @@ class ArchiveStore:
                 "size": destination.stat().st_size,
                 "created_at": _now(),
             }
-            with destination.with_suffix(destination.suffix + ".manifest.json").open("x", encoding="utf-8") as handle:
+            with temporary_manifest.open("x", encoding="utf-8") as handle:
                 json.dump(manifest, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Atomic, no-overwrite publication. Failure leaves no apparently valid manifest.
+            os.link(temporary_manifest, manifest_path)
             return manifest
         except Exception:
             destination.unlink(missing_ok=True)
             raise
+        finally:
+            temporary_manifest.unlink(missing_ok=True)

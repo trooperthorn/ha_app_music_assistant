@@ -26,6 +26,12 @@ provider before its commands are registered. It never auto-starts a capture.
   access. Background workers refresh the initiating user's permissions and bind
   that user explicitly because MA's task queue does not restore request context.
 - Direct library inspection avoids the normal refresh-on-access `get()` method.
+- Imported Spotify playlist listing uses library summaries only. It neither
+  contacts Spotify nor triggers media refresh. Live offset pages are candidates,
+  not a complete account inventory or a stable snapshot of concurrent library edits.
+- Optional capture preconditions bind a request to the account and snapshot shown
+  in the user's preview. A mismatch fails before writing archive state.
+- Bounded historical version listing returns metadata without loading occurrences.
 
 These are metadata/reference archives, not downloaded audio. This slice does not
 apply MA builtin mirrors, schedule sync, expose a bulk UI, support Liked Songs,
@@ -46,9 +52,11 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/capabilities` | none | compatibility, frontend/server versions, limits and supported features |
 | `library_enrichment/inspect` | `media_type`, `library_item_id` | full existing library item, `external_ids_loaded: true`; no provider fallback |
 | `library_enrichment/preview` | `provider_instance_id`, `source_playlist_id`, optional `max_items` | source name, snapshot, count, authenticated account and instance identity |
-| `library_enrichment/capture` | same as preview | durable `job_id`, `subscription_id`, MA `task_id` |
+| `library_enrichment/sources` | `provider_instance_id`, optional `limit` (1..200, default 100), `offset` | imported library candidates, excluded reasons, page boundaries and `has_more` |
+| `library_enrichment/capture` | same as preview; optional `expected_account_id`, `expected_snapshot_id` | durable `job_id`, `subscription_id`, MA `task_id`; stale preview rejected |
 | `library_enrichment/status` | none | persisted subscriptions, checkpoints, jobs, counts and sanitized failures |
 | `library_enrichment/version` | `version_id` | immutable ordered occurrence capture, verified against content digest |
+| `library_enrichment/versions` | `subscription_id`, optional `limit` (1..200, default 50), `offset` | newest-first version metadata; stable timestamp/ID ordering |
 | `library_enrichment/cancel` | `job_id` | final durable state; an already executing atomic commit can win the cancellation race |
 
 The playlist ID is the 22-character source ID, not a URL, title or MA integer ID.
@@ -58,11 +66,28 @@ no MA media and schedules no enrichment. Normal provider authentication can stil
 refresh and persist credentials; it is not a claim of zero filesystem writes.
 Captures reuse existing request throttling/session selection. A token expiring
 inside a request retry may fail safely; rerun capture after resolving authentication.
+Preview establishes metadata/size eligibility only; `items_access_verified` remains
+false until capture actually reads the pages. Invalid raw entries are retained with
+an explicit invalid state rather than silently represented as null source entries.
+
+The companion frontend adds selected-capture controls to Library Enrichment's
+provider settings. It checks source-listing and preview-precondition capabilities,
+requires a fresh preview when selection or limit changes, and sends the reviewed
+account/snapshot back with capture. Older backends must not silently fall back to
+the legacy bulk bridge. Status includes persisted progress after navigation/restart.
+Cancellation can return `state: stopping, cancelled: false`; keep checking status
+instead of reporting success prematurely. A cancelled capture request during SQLite
+preparation waits for the thread and fails its durable job before releasing the
+lifecycle lock, so it cannot leave an orphan pending job that blocks the next attempt.
 
 The backup helper `ArchiveStore.backup(new_path)` is currently an internal tested
 contract, not a web command accepting arbitrary filesystem paths. It refuses an
 existing destination, verifies destination integrity and version digests, and
-writes `<new_path>.manifest.json`. Tests reopen this copy and recover repeated/null
+writes `<new_path>.manifest.json` only after independently reopening the destination
+and verifying its schema/identity/content. The complete manifest is fsynced and
+published atomically without overwriting an existing file; the current helper needs
+hard-link support on the backup filesystem and fails safely when unavailable.
+Tests reopen this copy and recover repeated/null
 occurrences. No live library restore or coordinated MA recovery has been attempted.
 
 ## Validation and promotion
@@ -76,6 +101,6 @@ a real installation, complete image CI and a selected-source test plus independe
 backup/restore proof. Keep historical versions and archive data during upgrades or
 provider removal; do not substitute a new empty database after a migration error.
 
-Next work: capability-aware selection/status controls, builtin mirror apply and
-reconciliation, broader read-only inspection UI, source retention controls and a
+Next work: builtin mirror apply and reconciliation, broader read-only inspection
+UI, source retention controls and a
 coordinated recovery set. Matching and enrichment follow those preservation gates.
