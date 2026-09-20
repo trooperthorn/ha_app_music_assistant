@@ -498,3 +498,89 @@ with their ISRC and MusicBrainz id and are retried every 24 hours. What it
 would genuinely add is provenance, idempotent re-sync and match auditing,
 which only pay for themselves if recurring incremental re-sync from a
 streaming provider is wanted. Revisit it then, not before.
+
+## Bulk playlist archival ships as a plugin command (2026-09-19)
+
+The playlist import destination question settled on builtin (see "Playlist
+import keeps the builtin destination" above), which left the real remaining
+need unmet: copying a large number of streaming-provider playlists into
+builtin so the playlist structure survives independently of that provider.
+The motivating case is a library of roughly 400 Spotify playlists with no
+local files at all, where the curation work is the thing worth preserving.
+
+Two facts from the source decided the shape of this.
+
+First, nothing in the server ever re-points a stored builtin playlist entry
+at a provider mapping that appears later. The 24-hourly repair pass skips any
+entry that already has a title, `#EXTPROV` lines and `#EXTMA`, because
+`_stored_details_differ` compares only a manually set name and thumbnail and
+knows nothing about provider mappings; it also unregisters itself after one
+clean run. `match_imported_playlist_tracks` only considers an entry whose
+provider instance is not loaded, so while the source provider is configured
+it is a no-op. An archive is therefore a point-in-time copy, not a live view,
+and a separate re-resolve step will be needed once local files exist.
+
+Second, the cost is dominated by the source provider's rate limit, not by
+anything local. `export_playlist` resolves a library playlist to a provider
+id and pages through `get_playlist_tracks` against the live provider, so a
+50-track playlist is roughly four or five HTTP calls. Spotify is throttled at
+1 request per 2 seconds on Music Assistant's shared client id and 45 per 30
+seconds on a user's own, so 400 playlists is roughly 45 to 55 minutes in the
+first case and 15 in the second. Responses are cached for 3 hours, so a
+re-run shortly after is cheap.
+
+`playlist_bridge/archive_playlists` is therefore one background task rather
+than one task per playlist. The background task controller runs at most 2
+concurrent tasks by default, so queueing 400 would simply serialize behind
+that limit while filling the task list and the 100-entry history. It does not
+pass `priority=True`, because a bulk job must not jump ahead of interactive
+work, and it adds no sleeps of its own: the provider already throttles and
+honours `Retry-After` through `throttle_with_retries`. It does not
+parallelize either, since the builtin provider guards all M3U file writes
+with a single global lock.
+
+Matching is deliberately off (`import_playlist(..., library_matching=False)`).
+With hundreds of playlists, matching would issue tens of thousands of
+provider searches to find cross-provider equivalents that the archive does
+not need, since the point is a local copy of the playlist rather than a
+matched one. `migrate_playlist` remains the command for a matched copy on a
+chosen destination.
+
+Idempotency is by name: a playlist is skipped when a builtin playlist with
+its exact name already exists. That makes a re-run resume a partial run and
+pick up newly added playlists without duplicating anything, with no new
+persistent state to own. The accepted limitation is that it does not detect
+renames, so renaming either the source playlist or its archived copy breaks
+the link and the next run archives it again under the new name. Two source
+playlists sharing one name also both get archived, the second landing under
+the builtin provider's own `" (n)"` suffix. Both were preferred over adding a
+mapping store, whose absence is also why the deferred SQLite sidecar stays
+deferred.
+
+The task id is deterministic (`playlist_bridge_archive_<source or all>`)
+because the tasks controller returns the existing task when one with the same
+id is already active, which makes a double invocation a no-op for free. Per
+playlist failures call `report_current_task_failure` and continue rather than
+aborting, and the run ends with a Markdown summary through
+`set_current_task_report` giving archived, failed and per-reason skipped
+counts.
+
+Fixed in the same change: `_migrate_playlist` created a throwaway builtin
+playlist to run the matching pipeline through and never removed it, leaking
+an orphaned `.m3u` on every single call. It is now removed in a `finally`,
+after the matched track ids have been read from it, so cleanup happens
+whether the migration succeeded or raised. A cleanup failure is logged rather
+than raised, so it can neither turn a successful migration into a failure nor
+mask a real migration error. This mattered more than it looked: at 400
+playlists the old behaviour would have left 400 orphans behind.
+
+Not built yet, and the next piece of work: a command that walks an archived
+playlist's entries, re-looks each up by ISRC or MusicBrainz id, and rewrites
+its `#EXTPROV` lines from current library state. That is what will make local
+files usable in an archived playlist, given the server never does it. It is
+inert until local files exist, which is why it is not in this change.
+Playback source selection itself needs nothing new: `ProviderMapping.quality`
+scores a lossless local file around 60 against roughly 2 for Spotify at
+320 kbps, so a local mapping becomes the primary automatically once it
+exists, and the `play_source_steer` patch already lets a play request name a
+different source explicitly.
