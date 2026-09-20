@@ -40,7 +40,7 @@ async def setup(mass, manifest, config):
 
 
 class LibraryEnrichmentProvider(PluginProvider):
-    """Admin-operated selected captures; no remote mutation or local matching."""
+    """Admin-operated selected captures and review overlays; no remote mutation."""
 
     async def handle_async_init(self) -> None:
         if version("music-assistant") != SUPPORTED_SERVER:
@@ -75,6 +75,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("set_sync_policy", self.set_sync_policy),
             ("sync_now", self.sync_now),
             ("sync_status", self.sync_status),
+            ("match_review", self.match_review),
+            ("set_match_decision", self.set_match_decision),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -141,7 +143,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             "subscription_sync": True,
             "sync_policy_api_version": 1,
             "interval_bounds": {"min": 3600, "max": 604800},
-            "local_matching": False,
+            "local_matching": True,
+            "match_review_api_version": 1,
+            "max_match_review_page": 200,
             "liked_songs": False,
             "audio_backup": False,
             "max_items": 10000,
@@ -363,6 +367,204 @@ class LibraryEnrichmentProvider(PluginProvider):
     async def archive_versions(self, subscription_id: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         self._authorize()
         return await self._read_store(self._store.list_versions, subscription_id, limit, offset)
+
+    @staticmethod
+    def _match_classification(overlay: dict[str, Any]) -> str:
+        if overlay.get("approved_asset_id"):
+            return "approved"
+        candidates = overlay.get("candidates", ())
+        available = [candidate for candidate in candidates if not candidate.get("rejected")]
+        if candidates and not available:
+            return "rejected"
+        count = len(available)
+        return "unmatched" if count == 0 else "candidate" if count == 1 else "ambiguous"
+
+    def _local_mapping_candidate(self, mapping: Any) -> tuple[Any, dict[str, Any]] | None:
+        """Classify an existing merged mapping without resolving or refreshing it."""
+        provider = next(
+            (item for item in self.mass.music.providers if item.instance_id == mapping.provider_instance),
+            None,
+        )
+        if (
+            provider is None
+            or not provider.available
+            or getattr(mapping, "available", True) is False
+            or provider.domain != mapping.provider_domain
+            or provider.domain in ("builtin", "spotify")
+            or getattr(provider, "is_streaming_provider", True)
+        ):
+            return None
+        evidence = {
+            "kind": "existing_merged_provider_mapping",
+            "provider_domain": str(mapping.provider_domain),
+            "provider_instance_id": str(mapping.provider_instance),
+            "provider_item_id": str(mapping.item_id),
+        }
+        return provider, evidence
+
+    async def match_review(self, version_id: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        """Generate a bounded, read-only review overlay from existing MA mappings."""
+        self._authorize()
+        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
+            raise InvalidDataError("Match review page requires limit 1..200 and nonnegative offset")
+        version = await self._read_store(self._store.get_version, version_id)
+        subscription = await self._read_store(self._store.get_subscription, version["subscription_id"])
+        occurrences = version["occurrences"]
+        page = occurrences[offset : offset + limit]
+        source = {
+            "provider_domain": subscription["provider_domain"],
+            "provider_instance_id": subscription["provider_instance_id"],
+            "account_id": subscription["account_id"],
+        }
+        controller = self.mass.music.get_controller(MediaType.TRACK)
+        overlays: dict[str, dict[str, Any]] = {}
+        candidate_freshness = "fresh"
+        candidate_error = None
+        for source_item_id in dict.fromkeys(
+            row.get("source_item_id")
+            for row in page
+            if row.get("state") == "track" and isinstance(row.get("source_item_id"), str)
+        ):
+            try:
+                # This is the direct library lookup. Deliberately do not call the
+                # controller's refresh-on-access get() or any provider search.
+                item = await controller.get_library_item_by_prov_id(
+                    source_item_id, subscription["provider_instance_id"]
+                )
+            except Exception:
+                # A transient library read must not erase a previous candidate set.
+                candidate_freshness = "stale"
+                candidate_error = "library_read_failed"
+                overlays[source_item_id] = await self._read_store(
+                    self._store.get_match_overlay,
+                    subscription["provider_domain"],
+                    subscription["account_id"],
+                    "track",
+                    source_item_id,
+                )
+                continue
+            candidates = []
+            if item is not None:
+                for mapping in sorted(
+                    item.provider_mappings,
+                    key=lambda value: (value.provider_domain, value.provider_instance, value.item_id),
+                ):
+                    classified = self._local_mapping_candidate(mapping)
+                    if classified is None:
+                        continue
+                    _, evidence = classified
+                    evidence = {
+                        **evidence,
+                        "identity_claim": "candidate_not_exact_recording_or_edition",
+                        "source_provider_domain": subscription["provider_domain"],
+                        "source_provider_instance_id": subscription["provider_instance_id"],
+                        "source_item_id": source_item_id,
+                        "library_item_id": str(item.item_id),
+                    }
+                    asset = await self._read_store(
+                        self._store.upsert_local_asset,
+                        "track",
+                        mapping.provider_instance,
+                        str(mapping.item_id),
+                        {"provider_domain": str(mapping.provider_domain)},
+                        evidence,
+                    )
+                    candidates.append({"asset_id": asset["id"], "score": 0.5, "evidence": evidence})
+            overlays[source_item_id] = await self._read_store(
+                self._store.replace_match_candidates,
+                subscription["provider_domain"],
+                subscription["account_id"],
+                "track",
+                source_item_id,
+                candidates,
+                "ma-merged-mapping-v1",
+            )
+        items = []
+        for occurrence in page:
+            source_item_id = occurrence.get("source_item_id")
+            overlay = overlays.get(source_item_id)
+            items.append(
+                {
+                    "position": occurrence["position"],
+                    "state": occurrence.get("state", "invalid"),
+                    "source_item_id": source_item_id,
+                    "match": overlay,
+                    "classification": self._match_classification(overlay) if overlay else "unmatched",
+                }
+            )
+        return {
+            "version_id": version_id,
+            "subscription_id": version["subscription_id"],
+            "source": source,
+            "limit": limit,
+            "offset": offset,
+            "total": len(occurrences),
+            "has_more": offset + len(page) < len(occurrences),
+            "candidate_freshness": candidate_freshness,
+            "candidate_error": candidate_error,
+            "items": items,
+        }
+
+    async def set_match_decision(
+        self,
+        version_id: str,
+        source_item_id: str,
+        expected_revision: int,
+        action: str,
+        asset_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one explicit decision; this never changes MA mappings or playback."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Match decisions require library write permission")
+        version = await self._read_store(self._store.get_version, version_id)
+        subscription = await self._read_store(self._store.get_subscription, version["subscription_id"])
+        if not any(
+            row.get("state") == "track" and row.get("source_item_id") == source_item_id
+            for row in version["occurrences"]
+        ):
+            raise InvalidDataError("Source item is not a reviewable occurrence in this archive version")
+        try:
+            overlay = await self._read_store(
+                self._store.get_match_overlay,
+                subscription["provider_domain"], subscription["account_id"], "track", source_item_id,
+            )
+            if action == "approve":
+                if not isinstance(asset_id, str) or asset_id not in {
+                    candidate["asset_id"] for candidate in overlay["candidates"]
+                }:
+                    raise InvalidDataError("Approved asset must be a current candidate")
+                result = await self._read_store(
+                    self._store.set_match_decision,
+                    subscription["provider_domain"], subscription["account_id"], "track", source_item_id,
+                    "approve", asset_id, expected_revision, user.user_id,
+                    {"kind": "explicit_user_review", "version_id": version_id}, "ma-merged-mapping-v1",
+                )
+            elif action == "reject":
+                if not isinstance(asset_id, str) or asset_id not in {
+                    candidate["asset_id"] for candidate in overlay["candidates"]
+                }:
+                    raise InvalidDataError("Rejected asset must be a current candidate")
+                result = await self._read_store(
+                    self._store.set_match_decision,
+                    subscription["provider_domain"], subscription["account_id"], "track", source_item_id,
+                    "reject", asset_id, expected_revision, user.user_id,
+                    {"kind": "explicit_user_review", "version_id": version_id}, "ma-merged-mapping-v1",
+                )
+            elif action == "clear":
+                if asset_id is not None:
+                    raise InvalidDataError("Clearing a decision does not accept an asset ID")
+                result = await self._read_store(
+                    self._store.clear_match_decision,
+                    subscription["provider_domain"], subscription["account_id"], "track", source_item_id,
+                    expected_revision, user.user_id,
+                    {"kind": "explicit_user_review", "version_id": version_id},
+                )
+            else:
+                raise InvalidDataError("Match decision action must be approve, reject or clear")
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+        return {"match": result, "classification": self._match_classification(result)}
 
     async def sync_policy(self, subscription_id: str) -> dict[str, Any]:
         self._authorize()

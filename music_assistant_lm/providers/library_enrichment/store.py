@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 
 
@@ -53,13 +53,15 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
                     required.add("apply_jobs")
                 if version >= 3:
                     required.update(("subscription_sync_policy", "subscription_sync_state", "sync_jobs"))
+                if version >= 4:
+                    required.update(("match_sources", "local_assets", "local_asset_locations", "match_candidates", "match_decisions"))
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if actual != required:
                     raise ValueError("Unexpected enrichment database tables; database untouched")
@@ -77,6 +79,8 @@ class ArchiveStore:
                     self._migrate_v2()
                 if version <= 2:
                     self._migrate_v3()
+                if version <= 3:
+                    self._migrate_v4()
         except Exception:
             self._db.close()
             raise
@@ -173,6 +177,372 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT INTO metadata VALUES ('schema_v3_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=3")
+
+    def _migrate_v4(self) -> None:
+        """Add a mutable match overlay without changing immutable archive rows."""
+        self._db.execute("""CREATE TABLE local_assets (
+            id TEXT PRIMARY KEY, media_type TEXT NOT NULL CHECK(media_type='track'),
+            metadata_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        self._db.execute("""CREATE TABLE local_asset_locations (
+            id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES local_assets(id),
+            provider_instance_id TEXT NOT NULL, item_id TEXT NOT NULL,
+            evidence_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(provider_instance_id,item_id))""")
+        self._db.execute("""CREATE TABLE match_sources (
+            id TEXT PRIMARY KEY, provider_domain TEXT NOT NULL, account_id TEXT NOT NULL,
+            media_type TEXT NOT NULL CHECK(media_type='track'), source_item_id TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0, approved_asset_id TEXT REFERENCES local_assets(id),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(provider_domain,account_id,media_type,source_item_id))""")
+        self._db.execute("""CREATE TABLE match_candidates (
+            id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES match_sources(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES local_assets(id), score REAL NOT NULL CHECK(score BETWEEN 0 AND 1),
+            evidence_json TEXT NOT NULL, algorithm_version TEXT NOT NULL, observed_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            UNIQUE(source_id,asset_id))""")
+        self._db.execute("""CREATE TABLE match_decisions (
+            id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES match_sources(id),
+            asset_id TEXT REFERENCES local_assets(id),
+            action TEXT NOT NULL CHECK(action IN ('approve','reject','clear')),
+            revision INTEGER NOT NULL, actor_id TEXT, evidence_json TEXT NOT NULL,
+            algorithm_version TEXT, created_at TEXT NOT NULL, UNIQUE(source_id,revision),
+            CHECK((action='clear' AND asset_id IS NULL) OR (action!='clear' AND asset_id IS NOT NULL)))""")
+        self._db.execute("CREATE INDEX match_candidates_source ON match_candidates(source_id,score DESC,id)")
+        self._db.execute("CREATE INDEX match_decisions_source ON match_decisions(source_id,revision)")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT INTO metadata VALUES ('schema_v4_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=4")
+
+    @staticmethod
+    def _json_object(value: dict | None, label: str) -> str:
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} must be an object")
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+    @staticmethod
+    def _source_key(provider_domain: str, account_id: str, media_type: str, source_item_id: str) -> tuple[str, str, str, str]:
+        if media_type != "track" or not all(
+            isinstance(value, str) and value.strip() for value in (provider_domain, account_id, source_item_id)
+        ):
+            raise ValueError("A stable track source key is required")
+        return provider_domain, account_id, media_type, source_item_id
+
+    def _ensure_match_source(self, provider_domain: str, account_id: str, media_type: str, source_item_id: str) -> dict:
+        key = self._source_key(provider_domain, account_id, media_type, source_item_id)
+        now = _now()
+        self._db.execute(
+            """INSERT OR IGNORE INTO match_sources
+            (id,provider_domain,account_id,media_type,source_item_id,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), *key, now, now),
+        )
+        return dict(
+            self._db.execute(
+                """SELECT * FROM match_sources WHERE provider_domain=? AND account_id=?
+                AND media_type=? AND source_item_id=?""",
+                key,
+            ).fetchone()
+        )
+
+    def upsert_local_asset(
+        self,
+        media_type: str,
+        provider_instance_id: str,
+        item_id: str,
+        metadata: dict | None = None,
+        evidence: dict | None = None,
+    ) -> dict:
+        if media_type != "track" or not all(
+            isinstance(value, str) and value.strip() for value in (provider_instance_id, item_id)
+        ):
+            raise ValueError("A local track location is required")
+        metadata_json = self._json_object(metadata, "Asset metadata")
+        evidence_json = self._json_object(evidence, "Location evidence")
+        with self._transaction():
+            location = self._db.execute(
+                "SELECT asset_id FROM local_asset_locations WHERE provider_instance_id=? AND item_id=?",
+                (provider_instance_id, item_id),
+            ).fetchone()
+            now = _now()
+            if location is None:
+                asset_id = str(uuid.uuid4())
+                self._db.execute(
+                    "INSERT INTO local_assets VALUES (?,?,?,?,?,?)",
+                    (asset_id, media_type, metadata_json, evidence_json, now, now),
+                )
+                self._db.execute(
+                    "INSERT INTO local_asset_locations VALUES (?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), asset_id, provider_instance_id, item_id, evidence_json, now, now),
+                )
+            else:
+                asset_id = location["asset_id"]
+                asset = self._db.execute("SELECT media_type FROM local_assets WHERE id=?", (asset_id,)).fetchone()
+                if asset["media_type"] != media_type:
+                    raise ValueError("Local location media type conflict")
+                self._db.execute(
+                    "UPDATE local_assets SET metadata_json=?,evidence_json=?,updated_at=? WHERE id=?",
+                    (metadata_json, evidence_json, now, asset_id),
+                )
+                self._db.execute(
+                    """UPDATE local_asset_locations SET evidence_json=?,updated_at=?
+                    WHERE provider_instance_id=? AND item_id=?""",
+                    (evidence_json, now, provider_instance_id, item_id),
+                )
+            return self.get_local_asset(asset_id)
+
+    def add_local_asset_location(
+        self, asset_id: str, provider_instance_id: str, item_id: str, evidence: dict | None = None
+    ) -> dict:
+        if not all(isinstance(value, str) and value.strip() for value in (asset_id, provider_instance_id, item_id)):
+            raise ValueError("Stable asset and location identities are required")
+        evidence_json = self._json_object(evidence, "Location evidence")
+        with self._transaction():
+            self.get_local_asset(asset_id)
+            existing = self._db.execute(
+                "SELECT * FROM local_asset_locations WHERE provider_instance_id=? AND item_id=?",
+                (provider_instance_id, item_id),
+            ).fetchone()
+            if existing is not None and existing["asset_id"] != asset_id:
+                raise ValueError("Local location is already bound to another asset")
+            now = _now()
+            if existing is None:
+                location_id = str(uuid.uuid4())
+                self._db.execute(
+                    "INSERT INTO local_asset_locations VALUES (?,?,?,?,?,?,?)",
+                    (location_id, asset_id, provider_instance_id, item_id, evidence_json, now, now),
+                )
+            else:
+                location_id = existing["id"]
+                self._db.execute(
+                    "UPDATE local_asset_locations SET evidence_json=?,updated_at=? WHERE id=?",
+                    (evidence_json, now, location_id),
+                )
+            result = dict(self._db.execute("SELECT * FROM local_asset_locations WHERE id=?", (location_id,)).fetchone())
+            result["evidence"] = json.loads(result.pop("evidence_json"))
+            return result
+
+    def get_local_asset(self, asset_id: str) -> dict:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM local_assets WHERE id=?", (asset_id,)).fetchone()
+            if row is None:
+                raise KeyError(asset_id)
+            result = dict(row)
+            result["metadata"] = json.loads(result.pop("metadata_json"))
+            result["evidence"] = json.loads(result.pop("evidence_json"))
+            result["locations"] = [
+                {**dict(location), "evidence": json.loads(location["evidence_json"])}
+                for location in self._db.execute(
+                    "SELECT * FROM local_asset_locations WHERE asset_id=? ORDER BY provider_instance_id,item_id", (asset_id,)
+                )
+            ]
+            for location in result["locations"]:
+                location.pop("evidence_json")
+            return result
+
+    def replace_match_candidates(
+        self,
+        provider_domain: str,
+        account_id: str,
+        media_type: str,
+        source_item_id: str,
+        candidates: list[dict],
+        algorithm_version: str,
+    ) -> dict:
+        if not isinstance(candidates, list) or not isinstance(algorithm_version, str) or not algorithm_version.strip():
+            raise ValueError("Candidates and algorithm version are required")
+        normalized: list[tuple[str, float, str]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("asset_id"), str):
+                raise ValueError("Candidate asset is required")
+            asset_id, score = candidate["asset_id"], candidate.get("score")
+            if asset_id in seen or isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+                raise ValueError("Candidate assets must be unique with score 0..1")
+            seen.add(asset_id)
+            normalized.append((asset_id, float(score), self._json_object(candidate.get("evidence"), "Candidate evidence")))
+        with self._transaction():
+            source = self._ensure_match_source(provider_domain, account_id, media_type, source_item_id)
+            for asset_id, _, _ in normalized:
+                asset = self.get_local_asset(asset_id)
+                if asset["media_type"] != media_type:
+                    raise ValueError("Candidate media type differs from source")
+            existing = {
+                row["asset_id"]: row["id"]
+                for row in self._db.execute("SELECT id,asset_id FROM match_candidates WHERE source_id=?", (source["id"],))
+            }
+            now = _now()
+            self._db.execute("UPDATE match_candidates SET active=0 WHERE source_id=?", (source["id"],))
+            for asset_id, score, evidence_json in normalized:
+                self._db.execute(
+                    """INSERT INTO match_candidates
+                    (id,source_id,asset_id,score,evidence_json,algorithm_version,observed_at,active)
+                    VALUES (?,?,?,?,?,?,?,1) ON CONFLICT(source_id,asset_id) DO UPDATE SET
+                    score=excluded.score,evidence_json=excluded.evidence_json,
+                    algorithm_version=excluded.algorithm_version,observed_at=excluded.observed_at,active=1""",
+                    (existing.get(asset_id, str(uuid.uuid4())), source["id"], asset_id, score, evidence_json, algorithm_version, now),
+                )
+            return self.get_match_overlay(provider_domain, account_id, media_type, source_item_id)
+
+    def get_match_overlay(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str
+    ) -> dict:
+        key = self._source_key(provider_domain, account_id, media_type, source_item_id)
+        with self._lock:
+            source_row = self._db.execute(
+                """SELECT * FROM match_sources WHERE provider_domain=? AND account_id=?
+                AND media_type=? AND source_item_id=?""",
+                key,
+            ).fetchone()
+            if source_row is None:
+                return {
+                    "source": dict(zip(("provider_domain", "account_id", "media_type", "source_item_id"), key, strict=True)),
+                    "revision": 0,
+                    "decision": None,
+                    "decision_history": [],
+                    "approved_asset_id": None,
+                    "candidates": [],
+                }
+            source = dict(source_row)
+            decisions = [dict(row) for row in self._db.execute(
+                "SELECT * FROM match_decisions WHERE source_id=? ORDER BY revision", (source["id"],)
+            )]
+            latest_by_asset: dict[str, str] = {}
+            for decision in decisions:
+                if decision["action"] == "clear":
+                    latest_by_asset.clear()
+                elif decision["asset_id"] is not None:
+                    latest_by_asset[decision["asset_id"]] = decision["action"]
+                decision["evidence"] = json.loads(decision.pop("evidence_json"))
+            candidates = []
+            for row in self._db.execute(
+                "SELECT * FROM match_candidates WHERE source_id=? AND active=1 ORDER BY score DESC,id", (source["id"],)
+            ):
+                candidate = dict(row)
+                candidate["evidence"] = json.loads(candidate.pop("evidence_json"))
+                candidate["rejected"] = latest_by_asset.get(candidate["asset_id"]) == "reject"
+                candidate["approved"] = candidate["asset_id"] == source["approved_asset_id"]
+                candidate["asset"] = self.get_local_asset(candidate["asset_id"])
+                candidates.append(candidate)
+            public_source = {key: source[key] for key in ("id", "provider_domain", "account_id", "media_type", "source_item_id")}
+            return {
+                "source": public_source,
+                "revision": source["revision"],
+                "decision": decisions[-1] if decisions else None,
+                "decision_history": decisions,
+                "approved_asset_id": source["approved_asset_id"],
+                "candidates": candidates,
+            }
+
+    def list_match_overlays(
+        self, provider_domain: str | None = None, account_id: str | None = None, media_type: str | None = None
+    ) -> list[dict]:
+        if media_type not in (None, "track"):
+            raise ValueError("Only track matching is supported")
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT provider_domain,account_id,media_type,source_item_id FROM match_sources
+                WHERE (? IS NULL OR provider_domain=?) AND (? IS NULL OR account_id=?)
+                AND (? IS NULL OR media_type=?) ORDER BY provider_domain,account_id,media_type,source_item_id""",
+                (provider_domain, provider_domain, account_id, account_id, media_type, media_type),
+            ).fetchall()
+            return [self.get_match_overlay(*tuple(row)) for row in rows]
+
+    def set_match_decision(
+        self,
+        provider_domain: str,
+        account_id: str,
+        media_type: str,
+        source_item_id: str,
+        action: str,
+        asset_id: str,
+        expected_revision: int,
+        actor_id: str | None = None,
+        evidence: dict | None = None,
+        algorithm_version: str | None = None,
+    ) -> dict:
+        if action not in ("approve", "reject") or not isinstance(asset_id, str) or not asset_id.strip():
+            raise ValueError("Approve or reject requires an asset")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("Expected match revision required")
+        evidence_json = self._json_object(evidence, "Decision evidence")
+        with self._transaction():
+            source = self._ensure_match_source(provider_domain, account_id, media_type, source_item_id)
+            self.get_local_asset(asset_id)
+            if source["revision"] != expected_revision:
+                raise ValueError("Match decision revision conflict")
+            if not self._db.execute(
+                "SELECT 1 FROM match_candidates WHERE source_id=? AND asset_id=? AND active=1", (source["id"], asset_id)
+            ).fetchone():
+                raise ValueError("Decision asset is not a current candidate")
+            revision, now = expected_revision + 1, _now()
+            self._db.execute(
+                """INSERT INTO match_decisions
+                (id,source_id,asset_id,action,revision,actor_id,evidence_json,algorithm_version,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()), source["id"], asset_id, action, revision, actor_id, evidence_json, algorithm_version, now),
+            )
+            approved = (
+                asset_id
+                if action == "approve"
+                else None
+                if source["approved_asset_id"] == asset_id
+                else source["approved_asset_id"]
+            )
+            self._db.execute(
+                "UPDATE match_sources SET revision=?,approved_asset_id=?,updated_at=? WHERE id=?",
+                (revision, approved, now, source["id"]),
+            )
+            return self.get_match_overlay(provider_domain, account_id, media_type, source_item_id)
+
+    def clear_match_decision(
+        self,
+        provider_domain: str,
+        account_id: str,
+        media_type: str,
+        source_item_id: str,
+        expected_revision: int,
+        actor_id: str | None = None,
+        evidence: dict | None = None,
+    ) -> dict:
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("Expected match revision required")
+        evidence_json = self._json_object(evidence, "Decision evidence")
+        with self._transaction():
+            source = self._ensure_match_source(provider_domain, account_id, media_type, source_item_id)
+            if source["revision"] != expected_revision:
+                raise ValueError("Match decision revision conflict")
+            revision, now = expected_revision + 1, _now()
+            self._db.execute(
+                """INSERT INTO match_decisions
+                (id,source_id,asset_id,action,revision,actor_id,evidence_json,created_at)
+                VALUES (?,?,NULL,'clear',?,?,?,?)""",
+                (str(uuid.uuid4()), source["id"], revision, actor_id, evidence_json, now),
+            )
+            self._db.execute(
+                "UPDATE match_sources SET revision=?,approved_asset_id=NULL,updated_at=? WHERE id=?",
+                (revision, now, source["id"]),
+            )
+            return self.get_match_overlay(provider_domain, account_id, media_type, source_item_id)
+
+    def get_version_match_overlay(self, version_id: str) -> dict:
+        version = self.get_version(version_id)
+        subscription = self.get_subscription(version["subscription_id"])
+        occurrences = []
+        for occurrence in version["occurrences"]:
+            source_item_id = occurrence.get("source_item_id") if occurrence.get("state") == "track" else None
+            occurrences.append(
+                {
+                    "position": occurrence.get("position"),
+                    "source_item_id": source_item_id,
+                    "match": self.get_match_overlay(
+                        subscription["provider_domain"], subscription["account_id"], "track", source_item_id
+                    ) if source_item_id else None,
+                }
+            )
+        return {"version_id": version_id, "content_digest": version["content_digest"], "occurrences": occurrences}
 
     def get_sync_policy(self, subscription_id: str) -> dict:
         with self._lock:

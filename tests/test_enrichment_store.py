@@ -379,6 +379,9 @@ def test_v2_sync_migration_rollback_preserves_applied_capture(tmp_path):
     store.mark_apply_creating(job["id"])
     store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
     with store._transaction():
+        for table in ("match_decisions", "match_candidates", "match_sources", "local_asset_locations", "local_assets"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v4_migrated_at'")
         for table in ("sync_jobs", "subscription_sync_state", "subscription_sync_policy"):
             store._db.execute(f"DROP TABLE {table}")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v3_migrated_at'")
@@ -475,4 +478,135 @@ def test_sync_failure_access_pause_recovery_and_checkpoints(tmp_path, monkeypatc
     assert store.get_sync_job(interrupted["id"])["state"] == "interrupted"
     assert store.get_subscription(sub)["committed_version_id"] == version
     assert store.get_subscription(sub)["applied_version_id"] is None
+    store.close()
+
+
+def test_match_assets_candidates_decisions_and_version_overlay(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(
+        store,
+        sub,
+        rows=[
+            {"position": 0, "state": "track", "source_item_id": "spotify-track"},
+            {"position": 1, "state": "unavailable", "source_item_id": None},
+            {"position": 2, "state": "track", "source_item_id": "spotify-track"},
+        ],
+    )
+    first = store.upsert_local_asset(
+        "track", "filesystem", "music/song.flac", {"name": "Song"}, {"origin": "library_mapping"}
+    )
+    assert store.upsert_local_asset("track", "filesystem", "music/song.flac", {"name": "Renamed"})["id"] == first["id"]
+    location = store.add_local_asset_location(first["id"], "builtin", "42", {"library": True})
+    assert location["asset_id"] == first["id"]
+    with pytest.raises(ValueError, match="another asset"):
+        second = store.upsert_local_asset("track", "filesystem", "other.flac")
+        store.add_local_asset_location(second["id"], "builtin", "42")
+
+    overlay = store.replace_match_candidates(
+        "spotify",
+        "account-a",
+        "track",
+        "spotify-track",
+        [{"asset_id": first["id"], "score": 0.97, "evidence": {"isrc": "same"}}],
+        "exact-isrc-v1",
+    )
+    candidate_id = overlay["candidates"][0]["id"]
+    assert overlay["revision"] == 0
+    assert overlay["candidates"][0]["asset"]["locations"][1]["provider_instance_id"] == "filesystem"
+    rejected = store.set_match_decision(
+        "spotify", "account-a", "track", "spotify-track", "reject", first["id"], 0, "admin", {"reason": "wrong edition"},
+        "exact-isrc-v1",
+    )
+    assert rejected["revision"] == 1 and rejected["candidates"][0]["rejected"] is True
+    assert rejected["decision"]["evidence"] == {"reason": "wrong edition"}
+
+    # Removing and rediscovering a pair never erases its rejection history.
+    assert store.replace_match_candidates("spotify", "account-a", "track", "spotify-track", [], "metadata-v2")[
+        "candidates"
+    ] == []
+    refreshed = store.replace_match_candidates(
+        "spotify", "account-a", "track", "spotify-track",
+        [{"asset_id": first["id"], "score": 0.91, "evidence": {"title": "same"}}], "metadata-v2",
+    )
+    assert refreshed["candidates"][0]["id"] == candidate_id
+    assert refreshed["candidates"][0]["rejected"] is True
+    approved = store.set_match_decision(
+        "spotify", "account-a", "track", "spotify-track", "approve", first["id"], 1, "admin"
+    )
+    assert approved["approved_asset_id"] == first["id"]
+    assert approved["candidates"][0]["approved"] is True and approved["candidates"][0]["rejected"] is False
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.clear_match_decision("spotify", "account-a", "track", "spotify-track", 1)
+    cleared = store.clear_match_decision("spotify", "account-a", "track", "spotify-track", 2, "admin")
+    assert cleared["revision"] == 3 and cleared["approved_asset_id"] is None
+    assert cleared["candidates"][0]["rejected"] is False
+    assert cleared["decision"]["action"] == "clear"
+    assert [entry["action"] for entry in cleared["decision_history"]] == ["reject", "approve", "clear"]
+
+    version_overlay = store.get_version_match_overlay(version)
+    assert version_overlay["content_digest"] == store.get_version(version)["content_digest"]
+    assert version_overlay["occurrences"][0]["match"]["revision"] == 3
+    assert version_overlay["occurrences"][1]["match"] is None
+    assert version_overlay["occurrences"][2]["match"]["source"]["source_item_id"] == "spotify-track"
+    assert len(store.list_match_overlays("spotify", "account-a", "track")) == 1
+    store.close()
+
+
+def test_match_candidate_validation_and_cas_are_atomic(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    asset = store.upsert_local_asset("track", "filesystem", "song.flac")
+    key = ("spotify", "account", "track", "source")
+    for candidates in (
+        [{"asset_id": asset["id"], "score": True}],
+        [{"asset_id": asset["id"], "score": 1.1}],
+        [{"asset_id": asset["id"], "score": 0.5}, {"asset_id": asset["id"], "score": 0.4}],
+    ):
+        with pytest.raises(ValueError):
+            store.replace_match_candidates(*key, candidates, "v1")
+    overlay = store.replace_match_candidates(*key, [{"asset_id": asset["id"], "score": 1, "evidence": {}}], "v1")
+    with pytest.raises(ValueError, match="current candidate"):
+        other = store.upsert_local_asset("track", "filesystem", "other.flac")
+        store.set_match_decision(*key, "approve", other["id"], 0)
+    assert store.get_match_overlay(*key)["revision"] == overlay["revision"] == 0
+    store.close()
+
+
+def test_v3_match_migration_is_transactional_and_backup_preserves_overlay(tmp_path):
+    path = tmp_path / "legacy-v3.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    version = capture(store, sub)
+    with store._transaction():
+        for table in ("match_decisions", "match_candidates", "match_sources", "local_asset_locations", "local_assets"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v4_migrated_at'")
+        store._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (store._schema_digest(),))
+        store._db.execute("PRAGMA user_version=3")
+    identity = store.store_uuid
+    store.close()
+
+    class BrokenMigration(ArchiveStore):
+        def _migrate_v4(self):
+            super()._migrate_v4()
+            raise RuntimeError("migration interrupted")
+
+    with pytest.raises(RuntimeError):
+        BrokenMigration(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='match_sources'").fetchone() is None
+
+    store = ArchiveStore(path)
+    assert store.store_uuid == identity and store.get_version(version)["total"] == 1
+    asset = store.upsert_local_asset("track", "filesystem", "song.flac")
+    store.replace_match_candidates(
+        "spotify", "account-a", "track", "song", [{"asset_id": asset["id"], "score": 1}], "v1"
+    )
+    store.set_match_decision("spotify", "account-a", "track", "song", "approve", asset["id"], 0)
+    destination = tmp_path / "backup-v4.db"
+    store.backup(destination)
+    restored = ArchiveStore(destination)
+    assert restored.get_match_overlay("spotify", "account-a", "track", "song")["approved_asset_id"] == asset["id"]
+    restored.close()
     store.close()

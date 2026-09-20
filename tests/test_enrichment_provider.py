@@ -46,7 +46,7 @@ def plugin(monkeypatch, tmp_path):
         "music_assistant.models.plugin": {"PluginProvider": object},
         "music_assistant.controllers.webserver.helpers.auth_middleware": {
             "get_current_user": lambda: auth.user if current.get() is unset else current.get(),
-            "has_scope": lambda user, scope: user.allowed,
+            "has_scope": lambda user, scope: user.allowed and scope in getattr(user, "allowed_scopes", set(Scope)),
             "current_user": current,
             "impersonated_user": impersonated,
         },
@@ -80,6 +80,7 @@ def plugin(monkeypatch, tmp_path):
 
     controller = types.SimpleNamespace(
         get_library_item=AsyncMock(return_value=types.SimpleNamespace(to_dict=lambda: {"external_ids": []})),
+        get_library_item_by_prov_id=AsyncMock(return_value=None),
         get=AsyncMock(side_effect=AssertionError("inspection must not refresh")),
     )
     provider.mass = types.SimpleNamespace(
@@ -480,6 +481,8 @@ def test_unauthorized_archive_and_inspection_calls_are_denied(plugin, user):
         plugin.provider.archive_versions("unknown"),
         plugin.provider.sources("spotify-a"),
         plugin.provider.cancel("unknown"),
+        plugin.provider.match_review("unknown"),
+        plugin.provider.set_match_decision("unknown", "source", 0, "clear"),
     ):
         with pytest.raises(Exception, match="permission"):
             asyncio.run(coroutine)
@@ -490,8 +493,147 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 16
+    assert len(plugin.registered) == 18
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
+
+
+def _match_fixture(plugin, *, account="account-a"):
+    store = plugin.provider._store
+    subscription = store.upsert_subscription("spotify", account, "A" * 22, "spotify-a", "Match archive")
+    job = store.begin_capture(subscription["id"], "snapshot")
+    version_id = store.commit_capture(
+        job,
+        snapshot_before="snapshot",
+        snapshot_after="snapshot",
+        total=3,
+        occurrences=[
+            {"position": 0, "state": "track", "source_item_id": "T" * 22},
+            {"position": 1, "state": "track", "source_item_id": "T" * 22},
+            {"position": 2, "state": "null", "source_item_id": None},
+        ],
+    )
+    local_a = types.SimpleNamespace(
+        instance_id="local-a", domain="filesystem_local", available=True, is_streaming_provider=False
+    )
+    local_b = types.SimpleNamespace(
+        instance_id="local-b", domain="filesystem_local", available=True, is_streaming_provider=False
+    )
+    streaming = types.SimpleNamespace(
+        instance_id="stream-a", domain="qobuz", available=True, is_streaming_provider=True
+    )
+    plugin.provider.mass.music.providers.extend((local_a, local_b, streaming))
+
+    def mapping(domain, instance, item_id):
+        return types.SimpleNamespace(provider_domain=domain, provider_instance=instance, item_id=item_id)
+
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(
+        item_id="ma-track-7",
+        provider_mappings=[
+            mapping("spotify", "spotify-a", "T" * 22),
+            mapping("filesystem_local", "local-a", "music/track.flac"),
+            mapping("filesystem_local", "local-b", "archive/track.flac"),
+            mapping("qobuz", "stream-a", "remote-track"),
+        ],
+    )
+    return version_id
+
+
+def test_match_review_uses_existing_local_mappings_and_preserves_duplicate_occurrences(plugin):
+    version_id = _match_fixture(plugin)
+
+    result = asyncio.run(plugin.provider.match_review(version_id, limit=3))
+
+    assert result["candidate_freshness"] == "fresh"
+    assert result["candidate_error"] is None
+    assert [item["position"] for item in result["items"]] == [0, 1, 2]
+    assert result["items"][0]["classification"] == "ambiguous"
+    assert result["items"][0]["match"] == result["items"][1]["match"]
+    candidates = result["items"][0]["match"]["candidates"]
+    assert len(candidates) == 2
+    assert {candidate["evidence"]["provider_instance_id"] for candidate in candidates} == {"local-a", "local-b"}
+    assert all(candidate["evidence"]["kind"] == "existing_merged_provider_mapping" for candidate in candidates)
+    assert result["items"][2]["match"] is None
+    plugin.controller.get_library_item_by_prov_id.assert_awaited_once_with("T" * 22, "spotify-a")
+    plugin.controller.get.assert_not_called()
+
+
+def test_match_review_is_bounded_and_account_isolated(plugin):
+    first = _match_fixture(plugin, account="account-a")
+    second = _match_fixture(plugin, account="account-b")
+    first_result = asyncio.run(plugin.provider.match_review(first, limit=1, offset=0))
+    second_result = asyncio.run(plugin.provider.match_review(second, limit=1, offset=1))
+
+    assert first_result["has_more"] is True and first_result["total"] == 3
+    assert second_result["items"][0]["position"] == 1
+    assert first_result["items"][0]["match"]["source"]["account_id"] == "account-a"
+    assert second_result["items"][0]["match"]["source"]["account_id"] == "account-b"
+    assert first_result["items"][0]["match"]["source"]["source_item_id"] == "T" * 22
+
+
+def test_match_decision_requires_library_write_and_uses_revision_cas(plugin):
+    version_id = _match_fixture(plugin)
+    review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    candidate = review["items"][0]["match"]["candidates"][0]
+    plugin.auth.user.allowed_scopes = {plugin.module.Scope.CONFIG_PROVIDERS_WRITE}
+    with pytest.raises(Exception, match="library write permission"):
+        asyncio.run(
+            plugin.provider.set_match_decision(version_id, "T" * 22, 0, "approve", candidate["asset_id"])
+        )
+    plugin.auth.user.allowed_scopes = set(plugin.module.Scope)
+    approved = asyncio.run(
+        plugin.provider.set_match_decision(version_id, "T" * 22, 0, "approve", candidate["asset_id"])
+    )
+    assert approved["classification"] == "approved"
+    assert approved["match"]["decision"]["asset_id"] == candidate["asset_id"]
+    with pytest.raises(Exception, match="revision"):
+        asyncio.run(
+            plugin.provider.set_match_decision(
+                version_id, "T" * 22, 0, "reject", candidate["asset_id"]
+            )
+        )
+    cleared = asyncio.run(
+        plugin.provider.set_match_decision(
+            version_id, "T" * 22, approved["match"]["revision"], "clear"
+        )
+    )
+    assert cleared["classification"] == "ambiguous"
+    assert cleared["match"]["decision"]["action"] == "clear"
+    assert cleared["match"]["approved_asset_id"] is None
+    rejected = asyncio.run(
+        plugin.provider.set_match_decision(
+            version_id,
+            "T" * 22,
+            cleared["match"]["revision"],
+            "reject",
+            candidate["asset_id"],
+        )
+    )
+    assert rejected["classification"] == "candidate"
+    assert next(
+        item for item in rejected["match"]["candidates"] if item["asset_id"] == candidate["asset_id"]
+    )["rejected"] is True
+
+
+def test_match_review_returns_stale_overlay_without_retry_or_ma_mutation(plugin):
+    version_id = _match_fixture(plugin)
+    fresh = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    plugin.controller.get_library_item_by_prov_id.reset_mock()
+    plugin.controller.get_library_item_by_prov_id.side_effect = RuntimeError("database temporarily unavailable")
+
+    stale = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+
+    assert stale["candidate_freshness"] == "stale"
+    assert stale["candidate_error"] == "library_read_failed"
+    assert stale["items"][0]["match"] == fresh["items"][0]["match"]
+    plugin.controller.get_library_item_by_prov_id.assert_awaited_once()
+    plugin.controller.get.assert_not_called()
+
+
+@pytest.mark.parametrize("args", [{"limit": 0}, {"limit": 201}, {"limit": True}, {"offset": -1}])
+def test_match_review_rejects_unbounded_pages(plugin, args):
+    with pytest.raises(Exception, match="Match review page"):
+        asyncio.run(plugin.provider.match_review("version", **args))
+    plugin.controller.get_library_item_by_prov_id.assert_not_called()
 
 
 def test_selected_capture_commits_real_ordered_store(plugin):

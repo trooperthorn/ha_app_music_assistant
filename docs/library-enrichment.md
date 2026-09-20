@@ -80,6 +80,17 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/set_sync_policy` | `subscription_id`, `expected_revision`, `mode`, optional `interval_seconds` | atomically change or pause the schedule |
 | `library_enrichment/sync_now` | `subscription_id` | queue one explicit snapshot-aware check and return its job/task IDs |
 | `library_enrichment/sync_status` | `subscription_id` | policy, state, recent jobs and latest job |
+| `library_enrichment/match_review` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned local candidates from existing merged mappings, including ambiguity and freshness |
+| `library_enrichment/set_match_decision` | `version_id`, `source_item_id`, `expected_revision`, `action` (`approve`, `reject` or `clear`), `asset_id` for approval or rejection | revisioned decision overlay; also requires `library.write` |
+
+Local match review is an overlay on the immutable Spotify occurrence archive. It
+uses direct MA library lookups and only considers mappings owned by an available,
+non-streaming provider. It does not search providers, refresh metadata, add or
+remove MA mappings, or alter playback selection. Repeated source occurrences stay
+separate in the response while sharing one account-scoped source decision. A
+failed library read returns the last stored candidates as stale when available;
+it is not retried automatically. See `local-match-review.md` for the exact
+contract and current boundary.
 
 The playlist ID is the 22-character source ID, not a URL, title or MA integer ID.
 The provider instance ID must identify a currently available Spotify instance in
@@ -124,5 +135,6 @@ backup/restore proof. Keep historical versions and archive data during upgrades 
 provider removal; do not substitute a new empty database after a migration error.
 
 Next work: uncertain-apply reconciliation, broader read-only inspection UI,
-source retention controls and a coordinated
-recovery set. Local matching and playback policy follow those preservation gates.
+source retention controls and a coordinated recovery set. Match review now records
+evidence and explicit decisions; playback-policy enforcement still requires a
+server stream-resolution integration.
