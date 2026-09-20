@@ -38,10 +38,18 @@ provider before its commands are registered. It never auto-starts a capture.
   verifies the stored M3U order, and records its applied checkpoint separately.
 - Apply intent is durable and idempotent. Once playlist creation starts, an
   unverified failure becomes `uncertain` and is never retried automatically.
+- Each subscription can remain manual or use an explicit 1-hour-to-7-day
+  snapshot check interval. Scheduled checks reuse the initiating administrator's
+  current permissions and provider scope, skip item retrieval when the source
+  snapshot is unchanged, and commit a new immutable version when it changes.
+- Synchronization jobs and access failures are durable. Authentication or access
+  loss pauses future checks until an administrator saves the schedule again;
+  pausing to manual remains available while the source provider is offline.
 
 These are metadata/reference archives, not downloaded audio. A visible applied
 playlist contains Spotify references and does not establish local playback. This
-slice does not maintain a synchronized mirror, schedule sync, expose a bulk UI, support Liked Songs,
+slice does not automatically update an applied visible playlist, expose a bulk UI,
+support Liked Songs,
 perform local matching, enforce playback source policies, or replace coordinated
 MA backup/restore. It does not change ordinary detail-page behavior. The existing
 bridge bulk copy remains a separate name-based export and is not a durable archive.
@@ -68,6 +76,10 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/apply_preview` | `version_id` | exact projection digest, source/projected counts, omissions, partial-consent requirement and existing destination |
 | `library_enrichment/apply` | `version_id`, `expected_digest`, optional `allow_partial` | create and verify one visible builtin playlist; also requires `library.write` |
 | `library_enrichment/apply_status` | `version_id` | durable apply state and destination without starting or retrying a write |
+| `library_enrichment/sync_policy` | `subscription_id` | current revisioned manual/scheduled policy and durable sync state |
+| `library_enrichment/set_sync_policy` | `subscription_id`, `expected_revision`, `mode`, optional `interval_seconds` | atomically change or pause the schedule |
+| `library_enrichment/sync_now` | `subscription_id` | queue one explicit snapshot-aware check and return its job/task IDs |
+| `library_enrichment/sync_status` | `subscription_id` | policy, state, recent jobs and latest job |
 
 The playlist ID is the 22-character source ID, not a URL, title or MA integer ID.
 The provider instance ID must identify a currently available Spotify instance in
@@ -111,6 +123,6 @@ a real installation, complete image CI and a selected-source test plus independe
 backup/restore proof. Keep historical versions and archive data during upgrades or
 provider removal; do not substitute a new empty database after a migration error.
 
-Next work: uncertain-apply reconciliation, scheduled snapshot-aware refresh,
-broader read-only inspection UI, source retention controls and a coordinated
+Next work: uncertain-apply reconciliation, broader read-only inspection UI,
+source retention controls and a coordinated
 recovery set. Local matching and playback policy follow those preservation gates.

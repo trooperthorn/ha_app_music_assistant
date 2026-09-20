@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 )
 from music_assistant.models.plugin import PluginProvider
 from music_assistant_models.auth import Scope
+from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 
@@ -47,9 +49,13 @@ class LibraryEnrichmentProvider(PluginProvider):
         self._jobs: set[str] = set()
         self._stopping_jobs: set[str] = set()
         self._closing = False
+        self._sync_jobs: dict[str, str] = {}
+        self._sync_stopping: set[str] = set()
+        self._sync_dispatcher_id = "library_enrichment_sync_dispatcher"
         self._write_lock = asyncio.Lock()
         self._store = await asyncio.to_thread(ArchiveStore, Path(self.mass.storage_path) / "library_enrichment" / "enrichment.db")
         await asyncio.to_thread(self._store.recover_pending)
+        await asyncio.to_thread(self._store.recover_sync_pending)
 
     async def loaded_in_mass(self) -> None:
         for command, handler in (
@@ -65,16 +71,33 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("apply_preview", self.apply_preview),
             ("apply", self.apply),
             ("apply_status", self.apply_status),
+            ("sync_policy", self.sync_policy),
+            ("set_sync_policy", self.set_sync_policy),
+            ("sync_now", self.sync_now),
+            ("sync_status", self.sync_status),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
             )
+        self.mass.tasks.register_scheduled_task(
+            task_id=self._sync_dispatcher_id, name="Check selected archived Spotify playlists",
+            handler=self._dispatch_sync, schedule=TaskSchedule.hourly(every=1), initial_delay=60,
+            metadata={"task_domain": "library_enrichment_sync"}, allow_retry=False, allow_cancel=True,
+        )
 
     async def unload(self, is_removed: bool = False) -> None:
         self._closing = True
         for handle in self._handles:
             handle()
         async with self._write_lock:
+            for task_id in (self._sync_dispatcher_id, *tuple(self._sync_jobs.values())):
+                if task_id in self._sync_stopping:
+                    raise InvalidDataError("Playlist sync is still stopping; archive store left open")
+                stopped = await self.mass.tasks.unregister_scheduled_task_and_wait(task_id, clear_persisted_state=False)
+                if not stopped:
+                    self._sync_stopping.add(task_id)
+                    raise InvalidDataError("Playlist sync is still stopping; archive store left open")
+            await self._store_operation(self._store.recover_sync_pending)
             for job_id in tuple(self._jobs):
                 if job_id in self._stopping_jobs:
                     raise InvalidDataError("Capture is still stopping; archive store left open")
@@ -115,6 +138,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             "mirror_apply": False,
             "archive_apply": True,
             "apply_api_version": 1,
+            "subscription_sync": True,
+            "sync_policy_api_version": 1,
+            "interval_bounds": {"min": 3600, "max": 604800},
             "local_matching": False,
             "liked_songs": False,
             "audio_backup": False,
@@ -205,7 +231,7 @@ class LibraryEnrichmentProvider(PluginProvider):
                     raise asyncio.CancelledError from None
                 await asyncio.to_thread(self._store.fail_capture, job_id, "Capture request cancelled before scheduling")
                 raise
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, ValueError):
                 raise InvalidDataError("A capture for this source is already pending") from None
             self._jobs.add(job_id)
             try:
@@ -337,6 +363,183 @@ class LibraryEnrichmentProvider(PluginProvider):
     async def archive_versions(self, subscription_id: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         self._authorize()
         return await self._read_store(self._store.list_versions, subscription_id, limit, offset)
+
+    async def sync_policy(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        return await self._read_store(self._store.get_sync_policy, subscription_id)
+
+    async def set_sync_policy(self, subscription_id: str, expected_revision: int, mode: str, interval_seconds: int) -> dict[str, Any]:
+        user = self._authorize()
+        subscription = await self._read_store(self._store.get_subscription, subscription_id)
+        # Pausing future checks must remain possible while Spotify is offline or
+        # requires reauthentication. Enabling a schedule verifies the instance now.
+        if mode == "scheduled":
+            self._provider(subscription["provider_instance_id"])
+        try:
+            return await self._read_store(self._store.set_sync_policy, subscription_id, mode, interval_seconds,
+                                          user.user_id, expected_revision)
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+
+    async def sync_now(self, subscription_id: str) -> dict[str, Any]:
+        user = self._authorize()
+        async with self._write_lock:
+            if self._closing:
+                raise InvalidDataError("Archive provider is stopping")
+            operation = asyncio.create_task(self._queue_sync(subscription_id, user.user_id))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                try:
+                    await operation
+                finally:
+                    raise asyncio.CancelledError from None
+
+    async def _queue_sync(self, subscription_id, user_id):
+        subscription = await self._store_operation(self._store.get_subscription, subscription_id)
+        self._provider(subscription["provider_instance_id"])
+        try:
+            job = await self._store_operation(self._store.begin_sync, subscription_id, "manual")
+        except (ValueError, sqlite3.IntegrityError):
+            raise InvalidDataError("A capture or sync is already active for this source") from None
+        task_id = f"library_enrichment_sync_{job['id']}"
+        self._sync_jobs[job["id"]] = task_id
+        try:
+            self.mass.tasks.run_background_task(
+                task_id=task_id, name="Refresh selected archived Spotify playlist",
+                handler=lambda: self._run_sync(job, user_id), user_id=user_id,
+                priority=True, allow_retry=False, allow_cancel=True,
+            )
+        except Exception:
+            await self._store_operation(self._store.fail_sync, job["id"], "scheduling_failed", "Unable to schedule refresh")
+            self._sync_jobs.pop(job["id"], None)
+            raise
+        return {"job_id": job["id"], "task_id": task_id, "state": "queued"}
+
+    async def sync_status(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        async with self._write_lock:
+            if self._closing:
+                raise InvalidDataError("Archive provider is stopping")
+            for job_id, task_id in tuple(self._sync_jobs.items()):
+                try:
+                    task = self.mass.tasks.get_task(task_id)
+                    state = getattr(task.status, "value", task.status)
+                except InvalidDataError:
+                    state = None
+                if state not in ("idle", "pending", "running"):
+                    job = await self._store_operation(self._store.get_sync_job, job_id)
+                    if job["state"] in ("queued", "running"):
+                        await self._store_operation(self._store.cancel_sync, job_id)
+                    self._sync_jobs.pop(job_id, None)
+            status = await self._store_operation(self._store.get_sync_status, subscription_id)
+            return {**status, "latest_job": status["jobs"][-1] if status["jobs"] else None}
+
+    async def _dispatch_sync(self):
+        try:
+            await self._dispatch_due()
+        finally:
+            self._sync_stopping.discard(self._sync_dispatcher_id)
+
+    async def _dispatch_due(self):
+        due = await self._store_operation(self._store.list_due, datetime.now(UTC).isoformat(), 10)
+        for subscription in due[:10]:
+            if self._closing:
+                return
+            policy = await self._store_operation(self._store.get_sync_policy, subscription["id"])
+            if policy["mode"] != "scheduled":
+                continue
+            try:
+                preparation = asyncio.create_task(asyncio.to_thread(self._store.begin_sync, subscription["id"], "scheduled"))
+                try:
+                    job = await asyncio.shield(preparation)
+                except asyncio.CancelledError:
+                    try:
+                        job = await preparation
+                    except Exception:
+                        raise asyncio.CancelledError from None
+                    await self._store_operation(self._store.cancel_sync, job["id"])
+                    raise
+            except (ValueError, sqlite3.IntegrityError):
+                continue  # Explicit capture or another refresh already owns this source.
+            await self._run_sync(job, policy["initiating_user_id"])
+
+    async def _run_sync(self, job, user_id):
+        capture_id = None
+        user_token = impersonation_token = None
+        try:
+            user = await self.mass.webserver.auth.get_user(user_id)
+            user_token = current_user.set(user)
+            impersonation_token = impersonated_user.set(None)
+            self._authorize()
+            await self._store_operation(self._store.mark_sync_running, job["id"])
+            subscription = await self._store_operation(self._store.get_subscription, job["subscription_id"])
+            provider = self._provider(subscription["provider_instance_id"])
+            preview = await preview_playlist(provider, subscription["source_playlist_id"])
+            if preview["account_id"] != subscription["account_id"]:
+                raise SpotifyCaptureError("Spotify account changed; update the subscription explicitly", reason="account_changed")
+            await self._store_operation(self._store.observe_sync, job["id"], preview["snapshot_id"])
+            if preview["snapshot_id"] == subscription["committed_snapshot"]:
+                await self._store_operation(self._store.succeed_sync, job["id"], subscription["committed_version_id"])
+                return
+            preparation = asyncio.create_task(asyncio.to_thread(
+                self._store.begin_capture, subscription["id"], preview["snapshot_id"], job["id"]
+            ))
+            try:
+                capture_id = await asyncio.shield(preparation)
+            except asyncio.CancelledError:
+                capture_id = await preparation
+                raise
+
+            received_count = 0
+
+            async def progress(received):
+                nonlocal received_count
+                received_count = max(received_count, received)
+                await self._store_operation(self._store.update_progress, capture_id, received_count, preview["total"])
+
+            result = await capture_playlist(provider, subscription["source_playlist_id"], on_page=progress)
+            if result["account_id"] != subscription["account_id"] or result["snapshot_before"] != preview["snapshot_id"]:
+                raise SpotifyCaptureError("Spotify source identity or snapshot changed during refresh", reason="source_changed")
+            version_id = await self._store_operation(
+                lambda: self._store.commit_capture(capture_id, snapshot_before=result["snapshot_before"],
+                    snapshot_after=result["snapshot_after"], total=result["total"], occurrences=result["occurrences"])
+            )
+            await self._store_operation(self._store.succeed_sync, job["id"], version_id)
+        except BaseException as err:
+            if capture_id:
+                try:
+                    await self._store_operation(self._store.fail_capture, capture_id, "Refresh interrupted before a complete commit")
+                except ValueError:
+                    pass  # An atomic commit that already completed remains valid.
+            if isinstance(err, asyncio.CancelledError):
+                code, access = "cancelled", "temporarily_unavailable"
+            elif isinstance(err, InsufficientPermissions):
+                code, access = "permission_denied", "access_denied"
+            elif isinstance(err, SpotifyCaptureError):
+                code = err.reason
+                access = "access_denied" if code in ("account_changed", "source_inaccessible") else "temporarily_unavailable"
+            elif err.__class__.__name__ == "LoginFailed":
+                code, access = "authentication_required", "authentication_required"
+            elif isinstance(err, InvalidDataError):
+                code, access = "provider_offline", "provider_offline"
+            else:
+                code, access = "provider_error", "temporarily_unavailable"
+            if isinstance(err, asyncio.CancelledError):
+                try:
+                    await self._store_operation(self._store.cancel_sync, job["id"])
+                except ValueError:
+                    pass  # A success transaction already executing may finish first.
+                raise
+            await self._store_operation(self._store.fail_sync, job["id"], code, f"Refresh stopped: {code}", access)
+        finally:
+            if impersonation_token is not None:
+                impersonated_user.reset(impersonation_token)
+            if user_token is not None:
+                current_user.reset(user_token)
+            task_id = self._sync_jobs.pop(job["id"], None)
+            if task_id:
+                self._sync_stopping.discard(task_id)
 
     @staticmethod
     def _projection(version):

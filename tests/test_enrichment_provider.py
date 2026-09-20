@@ -40,6 +40,7 @@ def plugin(monkeypatch, tmp_path):
     impersonated = ContextVar("test_impersonated_user", default=None)
     modules = {
         "music_assistant_models.auth": {"Scope": Scope},
+        "music_assistant_models.background_task": {"TaskSchedule": types.SimpleNamespace(hourly=lambda **kwargs: kwargs)},
         "music_assistant_models.enums": {"MediaType": MediaType},
         "music_assistant_models.errors": {"InsufficientPermissions": Error, "InvalidDataError": Error},
         "music_assistant.models.plugin": {"PluginProvider": object},
@@ -63,6 +64,7 @@ def plugin(monkeypatch, tmp_path):
     spotify = types.SimpleNamespace(instance_id="spotify-a", domain="spotify", available=True)
     handlers = []
     registered = []
+    scheduled = []
     tasks = {}
 
     def schedule(**kwargs):
@@ -90,6 +92,7 @@ def plugin(monkeypatch, tmp_path):
         ),
         tasks=types.SimpleNamespace(
             run_background_task=schedule,
+            register_scheduled_task=lambda **kwargs: scheduled.append(kwargs) or types.SimpleNamespace(id=kwargs["task_id"]),
             get_task=get_task,
             unregister_scheduled_task_and_wait=AsyncMock(return_value=True),
         ),
@@ -119,6 +122,7 @@ def plugin(monkeypatch, tmp_path):
         tasks=tasks,
         controller=controller,
         registered=registered,
+        scheduled=scheduled,
     )
     provider._store.close()
 
@@ -294,6 +298,175 @@ def test_apply_requires_library_write_even_with_configuration_permission(plugin,
     playlists.import_playlist.assert_not_called()
 
 
+def _sync_fixture(plugin):
+    store = plugin.provider._store
+    sub = store.upsert_subscription("spotify", "account-a", "A" * 22, "spotify-a", "Source")
+    job = store.begin_capture(sub["id"], "A")
+    version = store.commit_capture(job, snapshot_before="A", snapshot_after="A", total=0, occurrences=[])
+    return sub["id"], version
+
+
+def test_sync_unchanged_uses_metadata_only_and_links_existing_version(plugin):
+    subscription, version = _sync_fixture(plugin)
+
+    async def run():
+        queued = await plugin.provider.sync_now(subscription)
+        assert queued["state"] == "queued" and plugin.handlers[-1]["priority"]
+        await plugin.handlers[-1]["handler"]()
+        status = await plugin.provider.sync_status(subscription)
+        assert status["latest_job"]["state"] == "succeeded"
+        assert status["latest_job"]["version_id"] == version
+        assert len(plugin.provider._store.list_versions(subscription)) == 1
+        plugin.module.capture_playlist.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_sync_changed_commits_new_version_without_applying(plugin):
+    subscription, old = _sync_fixture(plugin)
+    plugin.module.preview_playlist.return_value.update(snapshot_id="B")
+    plugin.module.capture_playlist.return_value.update(snapshot_before="B", snapshot_after="B")
+
+    async def run():
+        await plugin.provider.sync_now(subscription)
+        await plugin.handlers[-1]["handler"]()
+        status = await plugin.provider.sync_status(subscription)
+        assert status["latest_job"]["state"] == "succeeded"
+        assert status["latest_job"]["version_id"] != old
+        assert len(plugin.provider._store.list_versions(subscription)) == 2
+        assert plugin.provider._store.list_applies() == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["capture", "account", "owner"])
+def test_sync_failure_retains_prior_version_and_records_access(plugin, failure):
+    subscription, old = _sync_fixture(plugin)
+    plugin.module.preview_playlist.return_value.update(snapshot_id="B")
+    if failure == "capture":
+        plugin.module.capture_playlist.side_effect = RuntimeError("secret exception detail")
+    elif failure == "account":
+        plugin.module.preview_playlist.return_value["account_id"] = "another-account"
+    else:
+        plugin.provider.mass.webserver.auth.get_user.return_value = None
+
+    async def run():
+        await plugin.provider.sync_now(subscription)
+        await plugin.handlers[-1]["handler"]()
+        status = await plugin.provider.sync_status(subscription)
+        assert status["latest_job"]["state"] == "failed"
+        assert plugin.provider._store.get_subscription(subscription)["committed_version_id"] == old
+        assert "secret" not in status["latest_job"]["error"]
+        if failure != "capture":
+            assert status["state"]["access_state"] == "access_denied"
+            plugin.module.capture_playlist.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_sync_core_queued_cancel_reconciles_durable_job(plugin):
+    subscription, _ = _sync_fixture(plugin)
+
+    async def run():
+        queued = await plugin.provider.sync_now(subscription)
+        plugin.tasks[queued["task_id"]].status = "cancelled"
+        status = await plugin.provider.sync_status(subscription)
+        assert status["latest_job"]["state"] == "cancelled"
+        plugin.module.preview_playlist.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_dispatcher_bounds_batch_to_ten_and_never_applies(plugin, monkeypatch):
+    subscription, _ = _sync_fixture(plugin)
+    plugin.provider._store.set_sync_policy(subscription, "scheduled", 3600, "admin", 0)
+    monkeypatch.setattr(plugin.provider._store, "list_due", lambda now, limit: [{"id": subscription}] * 15)
+    plugin.provider._run_sync = AsyncMock(side_effect=lambda *args: plugin.provider._store.cancel_sync(args[0]["id"]))
+    asyncio.run(plugin.provider._dispatch_sync())
+    assert plugin.provider._run_sync.await_count == 10
+    assert plugin.provider._store.list_applies() == []
+
+
+def test_sync_running_cancellation_finishes_both_jobs(plugin):
+    subscription, _ = _sync_fixture(plugin)
+    plugin.module.preview_playlist.return_value.update(snapshot_id="B")
+
+    async def run():
+        started = asyncio.Event()
+
+        async def capture(*args, **kwargs):
+            started.set()
+            await asyncio.Future()
+
+        plugin.module.capture_playlist.side_effect = capture
+        await plugin.provider.sync_now(subscription)
+        worker = asyncio.create_task(plugin.handlers[-1]["handler"]())
+        await started.wait()
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        assert (await plugin.provider.sync_status(subscription))["latest_job"]["state"] == "cancelled"
+        assert not any(job["state"] == "pending" for job in plugin.provider._store.list_jobs())
+
+    asyncio.run(run())
+
+
+def test_sync_policy_revision_and_scheduler_lifecycle(plugin):
+    subscription, _ = _sync_fixture(plugin)
+
+    async def run():
+        await plugin.provider.loaded_in_mass()
+        schedule = plugin.scheduled[0]
+        assert schedule["schedule"] == {"every": 1}
+        assert schedule["initial_delay"] == 60
+        policy = await plugin.provider.set_sync_policy(subscription, 0, "scheduled", 3600)
+        assert policy["revision"] == 1 and policy["initiating_user_id"] == "admin"
+        with pytest.raises(Exception, match="revision conflict"):
+            await plugin.provider.set_sync_policy(subscription, 0, "manual", 3600)
+        await plugin.provider.unload()
+        plugin.provider.mass.tasks.unregister_scheduled_task_and_wait.assert_any_await(
+            "library_enrichment_sync_dispatcher", clear_persisted_state=False
+        )
+
+    asyncio.run(run())
+
+
+def test_manual_capture_and_sync_exclude_each_other(plugin):
+    subscription, _ = _sync_fixture(plugin)
+
+    async def run():
+        await plugin.provider.sync_now(subscription)
+        with pytest.raises(Exception, match="already pending"):
+            await plugin.provider.capture("spotify-a", "A" * 22)
+        assert len(plugin.provider._store.list_jobs()) == 1
+
+    asyncio.run(run())
+
+
+def test_restart_interrupts_queued_sync_without_changing_committed_version(plugin):
+    subscription, committed = _sync_fixture(plugin)
+    plugin.provider._store.begin_sync(subscription)
+    assert plugin.provider._store.recover_sync_pending() == 1
+    status = asyncio.run(plugin.provider.sync_status(subscription))
+    assert status["latest_job"]["state"] == "interrupted"
+    assert plugin.provider._store.get_subscription(subscription)["committed_version_id"] == committed
+
+
+def test_scheduled_checks_can_be_paused_while_source_provider_is_offline(plugin):
+    subscription, _ = _sync_fixture(plugin)
+
+    async def run():
+        enabled = await plugin.provider.set_sync_policy(subscription, 0, "scheduled", 3600)
+        plugin.provider.mass.music.providers = []
+        paused = await plugin.provider.set_sync_policy(subscription, enabled["revision"], "manual", 3600)
+        assert paused["mode"] == "manual"
+        assert (await plugin.provider.sync_status(subscription))["state"]["next_check_at"] is None
+        with pytest.raises(Exception, match="available Spotify"):
+            await plugin.provider.set_sync_policy(subscription, paused["revision"], "scheduled", 3600)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("user", [None, types.SimpleNamespace(user_id="guest", allowed=False)])
 def test_unauthorized_archive_and_inspection_calls_are_denied(plugin, user):
     plugin.auth.user = user
@@ -317,7 +490,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 12
+    assert len(plugin.registered) == 16
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
