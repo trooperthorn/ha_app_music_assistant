@@ -402,6 +402,9 @@ def test_v2_sync_migration_rollback_preserves_applied_capture(tmp_path):
     store.mark_apply_creating(job["id"])
     store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
     with store._transaction():
+        for table in ("provenance_overrides", "provenance_values", "provenance_subjects"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v6_migrated_at'")
         for table in ("playback_projections", "playback_policies"):
             store._db.execute(f"DROP TABLE {table}")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v5_migrated_at'")
@@ -604,6 +607,9 @@ def test_v3_match_migration_is_transactional_and_backup_preserves_overlay(tmp_pa
     sub = subscribe(store)
     version = capture(store, sub)
     with store._transaction():
+        for table in ("provenance_overrides", "provenance_values", "provenance_subjects"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v6_migrated_at'")
         for table in ("playback_projections", "playback_policies"):
             store._db.execute(f"DROP TABLE {table}")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v5_migrated_at'")
@@ -651,6 +657,9 @@ def test_v4_playback_policy_migration_preserves_match_overlay(tmp_path):
     )
     store.set_match_decision("spotify", "account-a", "track", "song", "approve", asset["id"], 0)
     with store._transaction():
+        for table in ("provenance_overrides", "provenance_values", "provenance_subjects"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v6_migrated_at'")
         for table in ("playback_projections", "playback_policies"):
             store._db.execute(f"DROP TABLE {table}")
         store._db.execute("DELETE FROM metadata WHERE key='schema_v5_migrated_at'")
@@ -663,3 +672,131 @@ def test_v4_playback_policy_migration_preserves_match_overlay(tmp_path):
     assert restored.get_version_match_overlay(version)["occurrences"][0]["match"]["approved_asset_id"] == asset["id"]
     restored.close()
     store.close()
+
+
+def provenance_value(version, value="Observed", fetched_at="2026-09-20T12:00:00-05:00"):
+    return {
+        "field_name": "title",
+        "state": "value",
+        "value": value,
+        "source": "spotify.playlist",
+        "fetched_at": fetched_at,
+        "parser_version": "spotify-v1",
+        "raw_reference": {"version_id": version, "position": 0, "json_pointer": "/item/name"},
+    }
+
+
+def test_provenance_observations_are_typed_append_only_and_raw_is_bounded(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub, rows=[{"position": 0, "state": "track", "source_item_id": "song", "secret": "raw"}])
+    overlay = store.upsert_provenance_values(
+        "spotify", "account-a", "track", "song",
+        [
+            provenance_value(version),
+            {
+                "field_name": "year", "state": "value", "value": 2026,
+                "source": "spotify.track", "fetched_at": "2026-09-20T17:00:00Z",
+                "parser_version": "spotify-v1", "date_precision": "year", "unit": "year",
+            },
+            {
+                "field_name": "lyrics", "state": "not_loaded", "source": "spotify.track",
+                "fetched_at": "2026-09-20T17:00:00+00:00", "parser_version": "spotify-v1",
+            },
+        ],
+    )
+    assert overlay["fields"]["title"]["effective"]["value"] == "Observed"
+    assert overlay["fields"]["year"]["effective"]["value_type"] == "integer"
+    assert overlay["fields"]["lyrics"]["observation"]["state"] == "not_loaded"
+    assert "payload" not in repr(overlay) and "secret" not in repr(overlay)
+    store.upsert_provenance_values(
+        "spotify", "account-a", "track", "song",
+        [provenance_value(version, "New", "2026-09-20T18:00:00+00:00")],
+    )
+    assert store.get_provenance_overlay("spotify", "account-a", "track", "song")["fields"]["title"]["effective"]["value"] == "New"
+    assert store._db.execute("SELECT count(*) FROM provenance_values WHERE field_name='title'").fetchone()[0] == 2
+    store.close()
+
+
+def test_provenance_override_survives_refresh_and_clear_reveals_latest_observation(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub, rows=[{"position": 0, "state": "track", "source_item_id": "song"}])
+    store.upsert_provenance_values("spotify", "account-a", "track", "song", [provenance_value(version, "First")])
+    overlay = store.set_provenance_override("spotify", "account-a", "track", "song", "title", "Curated", 0, "admin")
+    assert overlay["fields"]["title"]["effective"]["value"] == "Curated"
+    store.upsert_provenance_values(
+        "spotify", "account-a", "track", "song",
+        [provenance_value(version, "Refreshed", "2026-09-20T19:00:00+00:00")],
+    )
+    assert store.get_provenance_overlay("spotify", "account-a", "track", "song")["fields"]["title"]["effective"]["value"] == "Curated"
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.clear_provenance_override("spotify", "account-a", "track", "song", "title", 0, "other")
+    cleared = store.clear_provenance_override("spotify", "account-a", "track", "song", "title", 1, "admin")
+    assert cleared["fields"]["title"]["revision"] == 2
+    assert cleared["fields"]["title"]["override"] is None
+    assert cleared["fields"]["title"]["effective"]["value"] == "Refreshed"
+    assert store._db.execute("SELECT count(*) FROM provenance_overrides").fetchone()[0] == 2
+    store.close()
+
+
+def test_provenance_validation_is_atomic_and_occurrence_overlay_preserves_duplicates(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    rows = [
+        {"position": 0, "state": "track", "source_item_id": "song"},
+        {"position": 1, "state": "track", "source_item_id": "song"},
+        {"position": 2, "state": "null"},
+    ]
+    version = capture(store, sub, rows=rows)
+    invalid = provenance_value(version)
+    invalid["raw_reference"]["json_pointer"] = "not-a-pointer"
+    with pytest.raises(ValueError, match="pointer"):
+        store.upsert_provenance_values(
+            "spotify", "account-a", "track", "song",
+            [provenance_value(version), {**invalid, "field_name": "album"}],
+        )
+    assert store.lookup_provenance_subject("spotify", "account-a", "track", "song") is None
+    store.upsert_provenance_values("spotify", "account-a", "track", "song", [provenance_value(version)])
+    page = store.get_version_provenance_overlay(version)["occurrences"]
+    assert [row["position"] for row in page] == [0, 1, 2]
+    assert page[0]["provenance"]["subject"]["source_item_id"] == "song"
+    assert page[1]["provenance"]["fields"]["title"]["effective"]["value"] == "Observed"
+    assert page[2]["provenance"] is None
+    store.close()
+
+
+def test_v5_provenance_migration_seeds_subjects_without_fabricating_values_and_rolls_back(tmp_path):
+    path = tmp_path / "legacy-v5.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    capture(store, sub, rows=[{"position": 0, "state": "track", "source_item_id": "song"}])
+    with store._transaction():
+        for table in ("provenance_overrides", "provenance_values", "provenance_subjects"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v6_migrated_at'")
+        store._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (store._schema_digest(),))
+        store._db.execute("PRAGMA user_version=5")
+    identity = store.store_uuid
+    store.close()
+
+    class BrokenMigration(ArchiveStore):
+        def _migrate_v6(self):
+            super()._migrate_v6()
+            raise RuntimeError("migration interrupted")
+
+    with pytest.raises(RuntimeError):
+        BrokenMigration(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='provenance_subjects'").fetchone() is None
+    restored = ArchiveStore(path)
+    assert restored.store_uuid == identity
+    assert restored.lookup_provenance_subject("spotify", "account-a", "track", "song") is not None
+    assert restored._db.execute("SELECT count(*) FROM provenance_values").fetchone()[0] == 0
+    backup = tmp_path / "backup-v6.db"
+    restored.backup(backup)
+    reopened = ArchiveStore(backup)
+    assert reopened.lookup_provenance_subject("spotify", "account-a", "track", "song") is not None
+    reopened.close()
+    restored.close()

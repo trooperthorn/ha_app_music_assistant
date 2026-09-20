@@ -16,8 +16,10 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
+PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
+PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
 
 
 def _now() -> str:
@@ -53,7 +55,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -64,6 +66,8 @@ class ArchiveStore:
                     required.update(("match_sources", "local_assets", "local_asset_locations", "match_candidates", "match_decisions"))
                 if version >= 5:
                     required.update(("playback_policies", "playback_projections"))
+                if version >= 6:
+                    required.update(("provenance_subjects", "provenance_values", "provenance_overrides"))
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if actual != required:
                     raise ValueError("Unexpected enrichment database tables; database untouched")
@@ -85,6 +89,8 @@ class ArchiveStore:
                     self._migrate_v4()
                 if version <= 4:
                     self._migrate_v5()
+                if version <= 5:
+                    self._migrate_v6()
         except Exception:
             self._db.close()
             raise
@@ -240,6 +246,72 @@ class ArchiveStore:
         self._db.execute("INSERT INTO metadata VALUES ('schema_v5_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=5")
 
+    def _migrate_v6(self) -> None:
+        """Add immutable provenance observations and override events."""
+        self._db.execute("""CREATE TABLE provenance_subjects (
+            id TEXT PRIMARY KEY, provider_domain TEXT NOT NULL, account_id TEXT NOT NULL,
+            media_type TEXT NOT NULL, source_item_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(provider_domain,account_id,media_type,source_item_id))""")
+        self._db.execute("""CREATE TABLE provenance_values (
+            id TEXT PRIMARY KEY, subject_id TEXT NOT NULL REFERENCES provenance_subjects(id),
+            field_name TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN
+              ('value','stale','missing','empty','not_loaded','inaccessible')),
+            value_type TEXT CHECK(value_type IN ('string','integer','number','boolean','object','array','null')),
+            value_json TEXT, source TEXT NOT NULL, fetched_at TEXT NOT NULL,
+            parser_version TEXT NOT NULL, date_precision TEXT, unit TEXT,
+            raw_version_id TEXT REFERENCES versions(id), raw_position INTEGER,
+            raw_json_pointer TEXT, created_at TEXT NOT NULL,
+            CHECK((state='value' AND value_type IS NOT NULL AND value_json IS NOT NULL)
+               OR (state='stale' AND ((value_type IS NULL AND value_json IS NULL)
+                                   OR (value_type IS NOT NULL AND value_json IS NOT NULL)))
+               OR (state NOT IN ('value','stale') AND value_type IS NULL AND value_json IS NULL)),
+            CHECK((raw_version_id IS NULL AND raw_position IS NULL AND raw_json_pointer IS NULL)
+               OR (raw_version_id IS NOT NULL AND raw_position IS NOT NULL AND raw_position>=0)))""")
+        self._db.execute("""CREATE TABLE provenance_overrides (
+            id TEXT PRIMARY KEY, subject_id TEXT NOT NULL REFERENCES provenance_subjects(id),
+            field_name TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('set','clear')),
+            revision INTEGER NOT NULL CHECK(revision>0), actor_id TEXT NOT NULL,
+            value_type TEXT CHECK(value_type IN ('string','integer','number','boolean','object','array','null')),
+            value_json TEXT, created_at TEXT NOT NULL,
+            UNIQUE(subject_id,field_name,revision),
+            CHECK((action='set' AND value_type IS NOT NULL AND value_json IS NOT NULL)
+               OR (action='clear' AND value_type IS NULL AND value_json IS NULL)))""")
+        self._db.execute(
+            "CREATE INDEX provenance_values_latest ON provenance_values(subject_id,field_name,created_at DESC,id DESC)"
+        )
+        self._db.execute(
+            "CREATE INDEX provenance_overrides_latest ON provenance_overrides(subject_id,field_name,revision DESC)"
+        )
+        # Existing stable source identities become subjects. Migration never guesses values.
+        keys = {
+            tuple(row)
+            for row in self._db.execute(
+                "SELECT provider_domain,account_id,media_type,source_item_id FROM match_sources"
+            )
+        }
+        for row in self._db.execute(
+            """SELECT s.provider_domain,s.account_id,o.payload FROM occurrences o
+            JOIN versions v ON v.id=o.version_id JOIN subscriptions s ON s.id=v.subscription_id"""
+        ):
+            try:
+                occurrence = json.loads(row[2])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(occurrence, dict):
+                continue
+            source_item_id = occurrence.get("source_item_id")
+            if occurrence.get("state") == "track" and isinstance(source_item_id, str) and source_item_id.strip():
+                keys.add((row[0], row[1], "track", source_item_id))
+        now = _now()
+        self._db.executemany(
+            "INSERT INTO provenance_subjects VALUES (?,?,?,?,?,?)",
+            [(str(uuid.uuid4()), *key, now) for key in sorted(keys)],
+        )
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT INTO metadata VALUES ('schema_v6_migrated_at',?)", (now,))
+        self._db.execute("PRAGMA user_version=6")
+
     @staticmethod
     def _json_object(value: dict | None, label: str) -> str:
         if value is None:
@@ -247,6 +319,273 @@ class ArchiveStore:
         if not isinstance(value, dict):
             raise ValueError(f"{label} must be an object")
         return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+    @staticmethod
+    def _provenance_key(
+        provider_domain: str, account_id: str, media_type: str, source_item_id: str
+    ) -> tuple[str, str, str, str]:
+        key = (provider_domain, account_id, media_type, source_item_id)
+        if not all(isinstance(value, str) and value.strip() and len(value) <= 512 for value in key):
+            raise ValueError("A bounded stable provenance subject key is required")
+        return key
+
+    @staticmethod
+    def _typed_value(value) -> tuple[str, str]:
+        if value is None:
+            value_type = "null"
+        elif isinstance(value, bool):
+            value_type = "boolean"
+        elif type(value) is int:
+            value_type = "integer"
+        elif type(value) is float:
+            value_type = "number"
+        elif isinstance(value, str):
+            value_type = "string"
+        elif isinstance(value, dict):
+            value_type = "object"
+        elif isinstance(value, list):
+            value_type = "array"
+        else:
+            raise ValueError("Unsupported provenance value type")
+        return value_type, json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+    def _ensure_provenance_subject(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str
+    ) -> dict:
+        key = self._provenance_key(provider_domain, account_id, media_type, source_item_id)
+        self._db.execute(
+            """INSERT OR IGNORE INTO provenance_subjects
+            (id,provider_domain,account_id,media_type,source_item_id,created_at) VALUES (?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), *key, _now()),
+        )
+        return dict(
+            self._db.execute(
+                """SELECT * FROM provenance_subjects WHERE provider_domain=? AND account_id=?
+                AND media_type=? AND source_item_id=?""",
+                key,
+            ).fetchone()
+        )
+
+    def lookup_provenance_subject(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str
+    ) -> dict | None:
+        key = self._provenance_key(provider_domain, account_id, media_type, source_item_id)
+        with self._lock:
+            row = self._db.execute(
+                """SELECT * FROM provenance_subjects WHERE provider_domain=? AND account_id=?
+                AND media_type=? AND source_item_id=?""",
+                key,
+            ).fetchone()
+            return dict(row) if row else None
+
+    def _validate_raw_reference(self, subject: dict, reference: dict | None) -> tuple[str | None, int | None, str | None]:
+        if reference is None:
+            return None, None, None
+        if not isinstance(reference, dict) or set(reference) - {"version_id", "position", "json_pointer"}:
+            raise ValueError("Raw reference must be a bounded occurrence reference")
+        version_id, position = reference.get("version_id"), reference.get("position")
+        pointer = reference.get("json_pointer")
+        if not isinstance(version_id, str) or type(position) is not int or position < 0:
+            raise ValueError("Raw reference requires version and position")
+        if pointer is not None and (not isinstance(pointer, str) or len(pointer) > 512 or (pointer and not pointer.startswith("/"))):
+            raise ValueError("Invalid raw JSON pointer")
+        row = self._db.execute(
+            """SELECT s.provider_domain,s.account_id,o.payload FROM occurrences o
+            JOIN versions v ON v.id=o.version_id JOIN subscriptions s ON s.id=v.subscription_id
+            WHERE o.version_id=? AND o.position=?""",
+            (version_id, position),
+        ).fetchone()
+        if row is None or (row[0], row[1]) != (subject["provider_domain"], subject["account_id"]):
+            raise ValueError("Raw reference is outside the provenance subject account")
+        occurrence = json.loads(row[2])
+        if occurrence.get("source_item_id") != subject["source_item_id"]:
+            raise ValueError("Raw reference does not identify the provenance subject")
+        return version_id, position, pointer
+
+    def upsert_provenance_values(
+        self,
+        provider_domain: str,
+        account_id: str,
+        media_type: str,
+        source_item_id: str,
+        values: list[dict],
+    ) -> dict:
+        """Append a validated observation batch; existing observations and overrides remain immutable."""
+        if not isinstance(values, list) or not values:
+            raise ValueError("At least one provenance value is required")
+        with self._transaction():
+            subject = self._ensure_provenance_subject(provider_domain, account_id, media_type, source_item_id)
+            prepared = []
+            seen = set()
+            for item in values:
+                if not isinstance(item, dict):
+                    raise ValueError("Provenance values must be objects")
+                field = item.get("field_name")
+                state = item.get("state")
+                source = item.get("source")
+                parser_version = item.get("parser_version")
+                if (
+                    not isinstance(field, str) or not field.strip() or len(field) > 128 or field in seen
+                    or state not in PROVENANCE_STATES
+                    or not isinstance(source, str) or not source.strip() or len(source) > 256
+                    or not isinstance(parser_version, str) or not parser_version.strip() or len(parser_version) > 128
+                ):
+                    raise ValueError("Invalid provenance observation")
+                seen.add(field)
+                fetched_at = _timestamp(item.get("fetched_at")) if isinstance(item.get("fetched_at"), str) else None
+                if fetched_at is None:
+                    raise ValueError("Provenance observation requires fetched_at")
+                if state in ("value", "stale") and "value" in item:
+                    value_type, value_json = self._typed_value(item["value"])
+                elif state == "value":
+                    if "value" not in item:
+                        raise ValueError("Value state requires a typed value")
+                elif state == "stale":
+                    value_type = value_json = None
+                else:
+                    if "value" in item:
+                        raise ValueError("Non-value provenance states cannot carry a value")
+                    value_type = value_json = None
+                precision, unit = item.get("date_precision"), item.get("unit")
+                if precision is not None and (not isinstance(precision, str) or not precision.strip() or len(precision) > 32):
+                    raise ValueError("Invalid date precision")
+                if unit is not None and (not isinstance(unit, str) or not unit.strip() or len(unit) > 64):
+                    raise ValueError("Invalid provenance unit")
+                raw_version, raw_position, raw_pointer = self._validate_raw_reference(subject, item.get("raw_reference"))
+                identity = (
+                    subject["id"], field, state, value_type, value_json, source, fetched_at,
+                    parser_version, precision, unit, raw_version, raw_position, raw_pointer,
+                )
+                if not self._db.execute(
+                    """SELECT 1 FROM provenance_values WHERE subject_id=? AND field_name=? AND state=?
+                    AND value_type IS ? AND value_json IS ? AND source=? AND fetched_at=? AND parser_version=?
+                    AND date_precision IS ? AND unit IS ? AND raw_version_id IS ? AND raw_position IS ?
+                    AND raw_json_pointer IS ? LIMIT 1""",
+                    identity,
+                ).fetchone():
+                    prepared.append((str(uuid.uuid4()), *identity, _now()))
+            self._db.executemany(
+                """INSERT INTO provenance_values
+                (id,subject_id,field_name,state,value_type,value_json,source,fetched_at,parser_version,
+                 date_precision,unit,raw_version_id,raw_position,raw_json_pointer,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                prepared,
+            )
+            return self.get_provenance_overlay(provider_domain, account_id, media_type, source_item_id)
+
+    @staticmethod
+    def _decoded_provenance_row(row: sqlite3.Row | None) -> dict | None:
+        if row is None:
+            return None
+        result = dict(row)
+        encoded = result.pop("value_json", None)
+        result["value"] = json.loads(encoded) if encoded is not None else None
+        raw_version = result.pop("raw_version_id", None)
+        raw_position = result.pop("raw_position", None)
+        raw_pointer = result.pop("raw_json_pointer", None)
+        result["raw_reference"] = (
+            {"version_id": raw_version, "position": raw_position, "json_pointer": raw_pointer}
+            if raw_version is not None else None
+        )
+        return result
+
+    def get_provenance_overlay(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str
+    ) -> dict:
+        with self._lock:
+            subject = self.lookup_provenance_subject(provider_domain, account_id, media_type, source_item_id)
+            if subject is None:
+                return {"subject": None, "fields": {}}
+            fields = {}
+            names = {
+                row[0] for row in self._db.execute(
+                    """SELECT field_name FROM provenance_values WHERE subject_id=?
+                    UNION SELECT field_name FROM provenance_overrides WHERE subject_id=?""",
+                    (subject["id"], subject["id"]),
+                )
+            }
+            for field in sorted(names):
+                observation = self._db.execute(
+                    """SELECT * FROM provenance_values WHERE subject_id=? AND field_name=?
+                    ORDER BY fetched_at DESC,created_at DESC,id DESC LIMIT 1""",
+                    (subject["id"], field),
+                ).fetchone()
+                override = self._db.execute(
+                    """SELECT * FROM provenance_overrides WHERE subject_id=? AND field_name=?
+                    ORDER BY revision DESC LIMIT 1""",
+                    (subject["id"], field),
+                ).fetchone()
+                observed = self._decoded_provenance_row(observation)
+                override_value = self._decoded_provenance_row(override)
+                active = override_value is not None and override_value["action"] == "set"
+                effective = override_value if active else observed
+                fields[field] = {
+                    "revision": override_value["revision"] if override_value else 0,
+                    "observation": observed,
+                    "override": override_value if active else None,
+                    "effective": effective,
+                }
+            return {"subject": subject, "fields": fields}
+
+    def _change_provenance_override(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str,
+        field_name: str, expected_revision: int, actor_id: str, *, clear: bool, value=None
+    ) -> dict:
+        if (not isinstance(field_name, str) or not field_name.strip() or len(field_name) > 128
+                or type(expected_revision) is not int or expected_revision < 0
+                or not isinstance(actor_id, str) or not actor_id.strip() or len(actor_id) > 256):
+            raise ValueError("Valid field, actor, and expected revision are required")
+        with self._transaction():
+            subject = self._ensure_provenance_subject(provider_domain, account_id, media_type, source_item_id)
+            row = self._db.execute(
+                "SELECT max(revision) FROM provenance_overrides WHERE subject_id=? AND field_name=?",
+                (subject["id"], field_name),
+            ).fetchone()
+            revision = row[0] or 0
+            if revision != expected_revision:
+                raise ValueError("Provenance override revision conflict")
+            value_type, value_json = (None, None) if clear else self._typed_value(value)
+            self._db.execute(
+                """INSERT INTO provenance_overrides
+                (id,subject_id,field_name,action,revision,actor_id,value_type,value_json,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()), subject["id"], field_name, "clear" if clear else "set",
+                 revision + 1, actor_id, value_type, value_json, _now()),
+            )
+            return self.get_provenance_overlay(provider_domain, account_id, media_type, source_item_id)
+
+    def set_provenance_override(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str,
+        field_name: str, value, expected_revision: int, actor_id: str
+    ) -> dict:
+        return self._change_provenance_override(
+            provider_domain, account_id, media_type, source_item_id, field_name,
+            expected_revision, actor_id, clear=False, value=value
+        )
+
+    def clear_provenance_override(
+        self, provider_domain: str, account_id: str, media_type: str, source_item_id: str,
+        field_name: str, expected_revision: int, actor_id: str
+    ) -> dict:
+        return self._change_provenance_override(
+            provider_domain, account_id, media_type, source_item_id, field_name,
+            expected_revision, actor_id, clear=True
+        )
+
+    def get_version_provenance_overlay(self, version_id: str) -> dict:
+        version = self.get_version(version_id)
+        subscription = self.get_subscription(version["subscription_id"])
+        occurrences = []
+        for occurrence in version["occurrences"]:
+            source_item_id = occurrence.get("source_item_id") if occurrence.get("state") == "track" else None
+            occurrences.append({
+                "position": occurrence.get("position"),
+                "source_item_id": source_item_id,
+                "provenance": self.get_provenance_overlay(
+                    subscription["provider_domain"], subscription["account_id"], "track", source_item_id
+                ) if source_item_id else None,
+            })
+        return {"version_id": version_id, "content_digest": version["content_digest"], "occurrences": occurrences}
 
     @staticmethod
     def _source_key(provider_domain: str, account_id: str, media_type: str, source_item_id: str) -> tuple[str, str, str, str]:

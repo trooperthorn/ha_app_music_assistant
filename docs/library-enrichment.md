@@ -52,6 +52,10 @@ provider before its commands are registered. It never auto-starts a capture.
 - Playback projection is a separate, explicit write with digest and policy-revision
   preconditions. Its durable checkpoint is independent of archive-copy apply.
   Synchronization never creates or updates a playback playlist.
+- Read-only provenance extracts a bounded, typed Spotify field set from the
+  committed immutable payload without refreshing Spotify or Music Assistant.
+- Playlist item provenance links known builtin archive and playback destinations
+  to their subscription, snapshots, and durable check state.
 
 These are metadata/reference archives, not downloaded audio. A visible applied
 playlist contains Spotify references and does not establish local playback. This
@@ -79,6 +83,8 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/status` | none | persisted subscriptions, checkpoints, jobs, counts and sanitized failures |
 | `library_enrichment/version` | `version_id` | immutable ordered occurrence capture, verified against content digest |
 | `library_enrichment/versions` | `subscription_id`, optional `limit` (1..200, default 50), `offset` | newest-first version metadata; stable timestamp/ID ordering |
+| `library_enrichment/provenance` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned typed provenance and effective values; no inline raw payload |
+| `library_enrichment/item_provenance` | `media_type` (`playlist`), `library_item_id` | builtin destination linkage and `current`, `source_changed`, `capture_pending`, `capture_failed`, or `unknown` state |
 | `library_enrichment/cancel` | `job_id` | final durable state; an already executing atomic commit can win the cancellation race |
 | `library_enrichment/apply_preview` | `version_id` | exact projection digest, source/projected counts, omissions, partial-consent requirement and existing destination |
 | `library_enrichment/apply` | `version_id`, `expected_digest`, optional `allow_partial` | create and verify one visible builtin playlist; also requires `library.write` |
@@ -103,6 +109,10 @@ separate in the response while sharing one account-scoped source decision. A
 failed library read returns the last stored candidates as stale when available;
 it is not retried automatically. See `local-match-review.md` for the exact
 contract and current boundary.
+
+Capabilities advertise `provenance_read`, `provenance_api_version: 1`,
+`max_provenance_page: 200`, `raw_payload_inline: false`, `item_provenance`, and
+`item_provenance_api_version: 1`. See `provenance.md` for field and state details.
 
 `prefer_local` selects an approved local URI and otherwise records an explicit
 Spotify fallback. `prefer_spotify` selects Spotify and falls back to an approved
