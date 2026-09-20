@@ -162,11 +162,21 @@ def server_frontend_pin(version: str) -> str:
 
 def latest_release(repo: str, tag_ok) -> dict:
     releases = json.loads(fetch(f"{API}/repos/{repo}/releases?per_page=30"))
-    for release in releases:
-        if release.get("draft") or release.get("prerelease"):
-            continue
-        if tag_ok(release["tag_name"]):
-            return release
+    stable = [
+        release
+        for release in releases
+        if not release.get("draft")
+        and not release.get("prerelease")
+        and tag_ok(release["tag_name"])
+    ]
+    if stable:
+        # GitHub orders releases by creation time, not version or publication
+        # time. A release drafted early and published later can otherwise be
+        # hidden below an older tag (for example .11 below .9).
+        return max(
+            stable,
+            key=lambda release: tuple(int(part) for part in re.findall(r"\d+", release["tag_name"])),
+        )
     raise RuntimeError(f"no stable release found on {repo}")
 
 
