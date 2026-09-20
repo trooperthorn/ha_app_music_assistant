@@ -475,6 +475,16 @@ def test_playlist_bridge_manifest_and_module_are_valid() -> None:
     assert manifest["codeowners"] == ["@trooperthorn"]
     compile(bridge.INIT_PY, "playlist_bridge/__init__.py", "exec")
     assert "migrate_playlist" in bridge.INIT_PY
+    assert "archive_playlists" in bridge.INIT_PY
+    assert '"playlist_bridge/archive_playlists"' in bridge.INIT_PY
+    assert bridge.INIT_PY.count("required_scope=Scope.LIBRARY_WRITE") == 2
+    # a long bulk archive job must never jump ahead of interactive tasks
+    assert "priority=True" not in bridge.INIT_PY.split("async def archive_playlists")[1].split(
+        "async def _archive_playlists"
+    )[0]
+    # the throwaway builtin copy created during a migration must always be
+    # cleaned up, success or failure
+    assert "await builtin.library_remove(matched_playlist.item_id, MediaType.PLAYLIST)" in bridge.INIT_PY
     # the plugin must resolve destinations from the caller's own configured
     # providers, not a global domain lookup, or it reintroduces the
     # scope-escape bug the closed upstream PR shipped
@@ -501,6 +511,7 @@ def test_playlist_bridge_manifest_and_module_are_valid() -> None:
     strings = json.loads(bridge.STRINGS_JSON)
     assert strings["manifest"]["description"] == manifest["description"]
     assert strings["background_task"]["playlist_bridge_migrate"] == "Migrate playlist {0} to {1}"
+    assert strings["background_task"]["playlist_bridge_archive"] == "Archive playlists ({0})"
 
 
 def test_playlist_bridge_match_policy_docstring_states_it_has_no_effect() -> None:
@@ -509,6 +520,282 @@ def test_playlist_bridge_match_policy_docstring_states_it_has_no_effect() -> Non
     assert "PlaylistMatchPolicy" in bridge.INIT_PY
     assert "server PR #5989" in bridge.INIT_PY
     assert "2.11.0" in bridge.INIT_PY
+
+
+# playlist_bridge behavior: the real server package is not installed in this
+# test environment, so exec the plugin's class body onto stand-ins for the
+# handful of server names it actually touches at runtime, same technique as
+# _library_trash_provider above. Annotations are postponed (the plugin
+# itself carries `from __future__ import annotations`) so server-only types
+# used only as type hints (Playlist, MusicProvider, BackgroundTask) never
+# need real stand-ins; only names used in executable statements do.
+
+
+class _StubMediaType:
+    TRACK = "track"
+    PLAYLIST = "playlist"
+
+
+class _StubMusicAssistantError(Exception):
+    pass
+
+
+class _StubProviderUnavailableError(_StubMusicAssistantError):
+    pass
+
+
+class _StubMusicProvider:
+    """Marker base so the plugin's isinstance(provider, MusicProvider) checks pass."""
+
+
+def _playlist_bridge_provider():
+    """A PlaylistBridgeProvider stand-in carrying only the plugin's own methods."""
+    import logging
+
+    body = bridge.INIT_PY.split("class PlaylistBridgeProvider(PluginProvider):\n", 1)[1]
+
+    calls: dict[str, list] = {"progress": [], "failures": [], "report": []}
+
+    def update_current_task_progress_from_index(current, total, text=None):
+        calls["progress"].append((current, total, text))
+
+    def report_current_task_failure(message):
+        calls["failures"].append(message)
+
+    def set_current_task_report(markdown):
+        calls["report"].append(markdown)
+
+    namespace = {
+        "MediaType": _StubMediaType,
+        "MusicAssistantError": _StubMusicAssistantError,
+        "ProviderUnavailableError": _StubProviderUnavailableError,
+        "InvalidDataError": _StubMusicAssistantError,
+        "MusicProvider": _StubMusicProvider,
+        "is_safe_name": lambda name: ".." not in name and "/" not in name,
+        "update_current_task_progress_from_index": update_current_task_progress_from_index,
+        "report_current_task_failure": report_current_task_failure,
+        "set_current_task_report": set_current_task_report,
+    }
+    exec("from __future__ import annotations\n\nclass Ctl:\n" + body, namespace)  # noqa: S102
+    ctl = namespace["Ctl"]()
+    ctl.logger = logging.getLogger("test")
+    ctl.translation_owner = "provider.playlist_bridge"
+    return ctl, calls
+
+
+class _Mapping:
+    def __init__(self, provider_domain: str, provider_instance: str, item_id: str = "x") -> None:
+        self.provider_domain = provider_domain
+        self.provider_instance = provider_instance
+        self.item_id = item_id
+
+
+class _Playlist:
+    def __init__(self, item_id, name, mappings, is_dynamic=False) -> None:
+        self.item_id = item_id
+        self.name = name
+        self.provider_mappings = mappings
+        self.is_dynamic = is_dynamic
+
+
+class _Track:
+    def __init__(self, provider_mappings) -> None:
+        self.provider_mappings = provider_mappings
+
+
+class _BuiltinProvider(_StubMusicProvider):
+    """Stands in for self.mass.get_provider("builtin") in _migrate_playlist."""
+
+    def __init__(self) -> None:
+        self.removed: list[tuple] = []
+
+    async def import_playlist(self, m3u_data):
+        return _Playlist("matched-1", "Matched", [])
+
+    async def match_imported_playlist_tracks(self, item_id, instance_ids):
+        return None
+
+    async def library_remove(self, item_id, media_type):
+        self.removed.append((item_id, media_type))
+        return True
+
+
+class _Destination:
+    def __init__(self, instance_id="spotify1", name="Spotify", fail=False) -> None:
+        self.instance_id = instance_id
+        self.name = name
+        self.fail = fail
+
+    async def add_playlist_tracks(self, item_id, track_ids):
+        if self.fail:
+            raise _StubMusicAssistantError("destination rejected tracks")
+
+
+class _MigratePlaylistsController:
+    """The self.mass.music.playlists surface _migrate_playlist calls."""
+
+    def __init__(self, tracks_for_matched) -> None:
+        self._tracks_for_matched = tracks_for_matched
+
+    async def export_playlist(self, item_id):
+        return f"m3u:{item_id}"
+
+    async def create_playlist(self, name, media_types, instance_id):
+        return _Playlist("new-1", name, [_Mapping("spotify", instance_id, "new-item-1")])
+
+    async def tracks(self, item_id, provider):
+        for track in self._tracks_for_matched:
+            yield track
+
+
+def _migrate_mass(builtin, playlists_controller):
+    music = type("Music", (), {"playlists": playlists_controller})()
+    return type("Mass", (), {"music": music, "get_provider": lambda self, domain: builtin if domain == "builtin" else None})()
+
+
+def test_migrate_playlist_removes_throwaway_builtin_playlist_on_success() -> None:
+    import asyncio
+
+    builtin = _BuiltinProvider()
+    matched_track = _Track([_Mapping("spotify", "spotify1", "dest-track-1")])
+    ctl, _calls = _playlist_bridge_provider()
+    ctl.mass = _migrate_mass(builtin, _MigratePlaylistsController([matched_track]))
+
+    playlist = _Playlist("10", "My Playlist", [])
+    destination = _Destination()
+
+    asyncio.run(ctl._migrate_playlist(playlist, destination, "My Playlist"))
+
+    # the throwaway builtin copy used only to run the matching pipeline must
+    # not leak an orphaned .m3u file behind a successful migration
+    assert builtin.removed == [("matched-1", _StubMediaType.PLAYLIST)]
+
+
+def test_migrate_playlist_removes_throwaway_builtin_playlist_when_migration_raises() -> None:
+    import asyncio
+
+    builtin = _BuiltinProvider()
+    matched_track = _Track([_Mapping("spotify", "spotify1", "dest-track-1")])
+    ctl, _calls = _playlist_bridge_provider()
+    ctl.mass = _migrate_mass(builtin, _MigratePlaylistsController([matched_track]))
+
+    playlist = _Playlist("10", "My Playlist", [])
+    destination = _Destination(fail=True)
+
+    with pytest.raises(_StubMusicAssistantError, match="rejected the migrated tracks"):
+        asyncio.run(ctl._migrate_playlist(playlist, destination, "My Playlist"))
+
+    # cleanup must still run (via finally) even though the migration itself raised
+    assert builtin.removed == [("matched-1", _StubMediaType.PLAYLIST)]
+
+
+class _ArchivePlaylistsController:
+    """The self.mass.music.playlists surface _archive_playlists calls."""
+
+    def __init__(self, playlists, fail_item_ids: set[str] | None = None) -> None:
+        self._playlists = playlists
+        self._fail_item_ids = fail_item_ids or set()
+        self.exported: list[str] = []
+        self.imported: list[tuple[str, bool]] = []
+
+    async def iter_library_items(self):
+        for playlist in self._playlists:
+            yield playlist
+
+    async def export_playlist(self, item_id):
+        self.exported.append(item_id)
+        if item_id in self._fail_item_ids:
+            raise _StubMusicAssistantError(f"item {item_id} failed")
+        return f"m3u:{item_id}"
+
+    async def import_playlist(self, m3u_data, library_matching=False):
+        self.imported.append((m3u_data, library_matching))
+        return _Playlist(f"new-{m3u_data}", m3u_data, [])
+
+
+def _archive_provider(playlists, fail_item_ids=None):
+    ctl, calls = _playlist_bridge_provider()
+    controller = _ArchivePlaylistsController(playlists, fail_item_ids)
+    ctl.mass = type("Mass", (), {"music": type("Music", (), {"playlists": controller})()})()
+    return ctl, controller, calls
+
+
+def test_archive_playlists_skips_dynamic_builtin_only_mismatched_and_already_archived() -> None:
+    import asyncio
+
+    playlists = [
+        _Playlist("1", "Dynamic Mix", [_Mapping("spotify", "spotify1")], is_dynamic=True),
+        _Playlist("2", "Local Copy", [_Mapping("builtin", "builtin")]),
+        _Playlist("3", "Apple Playlist", [_Mapping("apple_music", "apple1")]),
+        _Playlist("4", "Already Archived", [_Mapping("spotify", "spotify1")]),
+        _Playlist("5", "Already Archived", [_Mapping("builtin", "builtin")]),
+        _Playlist("6", "New Playlist", [_Mapping("spotify", "spotify1")]),
+    ]
+    ctl, controller, calls = _archive_provider(playlists)
+
+    asyncio.run(ctl._archive_playlists("spotify"))
+
+    # only playlist 6 is spotify-sourced, not dynamic, not builtin-only, and
+    # its name is not already a builtin playlist (playlist 4 shares its name
+    # with builtin playlist 5, so it is skipped as already archived; playlist
+    # 5 itself is also builtin-only, so the builtin-only count is 2: playlists
+    # 2 and 5)
+    assert controller.exported == ["6"]
+    assert len(controller.imported) == 1
+    assert controller.imported[0][1] is False  # library_matching=False
+    report = calls["report"][-1]
+    assert "Archived: 1" in report
+    assert "Skipped (dynamic): 1" in report
+    assert "Skipped (builtin-only): 2" in report
+    assert "Skipped (provider mismatch): 1" in report
+    assert "Skipped (already archived): 1" in report
+    assert "Failed: 0" in report
+
+
+def test_archive_playlists_reports_a_failure_and_continues() -> None:
+    import asyncio
+
+    playlists = [
+        _Playlist("1", "Bad Playlist", [_Mapping("spotify", "spotify1")]),
+        _Playlist("2", "Good Playlist", [_Mapping("spotify", "spotify1")]),
+    ]
+    ctl, controller, calls = _archive_provider(playlists, fail_item_ids={"1"})
+
+    # a single bad playlist must not abort the run: the second is still archived
+    asyncio.run(ctl._archive_playlists(None))
+
+    assert controller.exported == ["1", "2"]
+    assert len(controller.imported) == 1
+    assert calls["failures"] == ["Bad Playlist: item 1 failed"]
+    report = calls["report"][-1]
+    assert "Archived: 1" in report
+    assert "Failed: 1" in report
+    assert "Bad Playlist" in report
+
+
+def test_archive_playlists_task_id_is_deterministic_for_source_provider() -> None:
+    import asyncio
+
+    ctl, _calls = _playlist_bridge_provider()
+    captured = []
+
+    class _Tasks:
+        def run_background_task(self, **kwargs):
+            captured.append(kwargs)
+            return kwargs
+
+    ctl.mass = type("Mass", (), {"tasks": _Tasks()})()
+
+    asyncio.run(ctl.archive_playlists("spotify"))
+    asyncio.run(ctl.archive_playlists("spotify"))
+    asyncio.run(ctl.archive_playlists(None))
+
+    # same source_provider -> same task id, so a double-click is deduped by
+    # the tasks controller instead of starting a second overlapping run
+    assert captured[0]["task_id"] == captured[1]["task_id"] == "playlist_bridge_archive_spotify"
+    assert captured[2]["task_id"] == "playlist_bridge_archive_all"
+    # a long bulk job must never jump ahead of interactive tasks
+    assert captured[0].get("priority", False) is False
 
 
 def test_playlist_bridge_main_writes_once_and_is_idempotent(tmp_path: Path) -> None:
