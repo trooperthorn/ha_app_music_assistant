@@ -366,7 +366,9 @@ class LibraryEnrichmentProvider(PluginProvider):
         result["omitted_count"] = job["source_count"] - job["projected_count"]
         if job["state"] == "applied" and result["omitted_count"]:
             result["state"] = "partial"
-        result["retryable"] = False
+        # A failed state is only written before external playlist creation began.
+        # Once creation starts, every error is uncertain and must be reconciled.
+        result["retryable"] = job["state"] == "failed"
         result["destination"] = None
         if job.get("destination_item_id"):
             result["destination"] = {"item_id": job["destination_item_id"], "provider_instance": "library",
