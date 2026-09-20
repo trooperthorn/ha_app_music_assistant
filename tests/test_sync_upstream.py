@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -150,6 +151,17 @@ def test_server_frontend_pin_extracts_the_version(monkeypatch: pytest.MonkeyPatc
     pyproject = 'dependencies = [\n  "aiohttp==3.14.3",\n  "music-assistant-frontend==2.17.297",\n]\n'
     monkeypatch.setattr(sync, "fetch", lambda url, **kw: pyproject)
     assert sync.server_frontend_pin("2.10.3") == "2.17.297"
+
+
+def test_latest_release_uses_version_order_not_github_creation_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    releases = [
+        {"tag_name": "v2026.09.20.9", "draft": False, "prerelease": False},
+        {"tag_name": "v2026.09.20.11", "draft": False, "prerelease": False},
+        {"tag_name": "v2026.09.20.12", "draft": True, "prerelease": False},
+        {"tag_name": "not-a-release", "draft": False, "prerelease": False},
+    ]
+    monkeypatch.setattr(sync, "fetch", lambda url, **kw: json.dumps(releases))
+    assert sync.latest_release("owner/repo", sync.FORK_TAG.match)["tag_name"] == "v2026.09.20.11"
 
 
 def test_server_frontend_pin_is_empty_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
