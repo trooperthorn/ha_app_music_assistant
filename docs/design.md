@@ -72,6 +72,16 @@ Anchor patches:
   and on disk streams from Spotify even from the Filesystem listing. The
   fork frontend's library manager sends such uris for a listing narrowed to
   one source.
+  A caller that requires local playback prefixes a direct play uri with
+  `local-only:`. A builtin M3U entry uses
+  `#EXTPROV:local_only||<provider-instance>` because server 2.10.4 parses the
+  raw path but reconstructs playlist tracks from their provider mappings,
+  so a path prefix alone is not preserved into queue loading. Both forms set
+  `extra_attributes.strict_provider` on the resulting queue item. The named
+  provider must be loaded, available, and non-streaming; initial selection,
+  cached details, and capacity retries stay inside that instance/domain, and
+  provider-match discovery is disabled. Invalid or unserviceable strict
+  requests fail instead of widening to a streaming provider.
 - `sendspin_opus_bitrate.py`: a per-player `sendspin_opus_bitrate` setting
   (bits per second, 0 for the encoder default) for Sendspin players. It
   edits aiosendspin as well as the server: the Opus encoder applies the

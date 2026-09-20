@@ -123,16 +123,89 @@ def test_steer_marks_queue_items_and_prefers_their_provider() -> None:
     loader_tree = ast.parse(loader)
     names = {node.name for node in ast.walk(loader_tree) if isinstance(node, ast.FunctionDef)}
     assert "_play_source_steer" in names
+    assert "_play_source_provider" in names
     # the request's uri is read before it resolves to the library item
-    assert loader.index("steer_uri = item if isinstance(item, str) else None") < loader.index(
-        "media_item = await self.mass.music.get_item_by_uri(item)"
+    assert loader.index("steer_uri, strict_provider = self._play_source_steer(item)") < loader.index(
+        "media_item = await self.mass.music.get_item_by_uri(steer_uri)"
     )
     assert 'queue_item.extra_attributes["preferred_provider"] = steer_provider' in loader
+    assert 'queue_item.extra_attributes["strict_provider"] = steer_provider' in loader
     # the streams side puts it ahead of the quality order, before the user's filter
     assert "preferred_providers = [steer, *preferred_providers]" in audio
     assert audio.index("preferred_providers = [steer, *preferred_providers]") < audio.index(
         "candidates = self._get_streamdetail_candidates("
     )
+    # strict applies to initial candidates, cached details, capacity retry candidates,
+    # and disables on-demand cross-provider matching.
+    assert "# strict plays may never reuse details from another provider" in audio
+    assert "and not strict_stream_provider.is_streaming_provider" in audio
+    assert "if not provider.is_streaming_provider" in audio
+    assert "not strict_provider  # trooperthorn: play_source_steer" in audio
+    assert "Local-only provider {strict_provider!r} cannot serve" in audio
+
+
+@requires_py314
+def test_strict_steer_contract_rejects_bad_targets_and_consumes_m3u_marker() -> None:
+    loader = steer.apply(QUEUE_LOADER.read_text(encoding="utf-8"), steer.EDITS[steer.QUEUE_LOADER])
+    tree = ast.parse(loader)
+    methods = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_play_source_steer", "_play_source_provider"}
+    }
+    source = "from __future__ import annotations\nclass Ctl:\n" + "\n".join(
+        "\n".join(f"    {line}" if line else "" for line in ast.unparse(methods[name]).splitlines())
+        for name in ("_play_source_steer", "_play_source_provider")
+    )
+
+    class InvalidDataError(Exception):
+        pass
+
+    namespace = {"InvalidDataError": InvalidDataError}
+    exec(source, namespace)  # noqa: S102
+    ctl = namespace["Ctl"]()
+
+    class Provider:
+        def __init__(self, instance_id, domain, *, available=True, streaming=False):
+            self.instance_id = instance_id
+            self.domain = domain
+            self.available = available
+            self.is_streaming_provider = streaming
+
+    local = Provider("filesystem_local--abc", "filesystem_local")
+    spotify = Provider("spotify--abc", "spotify", streaming=True)
+    unavailable = Provider("filesystem_local--gone", "filesystem_local", available=False)
+    providers = {item.instance_id: item for item in (local, spotify, unavailable)}
+    providers["filesystem_local"] = local
+    ctl.mass = type(
+        "Mass", (), {"get_provider": lambda self, key, return_unavailable=False: providers.get(key)}
+    )()
+
+    uri = "filesystem_local--abc://track/Music/example.flac"
+    assert ctl._play_source_steer(f"local-only:{uri}") == (uri, "filesystem_local--abc")
+    assert ctl._play_source_provider(uri, "filesystem_local--abc") == "filesystem_local--abc"
+    assert ctl._play_source_provider(uri, "filesystem_local") == "filesystem_local"
+    # Ordinary source steering still accepts streaming providers and remains a preference.
+    assert ctl._play_source_provider("spotify--abc://track/1", None) == "spotify--abc"
+    with pytest.raises(InvalidDataError, match="expected local-only:<provider-uri>"):
+        ctl._play_source_steer("local-only:garbage")
+    with pytest.raises(InvalidDataError, match="unavailable or is a streaming provider"):
+        ctl._play_source_provider("spotify--abc://track/1", "spotify--abc")
+    with pytest.raises(InvalidDataError, match="unavailable or is a streaming provider"):
+        ctl._play_source_provider(uri, "filesystem_local--gone")
+
+    class Mapping:
+        def __init__(self, domain, item_id, instance=""):
+            self.provider_domain = domain
+            self.provider_instance = instance
+            self.item_id = item_id
+
+    marker = Mapping("local_only", "filesystem_local--abc")
+    real = Mapping("filesystem_local", "Music/example.flac", "filesystem_local--abc")
+    item = type("Item", (), {"uri": uri, "provider_mappings": {marker, real}})()
+    assert ctl._play_source_steer(item) == (uri, "filesystem_local--abc")
+    assert item.provider_mappings == {real}
 
 
 def test_steer_is_idempotent_and_refuses_a_moved_module() -> None:

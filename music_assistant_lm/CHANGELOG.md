@@ -3,6 +3,10 @@
 ## 2026-09-20
 
 - Fork frontend v2026.09.20.4 -> v2026.09.20.5
+- Library Enrichment adds revisioned per-subscription playback policies and an
+  explicit preview/apply workflow for durable builtin playback projections,
+  including approved-local selection, visible fallback gaps, and fail-closed
+  `local_only` provider signaling.
 - Fork frontend v2026.09.20.3 -> v2026.09.20.4
 - Library Enrichment can review existing merged library-backed mappings as
   local-match candidates and retain revisioned approvals and rejections without

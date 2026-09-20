@@ -147,6 +147,18 @@ names, keeps it on the queue items as `extra_attributes.preferred_provider`
 the queue), and puts it ahead of the quality order at stream time. The
 frontend only has to name the source's own item in the uri it sends.
 
+Phase 4 adds an explicit strict form without a global or per-user setting.
+Direct callers send `local-only:<provider-uri>`. Builtin M3U producers put
+`#EXTPROV:local_only||<provider-instance>` immediately before the entry's
+normal provider directives and path. The separate M3U form is required by
+the pinned 2.10.4 load path: `parse_m3u` preserves the raw path, but builtin
+playlist retrieval reconstructs the returned media item from `#EXTPROV`
+mappings, so the raw prefix does not reach `queue_loader`. The sentinel
+mapping does, and `queue_loader` removes it before normal resolution. Strict
+mode rejects missing, unavailable, or streaming targets and restricts cached
+reuse, normal candidates, and stream-capacity retry to the named non-streaming
+instance/domain; it also disables cross-provider match discovery.
+
 ## Opus bitrate is a build-time edit of aiosendspin too (2026-09-14)
 
 Network-aware playback (Music Assistant discussion 5264) has no upstream
