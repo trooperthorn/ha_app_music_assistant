@@ -391,3 +391,110 @@ dependency shape, so no further plugin migrations are planned for now.
 
 This was step 2 of 2 of moving the remaining anchor-shaped-but-anchor-
 independent patches to plugins that started with `folder_browser.py`.
+
+## Playlist import keeps the builtin destination (2026-09-19)
+
+`TODO.md` item 3a asked whether Spotify playlist import should target a
+"local playlist file on the filesystem" rather than a builtin playlist,
+on the assumption that a builtin playlist is a database row. That
+assumption was wrong, and the research below replaces it.
+
+A builtin playlist already is a file on disk. `BuiltinProvider.loaded_in_mass`
+sets `_playlists_dir` to `<storage_path>/playlists` and every mutation goes
+through `_write_m3u_file`, which writes `<playlist_id>.m3u` there;
+`get_library_playlists` enumerates the directory with `os.listdir` and treats
+each `*.m3u` filename as a playlist id. This app runs the server with
+`--data-dir /data`, so builtin playlists are `/data/playlists/*.m3u`, inside
+the persisted volume and covered by the app backup (nothing under
+`playlists/` is in `config.yaml`'s `backup_exclude`). Storing playlists as
+JSON under the provider config is legacy and only read by the one-way
+`_migrate_playlists` migration. Server 2.11.0b2 keeps the same layout, so
+this is not a 2.10.x-only detail.
+
+The real difference between the two destinations is what the M3U path line
+holds, and what may go in it at all. Builtin writes a Music Assistant URI
+(`media_item_to_playlist_item` builds it with `create_uri`) plus `#EXTMA`
+carrying ISRC and MusicBrainz recording id, and `#EXTPROV` per provider
+mapping. `filesystem_local.add_playlist_tracks` instead appends the provider
+item id verbatim, which for that provider is a base-relative file path, with
+a plain `#EXTINF` line and nothing else.
+
+That makes the filesystem destination unusable for the case that motivated
+the question. Its `add_playlist_tracks` resolves each id through
+`get_track(file_path)`, so an entry can only be a track that exists as a
+local file. A Spotify playlist is precisely the case where most tracks do
+not, so a filesystem destination could hold only the subset already owned
+locally.
+
+The filesystem destination is also fragile in ways the builtin one is not.
+A filesystem track's identity is its `relative_path` and its checksum is
+only `str(int(st_mtime))`, with no content hash, so a move is seen as one
+delete plus one add; `_process_deletions` then calls
+`remove_item_from_library` on the old path, destroying the library row along
+with its provider mappings and playlog, and cascading into album and artist
+cleanup. A playlist entry that no longer resolves raises inside
+`_parse_playlist_line`, is caught, logged, and skipped silently with no
+placeholder. `get_playlist_tracks` caches its result for a year keyed on the
+playlist file's own mtime, so moving a track does not invalidate the cached
+listing. `remove_playlist_tracks` rebuilds the file from scratch as
+`#EXTM3U` plus `#EXTINF` and path pairs, discarding comments, `#PLAYLIST`
+and every extension tag. `create_playlist` always writes to the provider
+root, and `get_playlist` forces `is_editable` false for any playlist outside
+it. On the cloud and WebDAV providers `write_access` never becomes true, so
+playlists there are read-only.
+
+By contrast the builtin destination repairs itself. Matching stores ISRC and
+MusicBrainz id, `_resolve_playlist_item` rebuilds from stored metadata and
+falls back to a library lookup, and a scheduled pass re-enriches unresolved
+or outdated entries every 24 hours. Its orphan drop is narrow: it fires only
+for a path containing none of `/`, `\` or `:`, which is leftover text from a
+value that once held a line break, never a track that merely failed to
+match. An unmatched track therefore survives with its metadata and is
+retried.
+
+Decision: playlist import keeps the builtin destination and nothing is built
+for it, because the capability the item asked for already exists. The
+filesystem destination is rejected rather than deferred. Beyond the reasons
+above, `playlist_bridge._resolve_destination` already refuses any
+destination that is neither `builtin` nor a streaming provider, and server
+2.11.0b2's own `migrate_playlist` carries the identical guard, so building a
+filesystem destination would mean diverging from upstream permanently on a
+decision upstream made twice.
+
+Two genuine gaps were found while answering this, both recorded in `TODO.md`
+rather than built, because each needs a product call first.
+
+The first is portability. Both the builtin M3U files and
+`music/playlists/export_playlist` emit Music Assistant URIs through the same
+`media_item_to_playlist_item` and `generate_m3u` pair, so neither is readable
+by an external player. That, not the destination, is what "sync to another
+tool" actually needs, and it is a smaller change: rewrite path lines to real
+file paths for tracks that carry a filesystem provider mapping, and report
+the tracks that had to be omitted.
+
+The second is that import matching is a fallback, not a preference.
+`match_imported_playlist_tracks` only considers an entry when
+`self.mass.get_provider(prov_instance)` returns nothing for the URI's own
+provider, so with Spotify configured a Spotify entry is never re-resolved to
+a local file. The `match_providers` argument, which this fork's frontend
+already passes, filters which providers are searched once that fallback
+triggers; it cannot express "prefer local even though the source provider
+works". Where several providers match the same ISRC, the winner is whichever
+`get_unique_providers()` yields first, which is not something this fork
+controls. Closing this would suit a `playlist_bridge` command that
+re-resolves a playlist after import, since that needs no server edit.
+
+A separate SQLite database for import provenance was considered and
+deferred. It is feasible and would fit the extension points: `aiosqlite` is
+already a server dependency, so it would add no requirement, and
+`<storage_path>/<domain>/` is the established place for provider-owned state
+(the spotify, sendspin, ai_radio, smart_playlist and sonic_similarity
+providers all keep files there), which also means it would land in `/data`
+and be backed up. It would have to be its own file rather than a table in
+`library.db`, because a failed library migration removes that database and
+recreates it empty, and a user-facing action resets it too. It was deferred
+because most of what it would buy already exists: unmatched entries persist
+with their ISRC and MusicBrainz id and are retried every 24 hours. What it
+would genuinely add is provenance, idempotent re-sync and match auditing,
+which only pay for themselves if recurring incremental re-sync from a
+streaming provider is wanted. Revisit it then, not before.
