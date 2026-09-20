@@ -209,6 +209,7 @@ class LibraryEnrichmentProvider(PluginProvider):
                     user_id=user.user_id,
                     allow_retry=False,
                     allow_cancel=True,
+                    priority=True,
                 )
             except Exception:
                 await asyncio.to_thread(self._store.fail_capture, job_id, "Unable to schedule capture")
@@ -278,7 +279,49 @@ class LibraryEnrichmentProvider(PluginProvider):
 
     async def status(self) -> dict[str, Any]:
         self._authorize()
-        return await self._read_store(lambda: {"subscriptions": self._store.list_subscriptions(), "jobs": self._store.list_jobs()})
+        async with self._write_lock:
+            if self._closing:
+                raise InvalidDataError("Archive provider is stopping")
+            jobs = await self._store_operation(self._store.list_jobs)
+            for job in jobs:
+                task = self._capture_task(job["id"])
+                job["task_status"] = getattr(getattr(task, "status", None), "value", getattr(task, "status", None))
+                started_at = getattr(task, "started_at", None)
+                job["task_started_at"] = started_at.isoformat() if started_at is not None else None
+                if job["state"] == "pending" and job["id"] in self._jobs and job["task_status"] not in (
+                    "idle",
+                    "pending",
+                    "running",
+                ):
+                    await self._store_operation(self._store.fail_capture, job["id"], "Capture task stopped before completion")
+                    self._jobs.discard(job["id"])
+                    self._stopping_jobs.discard(job["id"])
+            if any(job["state"] == "pending" and job["task_status"] not in ("idle", "pending", "running") for job in jobs):
+                jobs = await self._store_operation(self._store.list_jobs)
+                for job in jobs:
+                    task = self._capture_task(job["id"])
+                    job["task_status"] = getattr(getattr(task, "status", None), "value", getattr(task, "status", None))
+                    started_at = getattr(task, "started_at", None)
+                    job["task_started_at"] = started_at.isoformat() if started_at is not None else None
+            subscriptions = await self._store_operation(self._store.list_subscriptions)
+            return {"subscriptions": subscriptions, "jobs": jobs}
+
+    def _capture_task(self, job_id: str):
+        try:
+            return self.mass.tasks.get_task(f"library_enrichment_{job_id}")
+        except InvalidDataError:
+            return None
+
+    @staticmethod
+    async def _store_operation(method, *args):
+        operation = asyncio.create_task(asyncio.to_thread(method, *args))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            try:
+                await operation
+            finally:
+                raise asyncio.CancelledError from None
 
     async def archive_version(self, version_id: str) -> dict[str, Any]:
         self._authorize()
@@ -292,15 +335,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         async with self._write_lock:
             if self._closing:
                 raise InvalidDataError("Archive provider is stopping")
-            operation = asyncio.create_task(asyncio.to_thread(method, *args))
-            try:
-                return await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                # Do not let unload close a connection still queued in the thread pool.
-                try:
-                    await operation
-                finally:
-                    raise asyncio.CancelledError from None
+            return await self._store_operation(method, *args)
 
     async def cancel(self, job_id: str) -> dict[str, Any]:
         self._authorize()

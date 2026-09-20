@@ -62,10 +62,18 @@ def plugin(monkeypatch, tmp_path):
     spotify = types.SimpleNamespace(instance_id="spotify-a", domain="spotify", available=True)
     handlers = []
     registered = []
+    tasks = {}
 
     def schedule(**kwargs):
         handlers.append(kwargs)
-        return types.SimpleNamespace(id=kwargs["task_id"])
+        task = types.SimpleNamespace(id=kwargs["task_id"], status="pending", started_at=None)
+        tasks[task.id] = task
+        return task
+
+    def get_task(task_id):
+        if task_id not in tasks:
+            raise Error(f"Task {task_id} not found")
+        return tasks[task_id]
 
     controller = types.SimpleNamespace(
         get_library_item=AsyncMock(return_value=types.SimpleNamespace(to_dict=lambda: {"external_ids": []})),
@@ -79,7 +87,11 @@ def plugin(monkeypatch, tmp_path):
             get_controller=lambda media_type: controller,
             playlists=types.SimpleNamespace(library_items=AsyncMock(return_value=[])),
         ),
-        tasks=types.SimpleNamespace(run_background_task=schedule, unregister_scheduled_task_and_wait=AsyncMock(return_value=True)),
+        tasks=types.SimpleNamespace(
+            run_background_task=schedule,
+            get_task=get_task,
+            unregister_scheduled_task_and_wait=AsyncMock(return_value=True),
+        ),
         register_api_command=lambda command, handler, required_scope: registered.append((command, required_scope)) or (lambda: None),
     )
     preview = {"account_id": "account-a", "snapshot_id": "A", "name": "Same name", "total": 3}
@@ -99,7 +111,13 @@ def plugin(monkeypatch, tmp_path):
     )
     asyncio.run(provider.handle_async_init())
     yield types.SimpleNamespace(
-        provider=provider, module=module, auth=auth, handlers=handlers, controller=controller, registered=registered
+        provider=provider,
+        module=module,
+        auth=auth,
+        handlers=handlers,
+        tasks=tasks,
+        controller=controller,
+        registered=registered,
     )
     provider._store.close()
 
@@ -148,7 +166,11 @@ def test_selected_capture_commits_real_ordered_store(plugin):
     async def run():
         result = await plugin.provider.capture("spotify-a", "playlist")
         assert plugin.handlers[0]["user_id"] == "admin"
-        assert (await plugin.provider.status())["jobs"][0]["state"] == "pending"
+        assert plugin.handlers[0]["priority"] is True
+        queued = (await plugin.provider.status())["jobs"][0]
+        assert queued["state"] == "pending"
+        assert queued["task_status"] == "pending"
+        assert queued["task_started_at"] is None
         await plugin.handlers[0]["handler"]()
         status = await plugin.provider.status()
         assert status["jobs"][0]["state"] == "committed"
@@ -156,6 +178,21 @@ def test_selected_capture_commits_real_ordered_store(plugin):
         assert len(version["occurrences"]) == 3
         assert version["occurrences"][1]["source_payload"] is None
         assert result["job_id"] not in plugin.provider._jobs
+
+    asyncio.run(run())
+
+
+def test_core_task_cancellation_reconciles_durable_pending_job(plugin):
+    async def run():
+        result = await plugin.provider.capture("spotify-a", "playlist")
+        plugin.tasks[result["task_id"]].status = "cancelled"
+
+        status = await plugin.provider.status()
+
+        assert status["jobs"][0]["state"] == "failed"
+        assert status["jobs"][0]["error"] == "Capture task stopped before completion"
+        assert result["job_id"] not in plugin.provider._jobs
+        plugin.module.capture_playlist.assert_not_called()
 
     asyncio.run(run())
 
