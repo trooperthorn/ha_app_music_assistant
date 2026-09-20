@@ -29,6 +29,7 @@ from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 
+from .itunes_xml import ITunesXMLImportError, inspect_itunes_xml
 from .spotify import SpotifyCaptureError, capture_playlist, preview_playlist
 from .store import ArchiveStore
 
@@ -55,6 +56,8 @@ class LibraryEnrichmentProvider(PluginProvider):
         self._sync_dispatcher_id = "library_enrichment_sync_dispatcher"
         self._write_lock = asyncio.Lock()
         self._store = await asyncio.to_thread(ArchiveStore, Path(self.mass.storage_path) / "library_enrichment" / "enrichment.db")
+        self._itunes_import_root = Path(self.mass.storage_path) / "library_enrichment" / "imports"
+        await asyncio.to_thread(self._itunes_import_root.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(self._store.recover_pending)
         await asyncio.to_thread(self._store.recover_sync_pending)
 
@@ -70,6 +73,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("versions", self.archive_versions),
             ("provenance", self.provenance),
             ("item_provenance", self.item_provenance),
+            ("itunes_inspect", self.itunes_inspect),
+            ("itunes_preview", self.itunes_preview),
             ("cancel", self.cancel),
             ("apply_preview", self.apply_preview),
             ("apply", self.apply),
@@ -150,6 +155,12 @@ class LibraryEnrichmentProvider(PluginProvider):
             "raw_payload_inline": False,
             "item_provenance": True,
             "item_provenance_api_version": 1,
+            "itunes_import": True,
+            "itunes_import_api_version": 1,
+            "itunes_apply": False,
+            "itunes_source_modes": ["staged_server_path"],
+            "itunes_import_directory": str(self._itunes_import_root),
+            "max_itunes_preview_page": 200,
             "inspection": "library_only_no_refresh",
             "mirror_apply": False,
             "archive_apply": True,
@@ -168,6 +179,160 @@ class LibraryEnrichmentProvider(PluginProvider):
             "audio_backup": False,
             "max_items": 10000,
             "access": "provider_configuration_administrators",
+        }
+
+    def _itunes_source_path(self, library_path: str) -> Path:
+        if not isinstance(library_path, str) or not library_path.strip():
+            raise InvalidDataError("Select an XML file in the configured iTunes import directory")
+        requested = Path(library_path.strip())
+        if not requested.is_absolute():
+            requested = self._itunes_import_root / requested
+        try:
+            resolved = requested.resolve(strict=True)
+            root = self._itunes_import_root.resolve(strict=True)
+        except OSError as err:
+            raise InvalidDataError("The staged iTunes XML file is not readable") from err
+        if not resolved.is_relative_to(root) or resolved.suffix.casefold() != ".xml" or not resolved.is_file():
+            raise InvalidDataError("iTunes imports require an XML file inside the configured import directory")
+        return resolved
+
+    @staticmethod
+    def _itunes_public_inspection(parsed: dict[str, Any], inspection_id: str, revision: int) -> dict[str, Any]:
+        return {
+            "api_version": 1,
+            "inspection_id": inspection_id,
+            "revision": revision,
+            "source_digest": parsed["source_digest"],
+            "library_path": parsed["source"]["path"],
+            "library_persistent_id": parsed["library_persistent_id"],
+            "library_date": parsed["library_date"],
+            "library_version": parsed["library_version"],
+            "tracks_total": parsed["tracks_total"],
+            "playlists_total": parsed["playlists_total"],
+            "occurrences_total": parsed["occurrence_count"],
+            "roots": parsed["roots"],
+            "warnings": parsed["warnings"],
+            "warnings_truncated": parsed["warnings_truncated"],
+            "playlists": [
+                {key: playlist.get(key) for key in (
+                    "id", "name", "parent_id", "kind", "selectable", "reason", "track_count",
+                    "duplicate_occurrence_count",
+                )}
+                for playlist in parsed["playlists"]
+            ],
+        }
+
+    async def itunes_inspect(self, library_path: str) -> dict[str, Any]:
+        """Inspect one staged legacy XML library without changing the MA library."""
+        self._authorize()
+        source = self._itunes_source_path(library_path)
+        try:
+            parsed = await asyncio.to_thread(inspect_itunes_xml, source)
+            metadata = {
+                "library_path": str(source),
+                "library_date": parsed["library_date"],
+                "library_version": parsed["library_version"],
+                "tracks_total": parsed["tracks_total"],
+                "playlists_total": parsed["playlists_total"],
+                "occurrences_total": parsed["occurrence_count"],
+                "parser_version": parsed["parser_version"],
+            }
+            staged = await self._store_operation(
+                self._store.stage_itunes_import,
+                parsed["source_digest"], parsed["library_persistent_id"], metadata, [], [],
+            )
+        except (ITunesXMLImportError, ValueError) as err:
+            raise InvalidDataError(str(err)) from None
+        return self._itunes_public_inspection(parsed, staged["inspection_id"], staged["revision"])
+
+    async def itunes_preview(
+        self, inspection_id: str, source_digest: str, path_mappings: list, playlist_ids: list[str],
+    ) -> dict[str, Any]:
+        """Persist a digest-bound preview plan; never create or update MA items."""
+        self._authorize()
+        try:
+            inspection = await self._read_store(self._store.get_itunes_import, inspection_id)
+        except KeyError:
+            raise InvalidDataError("The iTunes inspection was not found") from None
+        if inspection["source_digest"] != source_digest:
+            raise InvalidDataError("The iTunes source digest changed; inspect the library again")
+        if not isinstance(path_mappings, list) or not isinstance(playlist_ids, list):
+            raise InvalidDataError("Path mappings and playlist IDs must be lists")
+        normalized_mappings = []
+        for mapping in path_mappings:
+            if not isinstance(mapping, dict):
+                raise InvalidDataError("Path mappings must be objects")
+            source_prefix = mapping.get("source_prefix", mapping.get("source_root"))
+            target_prefix = mapping.get("target_prefix", mapping.get("target_root"))
+            provider_instance_id = mapping.get("provider_instance_id", "unbound")
+            if not all(isinstance(value, str) and value.strip() for value in (source_prefix, target_prefix)):
+                raise InvalidDataError("Each path mapping requires nonempty source and target roots")
+            if not isinstance(provider_instance_id, str) or not provider_instance_id.strip():
+                raise InvalidDataError("A path mapping provider instance must be a nonempty string")
+            normalized_mappings.append({
+                "source_prefix": source_prefix,
+                "target_prefix": target_prefix,
+                "provider_instance_id": provider_instance_id,
+            })
+        source = self._itunes_source_path(inspection["source_metadata"]["library_path"])
+        try:
+            parsed = await asyncio.to_thread(inspect_itunes_xml, source, path_mappings=normalized_mappings)
+        except ITunesXMLImportError as err:
+            raise InvalidDataError(str(err)) from None
+        if parsed["source_digest"] != source_digest:
+            raise InvalidDataError("The iTunes XML changed after inspection")
+        by_id = {playlist["id"]: playlist for playlist in parsed["playlists"]}
+        if (
+            not all(isinstance(item, str) and item in by_id and by_id[item]["selectable"] for item in playlist_ids)
+            or len(playlist_ids) != len(set(playlist_ids))
+            or not playlist_ids
+        ):
+            raise InvalidDataError("Select one or more unique importable playlists")
+        selected = [by_id[item] for item in playlist_ids]
+        counts = {"matched": 0, "unresolved": 0, "ambiguous": 0, "unsupported": 0}
+        for playlist in selected:
+            for occurrence in playlist["occurrences"]:
+                if occurrence["state"] == "unsupported":
+                    counts["unsupported"] += 1
+                elif occurrence["state"] != "track" or occurrence["path"]["state"] != "mapped":
+                    counts["unresolved"] += 1
+                else:
+                    counts["matched"] += 1
+        preview_seed = json.dumps(
+            {
+                "source_digest": source_digest,
+                "path_mappings": path_mappings,
+                "playlist_ids": playlist_ids,
+                "snapshots": [playlist["snapshot_id"] for playlist in selected],
+                "counts": counts,
+            }, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        )
+        preview_digest = hashlib.sha256(preview_seed.encode()).hexdigest()
+        preview = {
+            **counts,
+            "selected_playlists": len(selected),
+            "source_tracks": parsed["tracks_total"],
+            "selected_occurrences": sum(playlist["occurrence_count"] for playlist in selected),
+        }
+        try:
+            staged = await self._store_operation(
+                self._store.stage_itunes_import,
+                source_digest, parsed["library_persistent_id"], inspection["source_metadata"],
+                path_mappings, playlist_ids,
+            )
+            recorded = await self._store_operation(
+                self._store.record_itunes_import_preview,
+                staged["inspection_id"], staged["revision"], preview_digest, preview,
+            )
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+        return {
+            "api_version": 1,
+            "inspection_id": recorded["inspection_id"],
+            "revision": recorded["revision"],
+            "source_digest": source_digest,
+            "preview_digest": preview_digest,
+            **preview,
         }
 
     async def inspect(self, media_type: str, library_item_id: str) -> dict[str, Any]:

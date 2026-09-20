@@ -483,6 +483,7 @@ def test_unauthorized_archive_and_inspection_calls_are_denied(plugin, user):
         plugin.provider.cancel("unknown"),
         plugin.provider.match_review("unknown"),
         plugin.provider.set_match_decision("unknown", "source", 0, "clear"),
+        plugin.provider.itunes_inspect("missing.xml"),
     ):
         with pytest.raises(Exception, match="permission"):
             asyncio.run(coroutine)
@@ -493,8 +494,64 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 25
+    assert len(plugin.registered) == 27
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
+
+
+def _write_itunes_xml(plugin):
+    source = plugin.provider._itunes_import_root / "legacy.xml"
+    source.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'
+        '<key>Library Persistent ID</key><string>LIBRARY</string>'
+        '<key>Tracks</key><dict><key>1</key><dict>'
+        '<key>Persistent ID</key><string>TRACK</string><key>Name</key><string>Song</string>'
+        '<key>Kind</key><string>MPEG audio file</string>'
+        '<key>Location</key><string>file://localhost/G:/Music/Artist/Song.mp3</string>'
+        '</dict></dict><key>Playlists</key><array><dict>'
+        '<key>Name</key><string>Favorites</string><key>Playlist Persistent ID</key><string>PLAYLIST</string>'
+        '<key>Playlist Items</key><array><dict><key>Track ID</key><integer>1</integer></dict></array>'
+        '</dict></array></dict></plist>',
+        encoding="utf-8",
+    )
+    return source
+
+
+def test_itunes_inspect_and_preview_are_staged_digest_bound_and_do_not_write_library(plugin):
+    source = _write_itunes_xml(plugin)
+
+    async def run():
+        capabilities = await plugin.provider.capabilities()
+        assert capabilities["itunes_import"] is True and capabilities["itunes_apply"] is False
+        inspected = await plugin.provider.itunes_inspect(source.name)
+        assert inspected["tracks_total"] == 1 and inspected["playlists_total"] == 1
+        assert inspected["playlists"][0]["id"] == "PLAYLIST"
+        preview = await plugin.provider.itunes_preview(
+            inspected["inspection_id"], inspected["source_digest"],
+            [{"source_root": "G:/Music/", "target_root": "Music"}],
+            ["PLAYLIST"],
+        )
+        assert preview["matched"] == 1 and preview["unresolved"] == 0
+        assert preview["selected_playlists"] == 1 and len(preview["preview_digest"]) == 64
+        assert plugin.provider._store.get_itunes_import(preview["inspection_id"])["status"] == "previewed"
+
+    asyncio.run(run())
+    plugin.controller.get.assert_not_called()
+
+
+def test_itunes_import_rejects_paths_outside_staging_and_changed_sources(plugin, tmp_path):
+    outside = tmp_path / "outside.xml"
+    outside.write_text("<plist><dict></dict></plist>", encoding="utf-8")
+    with pytest.raises(Exception, match="inside the configured import directory"):
+        asyncio.run(plugin.provider.itunes_inspect(str(outside)))
+    source = _write_itunes_xml(plugin)
+    inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    source.write_text("<plist><dict></dict></plist>", encoding="utf-8")
+    with pytest.raises(Exception, match="changed after inspection"):
+        asyncio.run(
+            plugin.provider.itunes_preview(
+                inspected["inspection_id"], inspected["source_digest"], [], ["PLAYLIST"]
+            )
+        )
 
 
 def _provenance_fixture(plugin, account="account-a"):
