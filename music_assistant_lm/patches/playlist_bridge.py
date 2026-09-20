@@ -73,7 +73,8 @@ STRINGS_JSON = """\
     "description": "Migrate a library playlist's tracks into another provider's own playlist."
   },
   "background_task": {
-    "playlist_bridge_migrate": "Migrate playlist {0} to {1}"
+    "playlist_bridge_migrate": "Migrate playlist {0} to {1}",
+    "playlist_bridge_archive": "Archive playlists ({0})"
   }
 }
 """
@@ -122,6 +123,11 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
 )
 
+from music_assistant.controllers.tasks.context import (
+    report_current_task_failure,
+    set_current_task_report,
+    update_current_task_progress_from_index,
+)
 from music_assistant.helpers.security import is_safe_name
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.models.plugin import PluginProvider
@@ -159,7 +165,12 @@ class PlaylistBridgeProvider(PluginProvider):
                 "playlist_bridge/migrate_playlist",
                 self.migrate_playlist,
                 required_scope=Scope.LIBRARY_WRITE,
-            )
+            ),
+            self.mass.register_api_command(
+                "playlist_bridge/archive_playlists",
+                self.archive_playlists,
+                required_scope=Scope.LIBRARY_WRITE,
+            ),
         ]
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -316,50 +327,174 @@ class PlaylistBridgeProvider(PluginProvider):
         # wrapper so this handler controls sequencing without polling the tasks
         # controller
         matched_playlist = await builtin.import_playlist(m3u_data)
-        await builtin.match_imported_playlist_tracks(
-            matched_playlist.item_id, [destination.instance_id]
-        )
-
-        # the destination provider's own track ids, kept as-is: a provider item_id
-        # may itself contain slashes (a filesystem provider's are relative paths),
-        # so they must never be round-tripped through a uri and split back out
-        matched_item_ids: list[str] = []
-        async for item in self.mass.music.playlists.tracks(matched_playlist.item_id, "builtin"):
-            for mapping in item.provider_mappings:
-                if mapping.provider_instance == destination.instance_id:
-                    matched_item_ids.append(mapping.item_id)
-                    break
-
-        if not matched_item_ids:
-            msg = (
-                f"No tracks in '{playlist.name}' could be matched against "
-                f"{destination.name}; nothing was migrated"
-            )
-            raise MusicAssistantError(msg)
-
-        # create_playlist is the same safe, tested path the frontend already
-        # uses for manual playlist creation (music/playlists/create_playlist)
-        new_playlist = await self.mass.music.playlists.create_playlist(
-            destination_name, [MediaType.TRACK], destination.instance_id
-        )
-        new_prov_mapping = next(
-            (m for m in new_playlist.provider_mappings if m.provider_instance == destination.instance_id),
-            None,
-        )
-        if new_prov_mapping is None:
-            msg = f"{destination.name} did not report a playlist id for the new playlist"
-            raise MusicAssistantError(msg)
-
-        # call the provider directly and await it, rather than the queued
-        # add_playlist_tracks background task, so a real per-item failure here
-        # surfaces to this task's own outcome instead of being silently
-        # swallowed by a separately-tracked task - the false-success bug this
-        # plugin exists to avoid.
         try:
-            await destination.add_playlist_tracks(new_prov_mapping.item_id, matched_item_ids)
-        except MusicAssistantError as err:
-            msg = f"{destination.name} rejected the migrated tracks: {err}"
-            raise MusicAssistantError(msg) from err
+            await builtin.match_imported_playlist_tracks(
+                matched_playlist.item_id, [destination.instance_id]
+            )
+
+            # the destination provider's own track ids, kept as-is: a provider item_id
+            # may itself contain slashes (a filesystem provider's are relative paths),
+            # so they must never be round-tripped through a uri and split back out
+            matched_item_ids: list[str] = []
+            async for item in self.mass.music.playlists.tracks(matched_playlist.item_id, "builtin"):
+                for mapping in item.provider_mappings:
+                    if mapping.provider_instance == destination.instance_id:
+                        matched_item_ids.append(mapping.item_id)
+                        break
+
+            if not matched_item_ids:
+                msg = (
+                    f"No tracks in '{playlist.name}' could be matched against "
+                    f"{destination.name}; nothing was migrated"
+                )
+                raise MusicAssistantError(msg)
+
+            # create_playlist is the same safe, tested path the frontend already
+            # uses for manual playlist creation (music/playlists/create_playlist)
+            new_playlist = await self.mass.music.playlists.create_playlist(
+                destination_name, [MediaType.TRACK], destination.instance_id
+            )
+            new_prov_mapping = next(
+                (m for m in new_playlist.provider_mappings if m.provider_instance == destination.instance_id),
+                None,
+            )
+            if new_prov_mapping is None:
+                msg = f"{destination.name} did not report a playlist id for the new playlist"
+                raise MusicAssistantError(msg)
+
+            # call the provider directly and await it, rather than the queued
+            # add_playlist_tracks background task, so a real per-item failure here
+            # surfaces to this task's own outcome instead of being silently
+            # swallowed by a separately-tracked task - the false-success bug this
+            # plugin exists to avoid.
+            try:
+                await destination.add_playlist_tracks(new_prov_mapping.item_id, matched_item_ids)
+            except MusicAssistantError as err:
+                msg = f"{destination.name} rejected the migrated tracks: {err}"
+                raise MusicAssistantError(msg) from err
+        finally:
+            # matched_playlist is a throwaway builtin copy that exists only to run
+            # the matching pipeline; without this it leaks an orphaned .m3u file
+            # in the builtin provider's playlists directory on every call. Runs
+            # whether the migration above succeeded or raised. A cleanup failure
+            # here is logged, not raised, so it never converts a successful
+            # migration into a failure and never masks a real migration error.
+            try:
+                await builtin.library_remove(matched_playlist.item_id, MediaType.PLAYLIST)
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "Failed to remove throwaway playlist %s: %s", matched_playlist.item_id, err
+                )
+
+    async def archive_playlists(self, source_provider: str | None = None) -> BackgroundTask:
+        """
+        Queue copying many library playlists into the builtin provider as local .m3u files.
+
+        This exists so a library built up on a streaming provider (with no
+        local files at all) can still have a durable, offline copy of its
+        playlist structure that survives independently of that provider.
+
+        :param source_provider: Instance id or domain of a provider to
+            archive from (e.g. "spotify"). None archives every eligible
+            library playlist regardless of provider.
+
+        Idempotent and resumable by design: a playlist is skipped when a
+        builtin playlist with its exact name already exists, so re-running
+        this command (after a partial run, a restart, or just to pick up
+        newly added playlists) only archives what is not already archived.
+        It does not detect renames, so renaming either the source or the
+        archived copy breaks that link and the next run archives it again
+        under the new name.
+
+        Matching against other providers is deliberately left off
+        (``import_playlist(..., library_matching=False)``): with hundreds of
+        playlists this would otherwise trigger tens of thousands of provider
+        searches for no benefit, since the goal here is a local copy of the
+        playlist, not a cross-provider match. Use ``migrate_playlist`` when a
+        matched copy on a specific destination provider is actually wanted.
+        """
+        return self.mass.tasks.run_background_task(
+            name=f"Archive playlists ({source_provider or 'all providers'})",
+            handler=lambda: self._archive_playlists(source_provider),
+            task_id=f"playlist_bridge_archive_{source_provider or 'all'}",
+            translation_key="playlist_bridge_archive",
+            translation_owner=self.translation_owner,
+            translation_args=[source_provider or "all providers"],
+            metadata={
+                "task_domain": "playlist_bridge_archive",
+                "source_provider": source_provider or "",
+            },
+            allow_retry=True,
+        )
+
+    async def _archive_playlists(self, source_provider: str | None) -> None:
+        """Copy eligible library playlists into the builtin provider, one at a time."""
+        # a single enumeration serves both the existing-names check and the
+        # progress total, so a large library is only scanned once
+        playlists = [item async for item in self.mass.music.playlists.iter_library_items()]
+        total = len(playlists)
+        existing_builtin_names = {
+            item.name
+            for item in playlists
+            if any(mapping.provider_domain == "builtin" for mapping in item.provider_mappings)
+        }
+
+        archived = 0
+        failed: list[str] = []
+        skipped_dynamic = 0
+        skipped_builtin_only = 0
+        skipped_provider_mismatch = 0
+        skipped_already_archived = 0
+
+        for index, playlist in enumerate(playlists):
+            # a dynamic (smart) playlist has no fixed track list to export
+            if playlist.is_dynamic:
+                skipped_dynamic += 1
+                continue
+            # never archive an archive
+            if all(mapping.provider_domain == "builtin" for mapping in playlist.provider_mappings):
+                skipped_builtin_only += 1
+                continue
+            if source_provider is not None and not any(
+                mapping.provider_domain == source_provider or mapping.provider_instance == source_provider
+                for mapping in playlist.provider_mappings
+            ):
+                skipped_provider_mismatch += 1
+                continue
+            # the idempotency/resumability rule: a prior run already archived this name
+            if playlist.name in existing_builtin_names:
+                skipped_already_archived += 1
+                continue
+
+            update_current_task_progress_from_index(index, total, f"Archiving {playlist.name}")
+            try:
+                m3u_data = await self.mass.music.playlists.export_playlist(playlist.item_id)
+                # the controller's import_playlist, not the provider's: only the
+                # controller also adds the result to the library so it shows in
+                # the UI. library_matching=False on purpose, see the docstring
+                # on archive_playlists above.
+                await self.mass.music.playlists.import_playlist(m3u_data, library_matching=False)
+            except MusicAssistantError as err:
+                # one bad playlist must never abort the run
+                report_current_task_failure(f"{playlist.name}: {err}")
+                failed.append(playlist.name)
+                continue
+            archived += 1
+
+        report_lines = [
+            "# Playlist archive summary",
+            f"- Archived: {archived}",
+            f"- Skipped (dynamic): {skipped_dynamic}",
+            f"- Skipped (builtin-only): {skipped_builtin_only}",
+            f"- Skipped (provider mismatch): {skipped_provider_mismatch}",
+            f"- Skipped (already archived): {skipped_already_archived}",
+            f"- Failed: {len(failed)}",
+        ]
+        if failed:
+            report_lines.append("")
+            report_lines.append("Failed playlists:")
+            report_lines.extend(f"- {name}" for name in failed)
+        set_current_task_report("\\n".join(report_lines))
 '''
 
 
