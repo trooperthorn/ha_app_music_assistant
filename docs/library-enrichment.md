@@ -54,6 +54,10 @@ provider before its commands are registered. It never auto-starts a capture.
   Synchronization never creates or updates a playback playlist.
 - Read-only provenance extracts a bounded, typed Spotify field set from the
   committed immutable payload without refreshing Spotify or Music Assistant.
+- That provenance read can append a version-bound snapshot of MusicBrainz
+  recording, release-track, release, release-group and ordered artist-credit
+  identities already present in the Music Assistant library. It uses only the
+  existing Spotify provider mapping and never searches or refreshes a provider.
 - Playlist item provenance links known builtin archive and playback destinations
   to their subscription, snapshots, and durable check state.
 - A staged legacy iTunes XML export can be inspected with bounded parsing and
@@ -120,7 +124,9 @@ contract and current boundary.
 
 Capabilities advertise `provenance_read`, `provenance_api_version: 1`,
 `max_provenance_page: 200`, `raw_payload_inline: false`, `item_provenance`, and
-`item_provenance_api_version: 1`. See `provenance.md` for field and state details.
+`item_provenance_api_version: 1`. `musicbrainz_identity_api_version: 1` advertises
+the additive local-library identity snapshot. See `provenance.md` for field and
+state details.
 
 Capabilities advertise `itunes_import`, `itunes_import_api_version: 1`, the
 server-side staging directory and `itunes_apply: false`. Only XML files inside

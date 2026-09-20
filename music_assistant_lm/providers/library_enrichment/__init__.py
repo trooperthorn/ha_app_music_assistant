@@ -165,6 +165,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "version_listing": True,
             "provenance_read": True,
             "provenance_api_version": 1,
+            "musicbrainz_identity_api_version": 1,
             "max_provenance_page": 200,
             "raw_payload_inline": False,
             "item_provenance": True,
@@ -800,6 +801,135 @@ class LibraryEnrichmentProvider(PluginProvider):
                         date_precision=precision),
         ]
 
+    @staticmethod
+    def _musicbrainz_identity_values(library_item: Any, fetched_at: str) -> list[dict[str, Any]]:
+        """Extract distinct MusicBrainz entities from one already-loaded MA library track."""
+        parser_version = "ma-library-identity-v1"
+
+        def value(field_name: str, state: str, observed: Any = None) -> dict[str, Any]:
+            result = {
+                "field_name": field_name,
+                "state": state,
+                "source": "music_assistant.library",
+                "fetched_at": fetched_at,
+                "parser_version": parser_version,
+            }
+            if state == "value":
+                result["value"] = observed
+            return result
+
+        field_names = (
+            "musicbrainz_recording_id",
+            "musicbrainz_release_track_id",
+            "musicbrainz_release_id",
+            "musicbrainz_release_group_id",
+            "musicbrainz_artist_credits",
+        )
+        if library_item is None:
+            return [value(name, "not_loaded") for name in field_names]
+        try:
+            item = library_item.to_dict()
+        except Exception:
+            return [value(name, "inaccessible") for name in field_names]
+        if not isinstance(item, dict):
+            return [value(name, "inaccessible") for name in field_names]
+
+        def external_id(container: Any, identity_type: str) -> tuple[str, Any]:
+            if not isinstance(container, dict):
+                return "not_loaded", None
+            if "external_ids" not in container:
+                return "missing", None
+            raw = container["external_ids"]
+            if raw is None:
+                return "not_loaded", None
+            if not isinstance(raw, (list, tuple, set, dict)):
+                return "inaccessible", None
+            pairs = raw.items() if isinstance(raw, dict) else raw
+            matches = []
+            malformed = False
+            for pair in pairs:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    malformed = True
+                    continue
+                kind, identifier = pair
+                if getattr(kind, "value", kind) != identity_type:
+                    continue
+                if isinstance(identifier, str) and identifier:
+                    if identifier not in matches:
+                        matches.append(identifier)
+                else:
+                    malformed = True
+            if matches:
+                return "value", matches[0] if len(matches) == 1 else matches
+            return ("inaccessible" if malformed else "missing"), None
+
+        album = item.get("album")
+        identities = (
+            ("musicbrainz_recording_id", item, "musicbrainz_recordingid"),
+            ("musicbrainz_release_track_id", item, "musicbrainz_trackid"),
+            ("musicbrainz_release_id", album, "musicbrainz_albumid"),
+            ("musicbrainz_release_group_id", album, "musicbrainz_releasegroupid"),
+        )
+        result = []
+        for field_name, container, identity_type in identities:
+            state, observed = external_id(container, identity_type)
+            result.append(value(field_name, state, observed))
+
+        if "artists" not in item:
+            result.append(value("musicbrainz_artist_credits", "missing"))
+        elif item["artists"] is None:
+            result.append(value("musicbrainz_artist_credits", "not_loaded"))
+        elif not isinstance(item["artists"], (list, tuple)):
+            result.append(value("musicbrainz_artist_credits", "inaccessible"))
+        elif not item["artists"]:
+            result.append(value("musicbrainz_artist_credits", "empty"))
+        else:
+            credits = []
+            for position, artist in enumerate(item["artists"]):
+                if not isinstance(artist, dict):
+                    result.append(value("musicbrainz_artist_credits", "inaccessible"))
+                    break
+                state, identifier = external_id(artist, "musicbrainz_artistid")
+                credits.append({
+                    "position": position,
+                    "name": artist.get("name") if isinstance(artist.get("name"), str) else None,
+                    "musicbrainz_artist_id": identifier,
+                    "identity_state": state,
+                })
+            else:
+                result.append(value("musicbrainz_artist_credits", "value", credits))
+        return result
+
+    @staticmethod
+    def _stale_musicbrainz_identity_values(
+        prior_overlay: dict[str, Any], fetched_at: str
+    ) -> list[dict[str, Any]]:
+        """Retain prior identity evidence while recording a failed current library read."""
+        fields = (
+            "musicbrainz_recording_id",
+            "musicbrainz_release_track_id",
+            "musicbrainz_release_id",
+            "musicbrainz_release_group_id",
+            "musicbrainz_artist_credits",
+        )
+        result = []
+        prior_fields = prior_overlay.get("fields", {})
+        for field_name in fields:
+            observation = {
+                "field_name": field_name,
+                "state": "inaccessible",
+                "source": "music_assistant.library",
+                "fetched_at": fetched_at,
+                "parser_version": "ma-library-identity-read-error-v1",
+            }
+            prior_observation = prior_fields.get(field_name, {}).get("observation")
+            if isinstance(prior_observation, dict) and prior_observation.get("state") in ("value", "stale"):
+                if prior_observation.get("value") is not None:
+                    observation["state"] = "stale"
+                    observation["value"] = prior_observation["value"]
+            result.append(observation)
+        return result
+
     async def provenance(self, version_id: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Return persisted typed provenance derived only from immutable archive JSON."""
         self._authorize()
@@ -811,10 +941,15 @@ class LibraryEnrichmentProvider(PluginProvider):
         except KeyError:
             raise InvalidDataError("Archive version was not found") from None
         occurrences = version["occurrences"]
+        requested_occurrences = occurrences[offset : offset + limit]
         # Persist each source once per request. Duplicate occurrences retain their own
         # raw references in the response while sharing the account-scoped subject.
         persisted: dict[str, dict[str, Any]] = {}
-        for occurrence in occurrences:
+        identity_fields = {
+            "musicbrainz_recording_id", "musicbrainz_release_track_id", "musicbrainz_release_id",
+            "musicbrainz_release_group_id", "musicbrainz_artist_credits",
+        }
+        for occurrence in requested_occurrences:
             source_id = occurrence.get("source_item_id")
             if not isinstance(source_id, str) or not source_id:
                 continue
@@ -823,8 +958,43 @@ class LibraryEnrichmentProvider(PluginProvider):
                 persisted[source_id] = await self._store_operation(
                     self._store.upsert_provenance_values, "spotify", subscription["account_id"], "track", source_id, values
                 )
+                scoped = await self._read_store(
+                    self._store.get_provenance_overlay,
+                    "spotify", subscription["account_id"], "track", source_id, version_id,
+                )
+                scoped_fields = scoped.get("fields", {})
+                identity_complete = identity_fields.issubset(scoped_fields) and all(
+                    scoped_fields[field_name].get("observation", {}).get("parser_version")
+                    == "ma-library-identity-v1"
+                    for field_name in identity_fields
+                )
+                if not identity_complete:
+                    fetched_at = datetime.now(UTC).isoformat()
+                    try:
+                        library_item = await self.mass.music.tracks.get_library_item_by_prov_id(
+                            source_id, subscription["provider_instance_id"]
+                        )
+                        identity_values = self._musicbrainz_identity_values(library_item, fetched_at)
+                    except Exception:
+                        prior = await self._read_store(
+                            self._store.get_provenance_overlay,
+                            "spotify", subscription["account_id"], "track", source_id,
+                        )
+                        identity_values = self._stale_musicbrainz_identity_values(prior, fetched_at)
+                    for identity_value in identity_values:
+                        identity_value["raw_reference"] = {
+                            "version_id": version_id, "position": occurrence["position"], "json_pointer": None,
+                        }
+                    await self._store_operation(
+                        self._store.upsert_provenance_values,
+                        "spotify", subscription["account_id"], "track", source_id, identity_values,
+                    )
+                persisted[source_id] = await self._read_store(
+                    self._store.get_provenance_overlay,
+                    "spotify", subscription["account_id"], "track", source_id, version_id,
+                )
         page = []
-        for occurrence in occurrences[offset : offset + limit]:
+        for occurrence in requested_occurrences:
             source_id = occurrence.get("source_item_id")
             page.append({
                 "position": occurrence["position"],

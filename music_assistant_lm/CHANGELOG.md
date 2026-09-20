@@ -8,6 +8,9 @@
 - Library Enrichment adds an admin-only API-v1 diagnostics snapshot with build
   compatibility, aggregate store/queue counts, database allocation and bounded
   recent job states while excluding identifiers, paths, payloads and raw errors.
+- Library Enrichment provenance can snapshot distinct MusicBrainz recording,
+  release-track, release, release-group and ordered artist-credit identities from
+  an existing Music Assistant library mapping without provider refreshes.
 - Fork frontend v2026.09.20.8 -> v2026.09.20.9
 - Fork frontend v2026.09.20.7 -> v2026.09.20.8
 - Legacy iTunes inspection accepts a safely staged ZIP package, including a
