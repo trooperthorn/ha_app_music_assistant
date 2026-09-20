@@ -278,6 +278,12 @@ def test_cancel_timeout_does_not_report_success_or_fail_active_job(plugin):
         assert cancelled == {"job_id": result["job_id"], "state": "stopping", "cancelled": False}
         assert (await plugin.provider.status())["jobs"][0]["state"] == "pending"
         assert result["job_id"] in plugin.provider._jobs
+        plugin.provider.mass.tasks.unregister_scheduled_task_and_wait.return_value = True
+        assert await plugin.provider.cancel(result["job_id"]) == cancelled
+        plugin.provider.mass.tasks.unregister_scheduled_task_and_wait.assert_awaited_once()
+        with pytest.raises(Exception, match="still stopping"):
+            await plugin.provider.unload()
+        assert plugin.provider._store.list_jobs()[0]["state"] == "pending"
 
     asyncio.run(run())
 

@@ -43,6 +43,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             raise InvalidDataError("Library Enrichment requires compatibility review for this server version")
         self._handles = []
         self._jobs: set[str] = set()
+        self._stopping_jobs: set[str] = set()
         self._closing = False
         self._write_lock = asyncio.Lock()
         self._store = await asyncio.to_thread(ArchiveStore, Path(self.mass.storage_path) / "library_enrichment" / "enrichment.db")
@@ -70,8 +71,11 @@ class LibraryEnrichmentProvider(PluginProvider):
             handle()
         async with self._write_lock:
             for job_id in tuple(self._jobs):
+                if job_id in self._stopping_jobs:
+                    raise InvalidDataError("Capture is still stopping; archive store left open")
                 stopped = await self.mass.tasks.unregister_scheduled_task_and_wait(f"library_enrichment_{job_id}")
                 if not stopped:
+                    self._stopping_jobs.add(job_id)
                     raise InvalidDataError("Capture is still stopping; archive store left open")
             await asyncio.to_thread(self._store.recover_pending)
             await asyncio.to_thread(self._store.close)
@@ -225,6 +229,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         except BaseException:
             await asyncio.to_thread(self._store.fail_capture, job_id, "Unable to verify initiating user")
             self._jobs.discard(job_id)
+            self._stopping_jobs.discard(job_id)
             raise
         user_token = current_user.set(user)
         impersonation_token = impersonated_user.set(None)
@@ -269,6 +274,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             raise InvalidDataError("Capture failed; previous committed archive retained") from None
         finally:
             self._jobs.discard(job_id)
+            self._stopping_jobs.discard(job_id)
 
     async def status(self) -> dict[str, Any]:
         self._authorize()
@@ -306,8 +312,13 @@ class LibraryEnrichmentProvider(PluginProvider):
     async def _cancel(self, job_id: str) -> dict[str, Any]:
         if job_id not in self._jobs:
             raise InvalidDataError("No active capture with that job ID")
+        if job_id in self._stopping_jobs:
+            return {"job_id": job_id, "state": "stopping", "cancelled": False}
         stopped = await self.mass.tasks.unregister_scheduled_task_and_wait(f"library_enrichment_{job_id}")
         if not stopped:
+            # MA unregisters before waiting. A second unregister would report True
+            # even though the first worker is still unwinding; retain that knowledge.
+            self._stopping_jobs.add(job_id)
             return {"job_id": job_id, "state": "stopping", "cancelled": False}
         try:
             await asyncio.to_thread(self._store.fail_capture, job_id, "Capture cancelled")
