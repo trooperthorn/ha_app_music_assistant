@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import types
+import zipfile
 from contextvars import ContextVar
 from enum import StrEnum
 from pathlib import Path
@@ -38,7 +39,16 @@ def plugin(monkeypatch, tmp_path):
     unset = object()
     current = ContextVar("test_current_user", default=unset)
     impersonated = ContextVar("test_impersonated_user", default=None)
+    async def authenticated_request(_request):
+        return auth.user
+    web = types.SimpleNamespace(
+        json_response=lambda payload, status=200: types.SimpleNamespace(
+            status=status,
+            text=json.dumps(payload),
+        )
+    )
     modules = {
+        "aiohttp": {"web": web},
         "music_assistant_models.auth": {"Scope": Scope},
         "music_assistant_models.background_task": {"TaskSchedule": types.SimpleNamespace(hourly=lambda **kwargs: kwargs)},
         "music_assistant_models.enums": {"MediaType": MediaType},
@@ -46,6 +56,7 @@ def plugin(monkeypatch, tmp_path):
         "music_assistant.models.plugin": {"PluginProvider": object},
         "music_assistant.controllers.webserver.helpers.auth_middleware": {
             "get_current_user": lambda: auth.user if current.get() is unset else current.get(),
+            "get_authenticated_user": authenticated_request,
             "has_scope": lambda user, scope: user.allowed and scope in getattr(user, "allowed_scopes", set(Scope)),
             "current_user": current,
             "impersonated_user": impersonated,
@@ -65,6 +76,7 @@ def plugin(monkeypatch, tmp_path):
     handlers = []
     registered = []
     scheduled = []
+    routes = []
     tasks = {}
 
     def schedule(**kwargs):
@@ -85,7 +97,10 @@ def plugin(monkeypatch, tmp_path):
     )
     provider.mass = types.SimpleNamespace(
         storage_path=str(tmp_path),
-        webserver=types.SimpleNamespace(auth=types.SimpleNamespace(get_user=AsyncMock(return_value=auth.user))),
+        webserver=types.SimpleNamespace(
+            auth=types.SimpleNamespace(get_user=AsyncMock(return_value=auth.user)),
+            register_dynamic_route=lambda path, handler, method="*": routes.append((path, method, handler)) or (lambda: None),
+        ),
         music=types.SimpleNamespace(
             providers=[spotify],
             get_controller=lambda media_type: controller,
@@ -124,6 +139,7 @@ def plugin(monkeypatch, tmp_path):
         controller=controller,
         registered=registered,
         scheduled=scheduled,
+        routes=routes,
     )
     provider._store.close()
 
@@ -541,7 +557,7 @@ def test_itunes_inspect_and_preview_are_staged_digest_bound_and_do_not_write_lib
 def test_itunes_import_rejects_paths_outside_staging_and_changed_sources(plugin, tmp_path):
     outside = tmp_path / "outside.xml"
     outside.write_text("<plist><dict></dict></plist>", encoding="utf-8")
-    with pytest.raises(Exception, match="inside the configured import directory"):
+    with pytest.raises(Exception, match="inside an advertised directory"):
         asyncio.run(plugin.provider.itunes_inspect(str(outside)))
     source = _write_itunes_xml(plugin)
     inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
@@ -552,6 +568,69 @@ def test_itunes_import_rejects_paths_outside_staging_and_changed_sources(plugin,
                 inspected["inspection_id"], inspected["source_digest"], [], ["PLAYLIST"]
             )
         )
+
+
+def test_itunes_zip_inspection_inventories_package_without_extracting_media(plugin, tmp_path):
+    zip_root = tmp_path / "media" / "music-assistant-imports"
+    zip_root.mkdir(parents=True)
+    plugin.provider._itunes_zip_root = zip_root
+    source = zip_root / "library.zip"
+    xml = _write_itunes_xml(plugin).read_bytes()
+    with zipfile.ZipFile(source, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("old/iTunes Library.xml", xml)
+        archive.writestr("old/iTunes Media/Artist/Song.mp3", b"audio")
+
+    result = asyncio.run(plugin.provider.itunes_inspect(str(source)))
+    assert result["source_kind"] == "zip"
+    assert result["package"]["media_files_total"] == 1
+    assert result["package"]["selected_xml_path"] == "old/iTunes Library.xml"
+    assert result["localization"]["state"] == "preview_only"
+    assert result["playlists"][0]["id"] == "PLAYLIST"
+    assert not any(zip_root.rglob("*.mp3"))
+
+
+def test_itunes_zip_upload_stages_xml_only_transport_for_inspection(plugin, tmp_path):
+    zip_root = tmp_path / "media" / "music-assistant-imports"
+    plugin.provider._itunes_zip_root = zip_root
+    xml = _write_itunes_xml(plugin).read_bytes()
+    package_path = tmp_path / "transport.zip"
+    with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("iTunes Library.xml", xml)
+    payload = package_path.read_bytes()
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield payload
+
+    request = types.SimpleNamespace(
+        headers={"X-Filename": "iTunes Library.zip"}, content_length=len(payload), content=Content()
+    )
+    response = asyncio.run(plugin.provider._itunes_zip_upload(request))
+    result = json.loads(response.text)
+    assert response.status == 200 and result["api_version"] == 1
+    staged = Path(result["library_path"])
+    assert staged.is_file() and staged.parent == zip_root
+    assert asyncio.run(plugin.provider.itunes_inspect(str(staged)))["tracks_total"] == 1
+
+
+def test_itunes_zip_upload_rejects_media_payload_and_cleans_partial_file(plugin, tmp_path):
+    zip_root = tmp_path / "media" / "music-assistant-imports"
+    plugin.provider._itunes_zip_root = zip_root
+    package_path = tmp_path / "transport.zip"
+    with zipfile.ZipFile(package_path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("iTunes Library.xml", _write_itunes_xml(plugin).read_bytes())
+        archive.writestr("Music/song.mp3", b"audio")
+    payload = package_path.read_bytes()
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield payload
+
+    request = types.SimpleNamespace(
+        headers={"X-Filename": "transport.zip"}, content_length=len(payload), content=Content()
+    )
+    response = asyncio.run(plugin.provider._itunes_zip_upload(request))
+    assert response.status == 400 and not list(zip_root.glob("*"))
 
 
 def _provenance_fixture(plugin, account="account-a"):

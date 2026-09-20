@@ -36,3 +36,25 @@ The next slice must verify mapped provider item IDs against available Music
 Assistant filesystem providers, expose ambiguous/missing review, require explicit
 partial consent and only then materialize selected playlists through supported
 Music Assistant APIs.
+
+## Staged ZIP packages
+
+Capabilities advertise `itunes_zip_packages`, `itunes_zip_api_version: 1`,
+`itunes_zip_upload`, its upload limit and the preferred
+`/media/music-assistant-imports` staging directory. A ZIP placed there can contain
+an XML library for comparison with media already indexed by Music Assistant.
+Inspection reads the central directory, hashes the archive, identifies one
+coherent iTunes XML export and returns a package inventory. It extracts no media.
+
+ZIP inspection rejects absolute, drive-qualified and traversal member paths;
+links and special files; encrypted entries; duplicate and case-colliding paths;
+and packages that exceed entry, member, expanded-size or compression-ratio
+limits. Multiple equally preferred XML exports require an explicit member path.
+Path mappings remain `preview_only`; no destination directory, filesystem provider
+or duplicate media file is created.
+
+The authenticated `POST /library-enrichment/itunes-upload` route accepts a raw,
+XML-only ZIP up to the advertised limit and stages it atomically under `/media`.
+It rejects media members because the upload is only a compact transport for the
+database export. Larger staged packages can still be copied into the advertised
+directory with Home Assistant file tooling, but extraction is outside this slice.
