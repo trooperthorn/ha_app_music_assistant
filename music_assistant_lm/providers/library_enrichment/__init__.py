@@ -7,6 +7,8 @@ preserve references and occurrences; they are not downloaded audio or MA mirrors
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import sqlite3
 from importlib.metadata import version
@@ -60,6 +62,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("version", self.archive_version),
             ("versions", self.archive_versions),
             ("cancel", self.cancel),
+            ("apply_preview", self.apply_preview),
+            ("apply", self.apply),
+            ("apply_status", self.apply_status),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -108,6 +113,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             "version_listing": True,
             "inspection": "library_only_no_refresh",
             "mirror_apply": False,
+            "archive_apply": True,
+            "apply_api_version": 1,
             "local_matching": False,
             "liked_songs": False,
             "audio_backup": False,
@@ -330,6 +337,122 @@ class LibraryEnrichmentProvider(PluginProvider):
     async def archive_versions(self, subscription_id: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         self._authorize()
         return await self._read_store(self._store.list_versions, subscription_id, limit, offset)
+
+    @staticmethod
+    def _projection(version):
+        """Build a playback projection without changing the historical occurrences."""
+        ids, omitted = [], []
+        for row in version["occurrences"]:
+            source_id = row.get("source_item_id")
+            if row.get("state") == "track" and isinstance(source_id, str) and re.fullmatch(r"[A-Za-z0-9]{22}", source_id):
+                ids.append(source_id)
+            else:
+                omitted.append({"position": row["position"], "state": row.get("state", "invalid")})
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", version.get("name", "") or "Spotify archive").strip()
+        name = f"{name[:120] or 'Spotify archive'} - archive {version['id'][:8]}"
+        document = {"version_id": version["id"], "name": name, "ids": ids, "omitted": omitted}
+        digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {"version_id": version["id"], "name": name, "source_count": version["total"], "projected_count": len(ids),
+                "omitted": omitted, "omitted_count": len(omitted), "projection_digest": digest,
+                "requires_partial_consent": bool(omitted)}, ids
+
+    @staticmethod
+    def _apply_result(job, version_id):
+        if job is None:
+            return {"version_id": version_id, "state": "not_applied", "retryable": True, "destination": None}
+        result = dict(job)
+        result["version_id"] = version_id
+        result["state"] = {"prepared": "pending", "creating": "applying"}.get(job["state"], job["state"])
+        result["omitted_count"] = job["source_count"] - job["projected_count"]
+        if job["state"] == "applied" and result["omitted_count"]:
+            result["state"] = "partial"
+        # A failed state is only written before external playlist creation began.
+        # Once creation starts, every error is uncertain and must be reconciled.
+        result["retryable"] = job["state"] == "failed"
+        result["destination"] = None
+        if job.get("destination_item_id"):
+            result["destination"] = {"item_id": job["destination_item_id"], "provider_instance": "library",
+                                     "uri": f"library://playlist/{job['destination_item_id']}", "name": job["requested_name"],
+                                     "builtin_provider_instance": job.get("destination_provider_instance")}
+        return result
+
+    async def apply_preview(self, version_id: str) -> dict[str, Any]:
+        """Review the exact immutable-version projection before a local playlist write."""
+        self._authorize()
+        version, job = await self._read_store(lambda: (self._store.get_version(version_id), self._store.get_apply_for_version(version_id)))
+        preview, _ = self._projection(version)
+        result = self._apply_result(job, version_id)
+        return {**preview, "already_applied": bool(job and job["state"] == "applied"), "destination": result["destination"]}
+
+    async def apply_status(self, version_id: str) -> dict[str, Any]:
+        self._authorize()
+        version, job = await self._read_store(lambda: (self._store.get_version(version_id), self._store.get_apply_for_version(version_id)))
+        return self._apply_result(job, version_id)
+
+    async def apply(self, version_id: str, expected_digest: str, allow_partial: bool = False) -> dict[str, Any]:
+        """Create one builtin playlist copy, with durable intent and no automatic uncertain retry."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Creating a playlist copy requires library write permission")
+        if type(allow_partial) is not bool:
+            raise InvalidDataError("Partial-copy consent must be a boolean")
+        async with self._write_lock:
+            if self._closing:
+                raise InvalidDataError("Archive provider is stopping")
+            operation = asyncio.create_task(self._apply_version(version_id, expected_digest, allow_partial))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # Keep lifecycle ownership until a durable outcome is known. An HTTP
+                # disconnect cannot authorize a second import or race store teardown.
+                try:
+                    await operation
+                finally:
+                    raise asyncio.CancelledError from None
+
+    async def _apply_version(self, version_id, expected_digest, allow_partial):
+        version = await asyncio.to_thread(self._store.get_version, version_id)
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)):
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        preview, ids = self._projection(version)
+        if expected_digest != preview["projection_digest"]:
+            raise InvalidDataError("Playlist projection changed; preview again")
+        if preview["requires_partial_consent"] and not allow_partial:
+            raise InvalidDataError("Explicit consent is required to omit unsupported source occurrences")
+        job = await asyncio.to_thread(self._store.prepare_apply, version_id, expected_digest, preview["source_count"],
+                                      len(ids), json.dumps(preview["omitted"]), f"archive:{version_id}", preview["name"])
+        if job["state"] != "prepared":
+            return self._apply_result(job, version_id)
+        started = False
+        try:
+            await asyncio.to_thread(self._store.mark_apply_creating, job["id"])
+            started = True
+            if ids:
+                m3u = "#EXTM3U\n#PLAYLIST:" + preview["name"] + "\n" + "".join(f"spotify://track/{item_id}\n" for item_id in ids)
+                destination = await self.mass.music.playlists.import_playlist(m3u, library_matching=False)
+            else:
+                destination = await self.mass.music.playlists.create_playlist(
+                    preview["name"], media_types=[MediaType.TRACK], provider_instance_or_domain=builtin.instance_id
+                )
+            mapping = next((m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None)
+            if mapping is None:
+                raise InvalidDataError("Created playlist has no expected builtin mapping")
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            paths = [line.strip() for line in raw.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+            if paths != [f"spotify://track/{item_id}" for item_id in ids]:
+                raise InvalidDataError("Created playlist contents differ from the approved ordered projection")
+            await asyncio.to_thread(self._store.commit_apply, job["id"], str(destination.item_id), builtin.instance_id, expected_digest)
+        except BaseException as err:
+            error = (
+                "Playlist creation outcome uncertain; inspect builtin playlists before recovery"
+                if started else "Unable to prepare playlist copy"
+            )
+            await asyncio.to_thread(self._store.fail_apply, job["id"], error, uncertain=started)
+            if isinstance(err, asyncio.CancelledError):
+                raise
+            raise InvalidDataError(error) from None
+        return self._apply_result(await asyncio.to_thread(self._store.get_apply, job["id"]), version_id)
 
     async def _read_store(self, method, *args):
         async with self._write_lock:

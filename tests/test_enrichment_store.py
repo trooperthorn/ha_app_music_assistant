@@ -261,3 +261,102 @@ def test_backup_rejects_schema_changed_after_open(tmp_path):
         store.backup(destination)
     assert not destination.exists()
     store.close()
+
+
+def test_v1_upgrade_preserves_capture_and_rolls_back_failed_migration(tmp_path):
+    class LegacyStore(ArchiveStore):
+        def _migrate_v2(self):
+            pass
+
+    path = tmp_path / "legacy.db"
+    old = LegacyStore(path)
+    sub = subscribe(old)
+    version = capture(old, sub)
+    identity = old.store_uuid
+    old.close()
+
+    class BrokenMigration(ArchiveStore):
+        def _migrate_v2(self):
+            super()._migrate_v2()
+            raise RuntimeError("injected migration failure")
+
+    with pytest.raises(RuntimeError):
+        BrokenMigration(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='apply_jobs'").fetchone() is None
+        assert "applied_version_id" not in [row[1] for row in db.execute("PRAGMA table_info(subscriptions)")]
+    upgraded = ArchiveStore(path)
+    assert upgraded.store_uuid == identity
+    assert upgraded.get_version(version)["total"] == 1
+    assert upgraded.get_subscription(sub)["applied_version_id"] is None
+    assert upgraded.list_applies() == []
+    upgraded.close()
+    reopened = ArchiveStore(path)
+    assert reopened.store_uuid == identity
+    reopened.close()
+
+
+def prepare(store, version, digest="a" * 64):
+    return store.prepare_apply(version, digest, 1, 1, "[]", "marker-" + version, "Visible archive")
+
+
+def test_apply_intent_idempotency_and_checkpoint_independence(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    first = capture(store, sub, "A")
+    job = prepare(store, first)
+    assert store.prepare_apply(first, "a" * 64, 1, 1, "[]", "new-marker", "New name")["id"] == job["id"]
+    with pytest.raises(ValueError, match="Conflicting"):
+        prepare(store, first, "b" * 64)
+    with pytest.raises(ValueError):
+        store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
+    store.mark_apply_creating(job["id"])
+    store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
+    second = capture(store, sub, "B")
+    store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
+    state = store.get_subscription(sub)
+    assert state["committed_version_id"] == second
+    assert state["applied_version_id"] == first
+    assert state["applied_job_id"] == job["id"]
+    with pytest.raises(ValueError):
+        store.commit_apply(job["id"], "different", "builtin", "a" * 64)
+    with pytest.raises(ValueError):
+        store.fail_apply(job["id"], "late failure")
+    store.close()
+
+
+def test_uncertain_creation_cannot_blind_retry_but_can_reconcile(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    job = prepare(store, capture(store, subscribe(store)))
+    store.mark_apply_creating(job["id"])
+    store.close()
+    store = ArchiveStore(path)
+    assert store.get_apply(job["id"])["state"] == "creating"
+    with pytest.raises(ValueError):
+        store.mark_apply_creating(job["id"])
+    store.fail_apply(job["id"], "lost response")
+    assert store.get_apply(job["id"])["state"] == "uncertain"
+    with pytest.raises(ValueError):
+        store.commit_apply(job["id"], "destination", "builtin", "b" * 64)
+    store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
+    assert store.get_apply_for_version(job["version_id"])["state"] == "applied"
+    store.close()
+
+
+def test_apply_validation_and_conflict_state(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    version = capture(store, subscribe(store))
+    for total, projected, omissions in [(2, 2, "[]"), (1, 0, "[]"), (1, 2, "[]")]:
+        with pytest.raises(ValueError):
+            store.prepare_apply(version, "a" * 64, total, projected, omissions, "marker", "Name")
+    job = prepare(store, version)
+    store.fail_apply(job["id"], "before creation")
+    assert store.get_apply(job["id"])["state"] == "failed"
+    store.mark_apply_creating(job["id"])
+    store.conflict_apply(job["id"], "multiple marker matches")
+    with pytest.raises(ValueError):
+        store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
+    assert len(store.list_applies()) == 1
+    store.close()

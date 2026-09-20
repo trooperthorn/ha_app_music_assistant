@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _now() -> str:
@@ -44,9 +44,12 @@ class ArchiveStore:
                 tables = self._db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 if version == 0 and not tables:
                     self._initialize()
-                elif version != SCHEMA_VERSION:
+                    version = 1
+                elif version not in (1, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
+                if version == 2:
+                    required.add("apply_jobs")
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if actual != required:
                     raise ValueError("Unexpected enrichment database tables; database untouched")
@@ -60,6 +63,8 @@ class ArchiveStore:
                     raise ValueError("Enrichment schema digest mismatch")
                 if self._db.execute("PRAGMA foreign_key_check").fetchone():
                     raise ValueError("Enrichment database contains broken foreign keys")
+                if version == 1:
+                    self._migrate_v2()
         except Exception:
             self._db.close()
             raise
@@ -105,10 +110,156 @@ class ArchiveStore:
         self._db.execute("INSERT INTO metadata VALUES ('store_uuid',?)", (str(uuid.uuid4()),))
         self._db.execute("INSERT INTO metadata VALUES ('schema_created_at',?)", (_now(),))
         self._db.execute("INSERT INTO metadata VALUES ('schema_digest',?)", (self._schema_digest(),))
-        self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        self._db.execute("PRAGMA user_version=1")
+
+    def _migrate_v2(self) -> None:
+        """Run only after validating v1; outer transaction rolls back all DDL on failure."""
+        self._db.execute("""CREATE TABLE apply_jobs (
+            id TEXT PRIMARY KEY, version_id TEXT NOT NULL UNIQUE REFERENCES versions(id),
+            subscription_id TEXT NOT NULL REFERENCES subscriptions(id),
+            projection_digest TEXT NOT NULL, source_count INTEGER NOT NULL,
+            projected_count INTEGER NOT NULL, omissions_json TEXT NOT NULL,
+            marker TEXT NOT NULL UNIQUE, requested_name TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('prepared','creating','applied','failed','uncertain','conflict')),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT,
+            destination_item_id TEXT, destination_provider_instance TEXT, verified_digest TEXT)""")
+        for column in (
+            "applied_version_id TEXT REFERENCES versions(id)",
+            "applied_at TEXT",
+            "applied_job_id TEXT REFERENCES apply_jobs(id)",
+        ):
+            self._db.execute(f"ALTER TABLE subscriptions ADD COLUMN {column}")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT INTO metadata VALUES ('schema_v2_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=2")
 
     def _schema_digest(self) -> str:
         return _digest([row[0] for row in self._db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")])
+
+    def prepare_apply(
+        self,
+        version_id: str,
+        projection_digest: str,
+        source_count: int,
+        projected_count: int,
+        omissions_json: str,
+        marker: str,
+        requested_name: str,
+    ) -> dict:
+        if (
+            not isinstance(projection_digest, str)
+            or len(projection_digest) != 64
+            or any(c not in "0123456789abcdef" for c in projection_digest)
+        ):
+            raise ValueError("Expected SHA-256 projection digest")
+        if type(source_count) is not int or type(projected_count) is not int or not 0 <= projected_count <= source_count:
+            raise ValueError("Invalid projection counts")
+        omissions = json.loads(omissions_json)
+        if not isinstance(omissions, list) or len(omissions) != source_count - projected_count:
+            raise ValueError("Omission count does not match projection")
+        normalized = json.dumps(omissions, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        if not all(isinstance(value, str) and value.strip() for value in (marker, requested_name)):
+            raise ValueError("Apply marker and destination name are required")
+        with self._transaction():
+            version = self.get_version(version_id)
+            if version["total"] != source_count:
+                raise ValueError("Projection source count differs from archive")
+            existing = self.get_apply_for_version(version_id)
+            if existing:
+                if (existing["projection_digest"], existing["projected_count"], existing["omissions_json"]) != (
+                    projection_digest,
+                    projected_count,
+                    normalized,
+                ):
+                    raise ValueError("Conflicting projection for existing apply intent")
+                return existing
+            job_id, now = str(uuid.uuid4()), _now()
+            self._db.execute(
+                """INSERT INTO apply_jobs
+                (id,version_id,subscription_id,projection_digest,source_count,projected_count,
+                 omissions_json,marker,requested_name,state,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,'prepared',?,?)""",
+                (
+                    job_id,
+                    version_id,
+                    version["subscription_id"],
+                    projection_digest,
+                    source_count,
+                    projected_count,
+                    normalized,
+                    marker,
+                    requested_name,
+                    now,
+                    now,
+                ),
+            )
+            return self.get_apply(job_id)
+
+    def get_apply(self, job_id: str) -> dict:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM apply_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            return dict(row)
+
+    def get_apply_for_version(self, version_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM apply_jobs WHERE version_id=?", (version_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_applies(self) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in self._db.execute("SELECT * FROM apply_jobs ORDER BY created_at,id")]
+
+    def mark_apply_creating(self, job_id: str) -> None:
+        with self._transaction():
+            job = self.get_apply(job_id)
+            if job["state"] not in ("prepared", "failed"):
+                raise ValueError("Apply requires reconciliation before creating another destination")
+            self._db.execute("UPDATE apply_jobs SET state='creating',error=NULL,updated_at=? WHERE id=?", (_now(), job_id))
+
+    def commit_apply(self, job_id: str, destination_item_id: str, destination_provider_instance: str, verified_digest: str) -> None:
+        if not all(isinstance(value, str) and value.strip() for value in (destination_item_id, destination_provider_instance)):
+            raise ValueError("Verified destination identity required")
+        with self._transaction():
+            job = self.get_apply(job_id)
+            if verified_digest != job["projection_digest"]:
+                raise ValueError("Destination digest does not match projection")
+            if job["state"] == "applied":
+                if (job["destination_item_id"], job["destination_provider_instance"]) != (
+                    destination_item_id,
+                    destination_provider_instance,
+                ):
+                    raise ValueError("Apply already committed to another destination")
+                return
+            if job["state"] not in ("creating", "uncertain"):
+                raise ValueError("Apply must be created or reconciled before commit")
+            now = _now()
+            self._db.execute(
+                """UPDATE apply_jobs SET state='applied',updated_at=?,error=NULL,
+                destination_item_id=?,destination_provider_instance=?,verified_digest=? WHERE id=?""",
+                (now, destination_item_id, destination_provider_instance, verified_digest, job_id),
+            )
+            self._db.execute(
+                "UPDATE subscriptions SET applied_version_id=?,applied_at=?,applied_job_id=? WHERE id=?",
+                (job["version_id"], now, job_id, job["subscription_id"]),
+            )
+
+    def fail_apply(self, job_id: str, error: str, uncertain: bool = False) -> None:
+        with self._transaction():
+            job = self.get_apply(job_id)
+            if job["state"] in ("applied", "conflict"):
+                raise ValueError("Cannot fail a completed or conflicted apply")
+            # Once creation was entered, a generic error cannot prove no destination exists.
+            state = "uncertain" if uncertain or job["state"] in ("creating", "uncertain") else "failed"
+            self._db.execute("UPDATE apply_jobs SET state=?,error=?,updated_at=? WHERE id=?", (state, error, _now(), job_id))
+
+    def conflict_apply(self, job_id: str, error: str) -> None:
+        with self._transaction():
+            job = self.get_apply(job_id)
+            if job["state"] == "applied":
+                raise ValueError("Cannot rewrite an applied checkpoint")
+            self._db.execute("UPDATE apply_jobs SET state='conflict',error=?,updated_at=? WHERE id=?", (error, _now(), job_id))
 
     def close(self) -> None:
         with self._lock:

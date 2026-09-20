@@ -3,7 +3,7 @@
   "stage": "experimental",
   "domain": "library_enrichment",
   "name": "Library Enrichment",
-  "description": "Selected Spotify playlist metadata archives with durable ordered versions.",
+  "description": "Selected Spotify playlist archives with durable ordered versions and explicit builtin projections.",
   "codeowners": ["@trooperthorn"],
   "requirements": [],
   "multi_instance": false,
