@@ -116,19 +116,50 @@ real file paths for tracks carrying a filesystem provider mapping, and
 reports the tracks it had to omit. Additive, no upstream conflict. Worth
 doing only if an external tool actually has to read these files.
 
-**Gap 2, import matching is a fallback and not a preference (decision
-needed, Sean)**: `match_imported_playlist_tracks` only considers an entry
-when the URI's own provider is unavailable, so with Spotify configured a
-Spotify entry is never re-resolved to a local file. `match_providers` (which
-the fork frontend already passes) filters which providers get searched once
-that fallback triggers; it cannot express "prefer local even though Spotify
-works". Where several providers match the same ISRC the winner is whatever
-`get_unique_providers()` yields first, which this fork does not control. So
-of the three plausible import modes, streaming-only works fully today,
-local-only works only if the source provider is absent, and an on-demand
-choice between them is not expressible. Closing this suits a
-`playlist_bridge` command that re-resolves a playlist after import, needing
-no server edit.
+**Gap 2, archive then re-resolve: archival DONE, re-resolve is next**.
+Sean's actual case is roughly 400 Spotify playlists and no local files at
+all, wanting the curation preserved and, later, a choice of source per
+track. That splits into three parts, and only one of them was missing what
+it looked like.
+
+*Part A, playback source selection: already shipped, nothing to do.* The
+`play_source_steer.py` patch already lets a play request name the source its
+items stream from, and the fork's library manager already sends
+provider-scoped uris for a listing narrowed to one source.
+`ProviderMapping.quality` scores a lossless local file around 60 against
+roughly 2 for Spotify at 320 kbps, so once a local mapping exists it becomes
+the primary automatically and the patch is the explicit override.
+
+*Part B, bulk archival: DONE.* `playlist_bridge/archive_playlists` copies
+eligible library playlists into builtin as local `.m3u` files in one
+resumable background task, matching deliberately off, idempotent by
+existing builtin name. Roughly 15 minutes for 400 playlists on a user's own
+Spotify client id and 45 to 55 on Music Assistant's shared one, throttle
+bound. Same change fixed `_migrate_playlist` leaking an orphaned throwaway
+builtin playlist on every call, which at this scale would have meant 400
+orphans. See `docs/decisions.md`, "Bulk playlist archival ships as a plugin
+command".
+
+*Part C, re-resolve: NOT BUILT, and the real gap.* The server never
+re-points a stored playlist entry at a provider mapping that appears later:
+the 24-hourly repair pass skips any entry that already has a title,
+`#EXTPROV` and `#EXTMA` (`_stored_details_differ` compares only a manually
+set name and thumbnail, and the pass unregisters itself after one clean
+run), and `match_imported_playlist_tracks` only considers entries whose
+provider is not loaded, so with Spotify configured it is a no-op. So an
+archive is a point-in-time copy. What is needed is a `playlist_bridge`
+command that walks an archived playlist, re-looks each entry up by ISRC or
+MusicBrainz id, and rewrites its `#EXTPROV` lines from current library
+state. Needs no server edit. It is inert until local files exist, which is
+why it was not built alongside part B; build it when the first local files
+land.
+
+One thing this also means: if Spotify ever goes away entirely, archived
+entries become unresolvable, which is exactly
+`match_imported_playlist_tracks`'s trigger condition, so they start being
+matched against whatever else is configured without part C existing. Part C
+is only needed for the case where Spotify still works and local copies
+should be preferred anyway.
 
 **Deferred, not needed yet**: a separate SQLite database for import
 provenance. Feasible and a clean fit (`aiosqlite` is already a server
@@ -140,8 +171,10 @@ entries already persist with their ISRC and MusicBrainz id and are retried
 every 24 hours. It would only add provenance, idempotent re-sync and match
 auditing, which pay off only if recurring incremental re-sync is wanted.
 
-**Status**: destination resolved, no work pending. Gaps 1 and 2 are waiting
-on Sean and are not blocked by any missing server capability.
+**Status**: destination resolved. Gap 2 part B shipped, part A was already
+shipped, part C (re-resolve) is the next piece and waits on local files
+existing. Gap 1 (portability) is waiting on Sean. Nothing here is blocked by
+a missing server capability.
 
 ### 3b. Equalizer — DONE, was already fully shipped before this was written
 
