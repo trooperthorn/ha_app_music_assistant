@@ -2,6 +2,7 @@
 
 ## 2026-09-20
 
+- Fork frontend v2026.09.20.8 -> v2026.09.20.9
 - Fork frontend v2026.09.20.7 -> v2026.09.20.8
 - Legacy iTunes inspection accepts a safely staged ZIP package, including a
   direct authenticated XML-only ZIP upload for compact transport, then maps the
