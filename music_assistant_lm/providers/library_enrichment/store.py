@@ -13,10 +13,11 @@ import sqlite3
 import threading
 import uuid
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 
 
 def _now() -> str:
@@ -25,6 +26,13 @@ def _now() -> str:
 
 def _digest(payloads: list[str]) -> str:
     return hashlib.sha256(json.dumps(payloads, ensure_ascii=False).encode()).hexdigest()
+
+
+def _timestamp(value: str) -> str:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError("Timestamp must include timezone")
+    return parsed.astimezone(UTC).isoformat()
 
 
 class ArchiveStore:
@@ -45,11 +53,13 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, SCHEMA_VERSION):
+                elif version not in (1, 2, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
-                if version == 2:
+                if version >= 2:
                     required.add("apply_jobs")
+                if version >= 3:
+                    required.update(("subscription_sync_policy", "subscription_sync_state", "sync_jobs"))
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if actual != required:
                     raise ValueError("Unexpected enrichment database tables; database untouched")
@@ -65,6 +75,8 @@ class ArchiveStore:
                     raise ValueError("Enrichment database contains broken foreign keys")
                 if version == 1:
                     self._migrate_v2()
+                if version <= 2:
+                    self._migrate_v3()
         except Exception:
             self._db.close()
             raise
@@ -135,6 +147,222 @@ class ArchiveStore:
 
     def _schema_digest(self) -> str:
         return _digest([row[0] for row in self._db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")])
+
+    def _migrate_v3(self) -> None:
+        self._db.execute("""CREATE TABLE subscription_sync_policy (
+            subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+            mode TEXT NOT NULL DEFAULT 'manual' CHECK(mode IN ('manual','scheduled')),
+            interval_seconds INTEGER NOT NULL DEFAULT 86400 CHECK(interval_seconds BETWEEN 3600 AND 604800),
+            initiating_user_id TEXT, revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)""")
+        self._db.execute("""CREATE TABLE subscription_sync_state (
+            subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id), next_check_at TEXT,
+            last_check_at TEXT, last_success_at TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            access_state TEXT NOT NULL DEFAULT 'unknown' CHECK(access_state IN
+              ('unknown','accessible','authentication_required','access_denied','temporarily_unavailable','provider_offline')),
+            last_error_code TEXT, last_error TEXT)""")
+        self._db.execute("""CREATE TABLE sync_jobs (
+            id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL REFERENCES subscriptions(id),
+            trigger TEXT NOT NULL CHECK(trigger IN ('manual','scheduled')),
+            state TEXT NOT NULL CHECK(state IN ('queued','running','succeeded','failed','cancelled','interrupted')),
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            observed_snapshot TEXT, version_id TEXT REFERENCES versions(id), error TEXT)""")
+        self._db.execute("CREATE UNIQUE INDEX one_active_sync ON sync_jobs(subscription_id) WHERE state IN ('queued','running')")
+        self._db.execute("CREATE INDEX sync_due ON subscription_sync_state(next_check_at)")
+        self._db.execute("INSERT INTO subscription_sync_policy(subscription_id,updated_at) SELECT id,? FROM subscriptions", (_now(),))
+        self._db.execute("INSERT INTO subscription_sync_state(subscription_id) SELECT id FROM subscriptions")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT INTO metadata VALUES ('schema_v3_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=3")
+
+    def get_sync_policy(self, subscription_id: str) -> dict:
+        with self._lock:
+            self.get_subscription(subscription_id)
+            return dict(self._db.execute("SELECT * FROM subscription_sync_policy WHERE subscription_id=?", (subscription_id,)).fetchone())
+
+    def set_sync_policy(
+        self,
+        subscription_id: str,
+        mode: str,
+        interval_seconds: int = 86400,
+        initiating_user_id: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict:
+        if mode not in ("manual", "scheduled") or type(interval_seconds) is not int or not 3600 <= interval_seconds <= 604800:
+            raise ValueError("Invalid sync mode or interval")
+        if mode == "scheduled" and (not isinstance(initiating_user_id, str) or not initiating_user_id.strip()):
+            raise ValueError("Scheduled sync requires initiating user")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("Expected policy revision required")
+        with self._transaction():
+            policy = self.get_sync_policy(subscription_id)
+            if policy["revision"] != expected_revision:
+                raise ValueError("Sync policy revision conflict")
+            now = _now()
+            due = (datetime.fromisoformat(now) + timedelta(seconds=interval_seconds)).isoformat() if mode == "scheduled" else None
+            self._db.execute(
+                """UPDATE subscription_sync_policy SET mode=?,interval_seconds=?,initiating_user_id=?,
+                revision=revision+1,updated_at=? WHERE subscription_id=?""",
+                (mode, interval_seconds, initiating_user_id, now, subscription_id),
+            )
+            self._db.execute("UPDATE subscription_sync_state SET next_check_at=? WHERE subscription_id=?", (due, subscription_id))
+            return self.get_sync_policy(subscription_id)
+
+    def list_due(self, now: str, limit: int = 50) -> list[dict]:
+        now = _timestamp(now)
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("Due limit must be 1..200")
+        with self._lock:
+            return [
+                dict(row)
+                for row in self._db.execute(
+                    """SELECT s.*,p.mode,p.interval_seconds,p.initiating_user_id,
+                p.revision,t.next_check_at,t.consecutive_failures,t.access_state FROM subscriptions s
+                JOIN subscription_sync_policy p ON p.subscription_id=s.id JOIN subscription_sync_state t ON t.subscription_id=s.id
+                WHERE p.mode='scheduled' AND t.next_check_at<=? AND NOT EXISTS
+                (SELECT 1 FROM sync_jobs j WHERE j.subscription_id=s.id AND j.state IN ('queued','running'))
+                AND NOT EXISTS (SELECT 1 FROM jobs c WHERE c.subscription_id=s.id AND c.state='pending')
+                ORDER BY t.next_check_at,s.id LIMIT ?""",
+                    (now, limit),
+                )
+            ]
+
+    def begin_sync(self, subscription_id: str, trigger: str = "manual") -> dict:
+        if trigger not in ("manual", "scheduled"):
+            raise ValueError("Invalid sync trigger")
+        with self._transaction():
+            policy = self.get_sync_policy(subscription_id)
+            if trigger == "scheduled" and policy["mode"] != "scheduled":
+                raise ValueError("Scheduled sync is disabled")
+            if self._db.execute("SELECT 1 FROM jobs WHERE subscription_id=? AND state='pending'", (subscription_id,)).fetchone():
+                raise ValueError("Capture already pending for subscription")
+            job_id = str(uuid.uuid4())
+            self._db.execute(
+                "INSERT INTO sync_jobs(id,subscription_id,trigger,state,created_at) VALUES (?,?,?,'queued',?)",
+                (job_id, subscription_id, trigger, _now()),
+            )
+            return self.get_sync_job(job_id)
+
+    def get_sync_job(self, job_id: str) -> dict:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM sync_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            return dict(row)
+
+    def list_sync_jobs(self, subscription_id: str | None = None) -> list[dict]:
+        with self._lock:
+            return [
+                dict(row)
+                for row in self._db.execute(
+                    """SELECT * FROM sync_jobs
+                WHERE (? IS NULL OR subscription_id=?) ORDER BY created_at,id""",
+                    (subscription_id, subscription_id),
+                )
+            ]
+
+    def get_sync_status(self, subscription_id: str) -> dict:
+        with self._lock:
+            return {
+                "policy": self.get_sync_policy(subscription_id),
+                "state": dict(
+                    self._db.execute("SELECT * FROM subscription_sync_state WHERE subscription_id=?", (subscription_id,)).fetchone()
+                ),
+                "jobs": self.list_sync_jobs(subscription_id),
+            }
+
+    def mark_sync_running(self, job_id: str) -> None:
+        with self._transaction():
+            if self.get_sync_job(job_id)["state"] != "queued":
+                raise ValueError("Sync is not queued")
+            self._db.execute("UPDATE sync_jobs SET state='running',started_at=? WHERE id=?", (_now(), job_id))
+
+    def observe_sync(self, job_id: str, snapshot: str) -> None:
+        if not isinstance(snapshot, str) or not snapshot:
+            raise ValueError("Snapshot required")
+        with self._transaction():
+            job = self.get_sync_job(job_id)
+            if job["state"] != "running":
+                raise ValueError("Sync is not running")
+            now = _now()
+            self._db.execute("UPDATE sync_jobs SET observed_snapshot=? WHERE id=?", (snapshot, job_id))
+            self._db.execute(
+                "UPDATE subscriptions SET observed_snapshot=?,observed_at=? WHERE id=?", (snapshot, now, job["subscription_id"])
+            )
+            self._db.execute(
+                "UPDATE subscription_sync_state SET last_check_at=?,access_state='accessible' WHERE subscription_id=?",
+                (now, job["subscription_id"]),
+            )
+
+    def _sync_next_check(self, subscription_id: str, now: str) -> str | None:
+        policy = self.get_sync_policy(subscription_id)
+        return (
+            (datetime.fromisoformat(now) + timedelta(seconds=policy["interval_seconds"])).isoformat()
+            if policy["mode"] == "scheduled"
+            else None
+        )
+
+    def succeed_sync(self, job_id: str, version_id: str | None = None) -> None:
+        with self._transaction():
+            job = self.get_sync_job(job_id)
+            if job["state"] != "running":
+                raise ValueError("Sync is not running")
+            if version_id is not None:
+                version = self.get_version(version_id)
+                if version["subscription_id"] != job["subscription_id"] or version["snapshot_id"] != job["observed_snapshot"]:
+                    raise ValueError("Sync version does not match observed source")
+            now = _now()
+            self._db.execute(
+                "UPDATE sync_jobs SET state='succeeded',finished_at=?,version_id=?,error=NULL WHERE id=?", (now, version_id, job_id)
+            )
+            self._db.execute(
+                """UPDATE subscription_sync_state SET next_check_at=?,last_check_at=?,last_success_at=?,
+                consecutive_failures=0,access_state='accessible',last_error_code=NULL,last_error=NULL WHERE subscription_id=?""",
+                (self._sync_next_check(job["subscription_id"], now), now, now, job["subscription_id"]),
+            )
+
+    def fail_sync(
+        self, job_id: str, error_code: str, error: str, access_state: str = "temporarily_unavailable", next_check_at: str | None = None
+    ) -> None:
+        if access_state not in ACCESS_STATES:
+            raise ValueError("Invalid access state")
+        if next_check_at is not None:
+            next_check_at = _timestamp(next_check_at)
+        with self._transaction():
+            job = self.get_sync_job(job_id)
+            if job["state"] not in ("queued", "running"):
+                raise ValueError("Sync is not active")
+            now = _now()
+            policy = self.get_sync_policy(job["subscription_id"])
+            due = next_check_at or self._sync_next_check(job["subscription_id"], now)
+            if policy["mode"] == "manual" or access_state in ("authentication_required", "access_denied"):
+                due = None
+            self._db.execute("UPDATE sync_jobs SET state='failed',finished_at=?,error=? WHERE id=?", (now, error, job_id))
+            self._db.execute(
+                """UPDATE subscription_sync_state SET next_check_at=?,last_check_at=?,consecutive_failures=consecutive_failures+1,
+                access_state=?,last_error_code=?,last_error=? WHERE subscription_id=?""",
+                (due, now, access_state, error_code, error, job["subscription_id"]),
+            )
+
+    def recover_sync_pending(self) -> int:
+        """At exclusive provider startup, interrupt abandoned work without changing checkpoints."""
+        with self._transaction():
+            return self._db.execute(
+                """UPDATE sync_jobs SET state='interrupted',finished_at=?,
+                error='Provider restarted; fresh check required' WHERE state IN ('queued','running')""",
+                (_now(),),
+            ).rowcount
+
+    def cancel_sync(self, job_id: str) -> None:
+        with self._transaction():
+            job = self.get_sync_job(job_id)
+            if job["state"] not in ("queued", "running"):
+                raise ValueError("Sync is not active")
+            now = _now()
+            self._db.execute("UPDATE sync_jobs SET state='cancelled',finished_at=? WHERE id=?", (now, job_id))
+            self._db.execute(
+                "UPDATE subscription_sync_state SET next_check_at=? WHERE subscription_id=?",
+                (self._sync_next_check(job["subscription_id"], now), job["subscription_id"]),
+            )
 
     def prepare_apply(
         self,
@@ -278,13 +506,18 @@ class ArchiveStore:
                 DO UPDATE SET provider_instance_id=excluded.provider_instance_id,name=excluded.name""",
                 (str(uuid.uuid4()), provider_domain, account_id, source_playlist_id, provider_instance_id, name),
             )
-            return dict(
+            result = dict(
                 self._db.execute(
                     """SELECT * FROM subscriptions WHERE
                 provider_domain=? AND account_id=? AND source_playlist_id=?""",
                     (provider_domain, account_id, source_playlist_id),
                 ).fetchone()
             )
+            self._db.execute(
+                "INSERT OR IGNORE INTO subscription_sync_policy(subscription_id,updated_at) VALUES (?,?)", (result["id"], _now())
+            )
+            self._db.execute("INSERT OR IGNORE INTO subscription_sync_state(subscription_id) VALUES (?)", (result["id"],))
+            return result
 
     def get_subscription(self, subscription_id: str) -> dict:
         with self._lock:
@@ -306,11 +539,18 @@ class ArchiveStore:
                 "UPDATE subscriptions SET observed_snapshot=?,observed_at=? WHERE id=?", (snapshot_id, _now(), subscription_id)
             )
 
-    def begin_capture(self, subscription_id: str, snapshot_id: str) -> str:
+    def begin_capture(self, subscription_id: str, snapshot_id: str, sync_job_id: str | None = None) -> str:
         if not snapshot_id:
             raise ValueError("Snapshot identity required")
         with self._transaction():
             self.get_subscription(subscription_id)
+            active_sync = self._db.execute(
+                "SELECT id,state FROM sync_jobs WHERE subscription_id=? AND state IN ('queued','running')", (subscription_id,)
+            ).fetchone()
+            if active_sync is not None and (active_sync["id"] != sync_job_id or active_sync["state"] != "running"):
+                raise ValueError("Subscription has an active sync")
+            if sync_job_id is not None and (active_sync is None or active_sync["id"] != sync_job_id):
+                raise ValueError("Sync capture ownership is invalid")
             job_id, now = str(uuid.uuid4()), _now()
             self._db.execute(
                 "INSERT INTO jobs(id,subscription_id,snapshot_id,state,created_at) VALUES (?,?,?,'pending',?)",

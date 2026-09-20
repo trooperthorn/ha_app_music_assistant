@@ -264,16 +264,24 @@ def test_backup_rejects_schema_changed_after_open(tmp_path):
 
 
 def test_v1_upgrade_preserves_capture_and_rolls_back_failed_migration(tmp_path):
-    class LegacyStore(ArchiveStore):
-        def _migrate_v2(self):
-            pass
-
     path = tmp_path / "legacy.db"
-    old = LegacyStore(path)
-    sub = subscribe(old)
-    version = capture(old, sub)
-    identity = old.store_uuid
-    old.close()
+    old = ArchiveStore.__new__(ArchiveStore)
+    old._db = sqlite3.connect(path)
+    old._initialize()
+    sub, version = "sub", "version"
+    old._db.execute(
+        "INSERT INTO subscriptions(id,provider_domain,account_id,source_playlist_id,provider_instance_id,name) VALUES (?,?,?,?,?,?)",
+        (sub, "spotify", "account", "playlist", "instance", "name"),
+    )
+    payload = '{"position": 0}'
+    old._db.execute(
+        "INSERT INTO versions VALUES (?,?,?,?,?,?,?,?)",
+        (version, sub, "A", module._now(), 1, "instance", "name", module._digest([payload])),
+    )
+    old._db.execute("INSERT INTO occurrences VALUES (?,?,?)", (version, 0, payload))
+    identity = old._db.execute("SELECT value FROM metadata WHERE key='store_uuid'").fetchone()[0]
+    old._db.commit()
+    old._db.close()
 
     class BrokenMigration(ArchiveStore):
         def _migrate_v2(self):
@@ -359,4 +367,112 @@ def test_apply_validation_and_conflict_state(tmp_path):
     with pytest.raises(ValueError):
         store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
     assert len(store.list_applies()) == 1
+    store.close()
+
+
+def test_v2_sync_migration_rollback_preserves_applied_capture(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    version = capture(store, sub)
+    job = prepare(store, version)
+    store.mark_apply_creating(job["id"])
+    store.commit_apply(job["id"], "destination", "builtin", "a" * 64)
+    with store._transaction():
+        for table in ("sync_jobs", "subscription_sync_state", "subscription_sync_policy"):
+            store._db.execute(f"DROP TABLE {table}")
+        store._db.execute("DELETE FROM metadata WHERE key='schema_v3_migrated_at'")
+        store._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (store._schema_digest(),))
+        store._db.execute("PRAGMA user_version=2")
+    store.close()
+
+    class BrokenMigration(ArchiveStore):
+        def _migrate_v3(self):
+            super()._migrate_v3()
+            raise RuntimeError("migration interrupted")
+
+    with pytest.raises(RuntimeError):
+        BrokenMigration(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='sync_jobs'").fetchone() is None
+    store = ArchiveStore(path)
+    assert store.get_sync_policy(sub)["mode"] == "manual"
+    assert store.get_subscription(sub)["applied_version_id"] == version
+    assert store.get_apply(job["id"])["state"] == "applied"
+    assert store.get_sync_status(sub)["state"]["next_check_at"] is None
+    store.close()
+
+
+def test_sync_policy_revision_and_due_selection(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "_now", lambda: "2026-09-20T00:00:00+00:00")
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    assert store.get_sync_policy(sub)["revision"] == 0
+    updated = store.set_sync_policy(sub, "scheduled", 3600, "admin", expected_revision=0)
+    assert updated["revision"] == 1
+    assert store.list_due("2026-09-20T00:59:59+00:00") == []
+    assert store.list_due("2026-09-20T01:00:00+00:00")[0]["id"] == sub
+    with pytest.raises(ValueError):
+        store.set_sync_policy(sub, "manual", expected_revision=0)
+    store.set_sync_policy(sub, "manual", expected_revision=1)
+    assert store.list_due("2026-09-21T00:00:00+00:00") == []
+    assert store.get_sync_status(sub)["state"]["next_check_at"] is None
+    for interval in (3599, 604801, True):
+        with pytest.raises(ValueError):
+            store.set_sync_policy(sub, "scheduled", interval, "admin", expected_revision=2)
+    store.close()
+
+
+def test_sync_capture_exclusion_and_owned_capture(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    run = store.begin_sync(sub)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.begin_sync(sub)
+    with pytest.raises(ValueError):
+        store.begin_capture(sub, "A")
+    store.mark_sync_running(run["id"])
+    store.observe_sync(run["id"], "A")
+    capture_id = store.begin_capture(sub, "A", sync_job_id=run["id"])
+    version = store.commit_capture(capture_id, snapshot_before="A", snapshot_after="A", total=0, occurrences=[])
+    store.succeed_sync(run["id"], version)
+    assert store.get_sync_job(run["id"])["version_id"] == version
+    capture_id = store.begin_capture(sub, "B")
+    with pytest.raises(ValueError):
+        store.begin_sync(sub)
+    store.fail_capture(capture_id, "cancelled")
+    store.close()
+
+
+def test_sync_failure_access_pause_recovery_and_checkpoints(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "_now", lambda: "2026-09-20T00:00:00+00:00")
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.set_sync_policy(sub, "scheduled", 3600, "admin", expected_revision=0)
+    run = store.begin_sync(sub, "scheduled")
+    store.mark_sync_running(run["id"])
+    store.observe_sync(run["id"], "B")
+    store.fail_sync(run["id"], "denied", "Access unavailable", "access_denied")
+    state = store.get_sync_status(sub)["state"]
+    assert state["next_check_at"] is None and state["consecutive_failures"] == 1
+    assert store.get_subscription(sub)["committed_version_id"] == version
+    assert store.get_subscription(sub)["observed_snapshot"] == "B"
+    retry = store.begin_sync(sub)
+    store.mark_sync_running(retry["id"])
+    store.observe_sync(retry["id"], "A")
+    store.succeed_sync(retry["id"], version)
+    state = store.get_sync_status(sub)["state"]
+    assert state["consecutive_failures"] == 0 and state["access_state"] == "accessible"
+    assert state["next_check_at"] == "2026-09-20T01:00:00+00:00"
+    interrupted = store.begin_sync(sub)
+    store.close()
+    store = ArchiveStore(path)
+    assert store.recover_sync_pending() == 1
+    assert store.recover_sync_pending() == 0
+    assert store.get_sync_job(interrupted["id"])["state"] == "interrupted"
+    assert store.get_subscription(sub)["committed_version_id"] == version
+    assert store.get_subscription(sub)["applied_version_id"] is None
     store.close()

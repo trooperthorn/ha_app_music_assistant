@@ -3,6 +3,9 @@
 ## 2026-09-20
 
 - Fork frontend v2026.09.20.2 -> v2026.09.20.3
+- Library Enrichment subscriptions support explicit revisioned manual or
+  scheduled snapshot checks, durable sync jobs and access state, unchanged-source
+  short-circuiting, and immutable capture when Spotify reports a new snapshot.
 - Fork frontend v2026.09.20.1 -> v2026.09.20.2
 - Library Enrichment can explicitly project a committed archive version into a
   visible builtin playlist with omission review, ordered-reference verification,
