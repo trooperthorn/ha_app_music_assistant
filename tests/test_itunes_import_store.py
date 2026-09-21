@@ -148,7 +148,7 @@ def test_v6_migration_is_transactional_and_backup_preserves_import(tmp_path):
     imported = stage(restored)
     backup = tmp_path / "backup-v7.db"
     manifest = restored.backup(backup)
-    assert manifest["schema_version"] == 8
+    assert manifest["schema_version"] == module.SCHEMA_VERSION
     reopened = ArchiveStore(backup)
     assert reopened.get_itunes_import(imported["inspection_id"])["playlist_ids"] == ["PLAYLIST-A", "PLAYLIST-B"]
     reopened.close()

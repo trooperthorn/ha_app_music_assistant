@@ -512,7 +512,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 30
+    assert len(plugin.registered) == 31
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -669,6 +669,7 @@ def test_diagnostics_report_build_and_redacted_store_health(plugin):
         "server_compatible": True,
     }
     assert result["store"]["queues"]["capture"] == {"failed": 1}
+    assert result["store"]["match_review"] == {"approved_sources": 0, "recent_decisions": []}
     assert result["store"]["recent_jobs"][0]["kind"] == "capture"
     serialized = json.dumps(result)
     for private_value in (
@@ -1134,6 +1135,52 @@ def test_match_decision_requires_library_write_and_uses_revision_cas(plugin):
     assert next(
         item for item in rejected["match"]["candidates"] if item["asset_id"] == candidate["asset_id"]
     )["rejected"] is True
+
+
+def test_bulk_match_approval_uses_checked_subset_and_is_idempotent(plugin):
+    version_id = _match_fixture(plugin)
+    review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    match = review["items"][0]["match"]
+    candidate = match["candidates"][0]
+    approvals = [{
+        "source_item_id": "T" * 22,
+        "asset_id": candidate["asset_id"],
+        "expected_revision": match["revision"],
+    }]
+    plugin.auth.user.allowed_scopes = {plugin.module.Scope.CONFIG_PROVIDERS_WRITE}
+    with pytest.raises(Exception, match="library write permission"):
+        asyncio.run(
+            plugin.provider.approve_match_candidates(version_id, "browser-operation-1", approvals)
+        )
+    plugin.auth.user.allowed_scopes = set(plugin.module.Scope)
+    result = asyncio.run(
+        plugin.provider.approve_match_candidates(version_id, "browser-operation-1", approvals)
+    )
+    assert result["approved_count"] == 1
+    assert result["idempotent_replay"] is False
+    assert result["items"][0]["classification"] == "approved"
+    assert "matches" not in result
+    asyncio.run(
+        plugin.provider.set_match_decision(version_id, "T" * 22, 1, "clear")
+    )
+    replay = asyncio.run(
+        plugin.provider.approve_match_candidates(version_id, "browser-operation-1", approvals)
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["items"][0]["match"]["revision"] == 1
+    assert plugin.provider._store.get_match_overlay(
+        "spotify", "account-a", "track", "T" * 22
+    )["revision"] == 2
+
+
+def test_bulk_match_approval_rejects_unreviewable_or_unbounded_requests(plugin):
+    version_id = _match_fixture(plugin)
+    with pytest.raises(Exception, match="1..200"):
+        asyncio.run(plugin.provider.approve_match_candidates(version_id, "operation", []))
+    with pytest.raises(Exception, match="unique reviewable"):
+        asyncio.run(plugin.provider.approve_match_candidates(version_id, "operation", [{
+            "source_item_id": "not-in-version", "asset_id": "asset", "expected_revision": 0,
+        }]))
 
 
 def test_playback_policy_preview_is_explicit_revisioned_and_strict(plugin):
