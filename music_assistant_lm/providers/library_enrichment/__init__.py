@@ -98,6 +98,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("sync_status", self.sync_status),
             ("match_review", self.match_review),
             ("set_match_decision", self.set_match_decision),
+            ("approve_match_candidates", self.approve_match_candidates),
             ("playback_policy", self.playback_policy),
             ("set_playback_policy", self.set_playback_policy),
             ("playback_preview", self.playback_preview),
@@ -196,8 +197,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             "sync_policy_api_version": 1,
             "interval_bounds": {"min": 3600, "max": 604800},
             "local_matching": True,
-            "match_review_api_version": 1,
+            "match_review_api_version": 2,
             "max_match_review_page": 200,
+            "max_match_approvals": 200,
             "playback_policy": True,
             "playback_policy_api_version": 1,
             "playback_policy_modes": ["prefer_local", "local_only", "prefer_spotify"],
@@ -205,7 +207,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "liked_songs": False,
             "audio_backup": False,
             "diagnostics": True,
-            "diagnostics_api_version": 1,
+            "diagnostics_api_version": 2,
             "max_diagnostics_recent_jobs": 100,
             "max_items": 10000,
             "access": "provider_configuration_administrators",
@@ -1493,6 +1495,75 @@ class LibraryEnrichmentProvider(PluginProvider):
         except ValueError as err:
             raise InvalidDataError(str(err)) from None
         return {"match": result, "classification": self._match_classification(result)}
+
+    async def approve_match_candidates(
+        self,
+        version_id: str,
+        operation_id: str,
+        approvals: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically approve a bounded, explicitly selected group of current candidates."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Match decisions require library write permission")
+        if not isinstance(operation_id, str) or not 1 <= len(operation_id.strip()) <= 128:
+            raise InvalidDataError("Bulk approval operation ID must contain 1..128 characters")
+        if not isinstance(approvals, list) or not 1 <= len(approvals) <= 200:
+            raise InvalidDataError("Bulk approval requires 1..200 selected candidates")
+        version = await self._read_store(self._store.get_version, version_id)
+        subscription = await self._read_store(self._store.get_subscription, version["subscription_id"])
+        reviewable = {
+            row.get("source_item_id")
+            for row in version["occurrences"]
+            if row.get("state") == "track" and isinstance(row.get("source_item_id"), str)
+        }
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for approval in approvals:
+            if not isinstance(approval, dict):
+                raise InvalidDataError("Each bulk approval must be an object")
+            source_item_id = approval.get("source_item_id")
+            asset_id = approval.get("asset_id")
+            expected_revision = approval.get("expected_revision")
+            if (
+                not isinstance(source_item_id, str)
+                or source_item_id not in reviewable
+                or source_item_id in seen
+                or not isinstance(asset_id, str)
+                or type(expected_revision) is not int
+                or expected_revision < 0
+            ):
+                raise InvalidDataError(
+                    "Bulk approvals require unique reviewable sources, candidate assets and nonnegative revisions"
+                )
+            seen.add(source_item_id)
+            normalized.append(
+                {
+                    "source_item_id": source_item_id,
+                    "asset_id": asset_id,
+                    "expected_revision": expected_revision,
+                }
+            )
+        try:
+            result = await self._read_store(
+                self._store.approve_match_candidates,
+                subscription["provider_domain"],
+                subscription["account_id"],
+                normalized,
+                user.user_id,
+                operation_id.strip(),
+                version_id,
+            )
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+        matches = result.pop("matches")
+        return {
+            **result,
+            "items": [
+                {"match": match, "classification": self._match_classification(match)}
+                for match in matches
+            ],
+        }
 
     async def sync_policy(self, subscription_id: str) -> dict[str, Any]:
         self._authorize()

@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
 PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
@@ -55,7 +55,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -72,12 +72,15 @@ class ArchiveStore:
                     required.update(("itunes_import_documents", "itunes_import_batches"))
                 if version >= 8:
                     required.add("itunes_apply_jobs")
+                if version >= 9:
+                    required.add("bulk_match_operations")
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                staged_v7 = {"itunes_import_documents", "itunes_import_batches"}
-                staged_v8 = staged_v7 | {"itunes_apply_jobs"}
+                later_tables = {
+                    "itunes_import_documents", "itunes_import_batches",
+                    "itunes_apply_jobs", "bulk_match_operations",
+                }
                 if actual != required and not (
-                    (version < 7 and actual == required | staged_v7)
-                    or (version < 8 and actual == required | staged_v8)
+                    version < 9 and required <= actual <= required | later_tables
                 ):
                     raise ValueError("Unexpected enrichment database tables; database untouched")
                 identity = self._db.execute("SELECT value FROM metadata WHERE key='store_uuid'").fetchone()
@@ -104,6 +107,8 @@ class ArchiveStore:
                     self._migrate_v7()
                 if version <= 7:
                     self._migrate_v8()
+                if version <= 8:
+                    self._migrate_v9()
         except Exception:
             self._db.close()
             raise
@@ -367,6 +372,15 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v8_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=8")
+
+    def _migrate_v9(self) -> None:
+        """Persist exact bulk-review responses for safe transport retries."""
+        self._db.execute("""CREATE TABLE IF NOT EXISTS bulk_match_operations (
+            operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL,
+            response_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v9_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=9")
 
     @staticmethod
     def _bounded_json(value, label: str, expected_type: type, limit: int = 65536) -> str:
@@ -1240,6 +1254,110 @@ class ArchiveStore:
             )
             return self.get_match_overlay(provider_domain, account_id, media_type, source_item_id)
 
+    def approve_match_candidates(
+        self,
+        provider_domain: str,
+        account_id: str,
+        approvals: list[dict],
+        actor_id: str | None,
+        operation_id: str,
+        version_id: str,
+    ) -> dict:
+        """Atomically apply an idempotent, bounded group of explicit approvals."""
+        if not isinstance(approvals, list) or not 1 <= len(approvals) <= 200:
+            raise ValueError("Bulk approval requires 1..200 selected candidates")
+        canonical = []
+        seen: set[str] = set()
+        for item in approvals:
+            if not isinstance(item, dict):
+                raise ValueError("Bulk approval entries are invalid or duplicated")
+            source_item_id = item.get("source_item_id")
+            asset_id = item.get("asset_id")
+            expected_revision = item.get("expected_revision")
+            if (
+                not isinstance(source_item_id, str)
+                or source_item_id in seen
+                or not isinstance(asset_id, str)
+                or type(expected_revision) is not int
+                or expected_revision < 0
+            ):
+                raise ValueError("Bulk approval entries are invalid or duplicated")
+            seen.add(source_item_id)
+            canonical.append((source_item_id, asset_id, expected_revision))
+        canonical.sort()
+        request_digest = _digest(
+            [provider_domain, account_id, version_id]
+            + [json.dumps(item, separators=(",", ":"), ensure_ascii=False) for item in canonical]
+        )
+        with self._transaction():
+            previous = self._db.execute(
+                "SELECT request_digest,response_json FROM bulk_match_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            if previous is not None:
+                if previous["request_digest"] != request_digest:
+                    raise ValueError("Bulk approval operation ID was already used for another request")
+                result = json.loads(previous["response_json"])
+                result["idempotent_replay"] = True
+                return result
+            sources = []
+            for source_item_id, asset_id, expected_revision in canonical:
+                source = self._db.execute(
+                    """SELECT * FROM match_sources WHERE provider_domain=? AND account_id=?
+                    AND media_type='track' AND source_item_id=?""",
+                    (provider_domain, account_id, source_item_id),
+                ).fetchone()
+                if source is None or source["revision"] != expected_revision:
+                    raise ValueError("Match decision revision conflict")
+                if not self._db.execute(
+                    "SELECT 1 FROM match_candidates WHERE source_id=? AND asset_id=? AND active=1",
+                    (source["id"], asset_id),
+                ).fetchone():
+                    raise ValueError("Decision asset is not a current candidate")
+                sources.append((source, asset_id))
+            now = _now()
+            evidence_json = self._json_object(
+                {
+                    "kind": "explicit_bulk_user_review",
+                    "version_id": version_id,
+                    "operation_id": operation_id,
+                    "request_digest": request_digest,
+                },
+                "Decision evidence",
+            )
+            for source, asset_id in sources:
+                revision = source["revision"] + 1
+                self._db.execute(
+                    """INSERT INTO match_decisions
+                    (id,source_id,asset_id,action,revision,actor_id,evidence_json,algorithm_version,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(uuid.uuid4()), source["id"], asset_id, "approve", revision,
+                        actor_id, evidence_json, "ma-merged-mapping-v1", now,
+                    ),
+                )
+                self._db.execute(
+                    "UPDATE match_sources SET revision=?,approved_asset_id=?,updated_at=? WHERE id=?",
+                    (revision, asset_id, now, source["id"]),
+                )
+            result = {
+                "operation_id": operation_id,
+                "approved_count": len(sources),
+                "idempotent_replay": False,
+                "matches": [
+                    self.get_match_overlay(provider_domain, account_id, "track", source["source_item_id"])
+                    for source, _ in sources
+                ],
+            }
+            response_json = self._bounded_json(
+                result, "Bulk approval response", dict, limit=2 * 1024 * 1024
+            )
+            self._db.execute(
+                "INSERT INTO bulk_match_operations VALUES (?,?,?,?)",
+                (operation_id, request_digest, response_json, now),
+            )
+            return result
+
     def get_version_match_overlay(self, version_id: str) -> dict:
         version = self.get_version(version_id)
         subscription = self.get_subscription(version["subscription_id"])
@@ -1821,6 +1939,7 @@ class ArchiveStore:
             "match_candidates", "match_decisions", "playback_policies",
             "playback_projections", "provenance_subjects", "provenance_values",
             "provenance_overrides", "itunes_import_documents", "itunes_import_batches",
+            "bulk_match_operations",
         )
         queue_tables = {
             "capture": ("jobs", "state"),
@@ -1874,6 +1993,18 @@ class ArchiveStore:
                 "queues": queues,
                 "database_bytes": page_size * page_count,
                 "recent_jobs": recent[:recent_limit],
+                "match_review": {
+                    "approved_sources": self._db.execute(
+                        "SELECT COUNT(*) FROM match_sources WHERE approved_asset_id IS NOT NULL"
+                    ).fetchone()[0],
+                    "recent_decisions": [
+                        {"action": row[0], "created_at": row[1]}
+                        for row in self._db.execute(
+                            "SELECT action,created_at FROM match_decisions ORDER BY created_at DESC,id DESC LIMIT ?",
+                            (recent_limit,),
+                        )
+                    ],
+                },
             }
 
     def recover_pending(self) -> int:

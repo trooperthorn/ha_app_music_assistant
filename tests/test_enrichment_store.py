@@ -39,6 +39,7 @@ def test_diagnostics_are_bounded_aggregates_without_identifiers_or_errors(tmp_pa
     assert result["counts"]["subscriptions"] == 1
     assert result["counts"]["jobs"] == 1
     assert result["queues"]["capture"] == {"failed": 1}
+    assert result["match_review"] == {"approved_sources": 0, "recent_decisions": []}
     assert result["recent_jobs"] == [
         {
             "kind": "capture",
@@ -605,13 +606,72 @@ def test_match_assets_candidates_decisions_and_version_overlay(tmp_path):
     assert cleared["candidates"][0]["rejected"] is False
     assert cleared["decision"]["action"] == "clear"
     assert [entry["action"] for entry in cleared["decision_history"]] == ["reject", "approve", "clear"]
-
     version_overlay = store.get_version_match_overlay(version)
     assert version_overlay["content_digest"] == store.get_version(version)["content_digest"]
     assert version_overlay["occurrences"][0]["match"]["revision"] == 3
     assert version_overlay["occurrences"][1]["match"] is None
     assert version_overlay["occurrences"][2]["match"]["source"]["source_item_id"] == "spotify-track"
     assert len(store.list_match_overlays("spotify", "account-a", "track")) == 1
+    store.close()
+
+
+def test_bulk_match_approval_is_atomic_idempotent_and_bounded(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    assets = []
+    approvals = []
+    for index in range(2):
+        source_id = f"source-{index}"
+        asset = store.upsert_local_asset(
+            "track", "filesystem", f"track-{index}.flac", {}, {}
+        )
+        assets.append(asset)
+        store.replace_match_candidates(
+            "spotify", "account-a", "track", source_id,
+            [{"asset_id": asset["id"], "score": 0.5, "evidence": {}}], "v1",
+        )
+        approvals.append(
+            {"source_item_id": source_id, "asset_id": asset["id"], "expected_revision": 0}
+        )
+
+    result = store.approve_match_candidates(
+        "spotify", "account-a", approvals, "admin", "operation-1", "version-1"
+    )
+    assert result["approved_count"] == 2
+    assert result["idempotent_replay"] is False
+    original_matches = result["matches"]
+    store.clear_match_decision("spotify", "account-a", "track", "source-0", 1, "admin")
+    replay = store.approve_match_candidates(
+        "spotify", "account-a", approvals, "admin", "operation-1", "version-1"
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["matches"] == original_matches
+    assert store.get_match_overlay("spotify", "account-a", "track", "source-0")["revision"] == 2
+
+    changed = [*approvals]
+    changed[0] = {**changed[0], "asset_id": assets[1]["id"]}
+    with pytest.raises(ValueError, match="already used"):
+        store.approve_match_candidates(
+            "spotify", "account-a", changed, "admin", "operation-1", "version-1"
+        )
+    store.replace_match_candidates(
+        "spotify", "account-a", "track", "source-2",
+        [{"asset_id": assets[0]["id"], "score": 0.5, "evidence": {}}], "v1",
+    )
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.approve_match_candidates(
+            "spotify", "account-a",
+            [
+                {"source_item_id": "source-2", "asset_id": assets[0]["id"], "expected_revision": 1},
+                {"source_item_id": "source-0", "asset_id": assets[0]["id"], "expected_revision": 1},
+            ],
+            "admin", "operation-2", "version-1",
+        )
+    assert store.get_match_overlay("spotify", "account-a", "track", "source-2")["revision"] == 0
+    with pytest.raises(ValueError, match="1..200"):
+        store.approve_match_candidates(
+            "spotify", "account-a", [], "admin", "operation-empty", "version-1"
+        )
+
     store.close()
 
 
