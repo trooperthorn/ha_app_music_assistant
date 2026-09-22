@@ -682,8 +682,13 @@ class LibraryEnrichmentProvider(PluginProvider):
         uris = [row["uri"] for row in rows if row.get("state") == "matched"]
         if (not allow_partial and len(uris) != preview.get("selected_occurrences")) or len(uris) > MAX_ITUNES_APPLY_OCCURRENCES:
             raise InvalidDataError("The iTunes projection is incomplete or exceeds its limit")
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", playlists[0].get("name", "")).strip()[:120]
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", playlists[0].get("name", "")).strip()
         name = name or "Imported iTunes playlist"
+        # Always marked, collision or not: makes every import traceable to its iTunes
+        # origin at a glance and keeps it visually distinct from any existing playlist
+        # of the same name (Music Assistant's own import does not dedupe by name).
+        itunes_suffix = " (iTunes)"
+        name = name[: 120 - len(itunes_suffix)] + itunes_suffix
         builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
         if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)):
             raise InvalidDataError("An accessible compatible builtin playlist provider is required")

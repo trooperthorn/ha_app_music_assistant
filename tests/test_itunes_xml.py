@@ -122,6 +122,159 @@ def test_size_and_mapping_contracts_are_bounded(tmp_path):
         module.inspect_itunes_xml(path, path_mappings=[{"source_prefix": "F:/"}])
 
 
+def test_playlist_rename_keeps_source_identity_stable(tmp_path):
+    def body(name):
+        return f"""
+        <key>Tracks</key><dict></dict>
+        <key>Playlists</key><array>
+          <dict><key>Name</key><string>{name}</string>
+            <key>Playlist Persistent ID</key><string>STABLEID</string>
+            <key>Playlist Items</key><array></array></dict>
+        </array>
+        """
+
+    first_dir = tmp_path / "a"
+    second_dir = tmp_path / "b"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    before = module.inspect_itunes_xml(write_library(first_dir, body("Road Trip")))
+    after = module.inspect_itunes_xml(write_library(second_dir, body("Summer Road Trip 2026")))
+    assert before["playlists"][0]["source_playlist_id"] == after["playlists"][0]["source_playlist_id"] == "STABLEID"
+    assert before["playlists"][0]["name"] == "Road Trip"
+    assert after["playlists"][0]["name"] == "Summer Road Trip 2026"
+    assert before["playlists"][0]["identity_fallback"] is False
+    assert after["playlists"][0]["identity_fallback"] is False
+
+
+def test_repeated_source_track_survives_multiple_occurrences(tmp_path):
+    body = """
+    <key>Tracks</key><dict>
+      <key>1</key><dict><key>Track ID</key><integer>1</integer><key>Persistent ID</key><string>TRACKA</string>
+        <key>Location</key><string>file://localhost/F:/Music/Song.mp3</string></dict>
+    </dict>
+    <key>Playlists</key><array>
+      <dict><key>Name</key><string>Repeats</string><key>Playlist Persistent ID</key><string>PL</string>
+        <key>Playlist Items</key><array>
+          <dict><key>Track ID</key><integer>1</integer></dict>
+          <dict><key>Track ID</key><integer>1</integer></dict>
+          <dict><key>Track ID</key><integer>1</integer></dict>
+          <dict><key>Track ID</key><integer>404</integer></dict>
+          <dict><key>Track ID</key><integer>404</integer></dict>
+        </array></dict>
+    </array>
+    """
+    result = module.inspect_itunes_xml(
+        write_library(tmp_path, body),
+        path_mappings=[{"source_prefix": "F:/Music/", "target_prefix": "Music", "provider_instance_id": "fs"}],
+    )
+    playlist = result["playlists"][0]
+    assert [row["source_item_id"] for row in playlist["occurrences"][:3]] == ["TRACKA"] * 3
+    assert [row["state"] for row in playlist["occurrences"]] == ["track", "track", "track", "missing_reference", "missing_reference"]
+    # duplicate_occurrence_count only tallies resolved occurrences (missing references have no source_item_id key in `seen`)
+    assert playlist["duplicate_occurrence_count"] == 2
+    assert playlist["occurrence_count"] == 5
+
+
+@pytest.mark.parametrize("kind", ["Podcast", "Audiobook file", "TV Show", "MPEG-4 movie file"])
+def test_podcast_book_and_video_kinds_are_all_classified_unsupported(tmp_path, kind):
+    body = f"""
+    <key>Tracks</key><dict>
+      <key>1</key><dict><key>Track ID</key><integer>1</integer><key>Kind</key><string>{kind}</string></dict>
+    </dict>
+    <key>Playlists</key><array>
+      <dict><key>Name</key><string>Mixed</string><key>Playlist Persistent ID</key><string>PL</string>
+        <key>Playlist Items</key><array><dict><key>Track ID</key><integer>1</integer></dict></array></dict>
+    </array>
+    """
+    result = module.inspect_itunes_xml(write_library(tmp_path, body))
+    assert result["tracks"]["1"]["media_type"] == "unsupported"
+    assert result["playlists"][0]["occurrences"][0]["state"] == "unsupported"
+    assert result["mapping_summary"]["unsupported"] == 1
+
+
+def test_disjoint_old_roots_map_independently_into_the_same_target(tmp_path):
+    body = """
+    <key>Tracks</key><dict>
+      <key>1</key><dict><key>Track ID</key><integer>1</integer>
+        <key>Location</key><string>file://localhost/F:/Music/A.mp3</string></dict>
+      <key>2</key><dict><key>Track ID</key><integer>2</integer>
+        <key>Location</key><string>file://localhost/G:/OldStuff/B.mp3</string></dict>
+    </dict>
+    <key>Playlists</key><array>
+      <dict><key>Name</key><string>Combined</string><key>Playlist Persistent ID</key><string>PL</string>
+        <key>Playlist Items</key><array>
+          <dict><key>Track ID</key><integer>1</integer></dict>
+          <dict><key>Track ID</key><integer>2</integer></dict>
+        </array></dict>
+    </array>
+    """
+    result = module.inspect_itunes_xml(
+        write_library(tmp_path, body),
+        path_mappings=[
+            {"source_prefix": "F:/Music/", "target_prefix": "Music", "provider_instance_id": "fs"},
+            {"source_prefix": "G:/OldStuff/", "target_prefix": "Music", "provider_instance_id": "fs"},
+        ],
+    )
+    assert {row["source_root"] for row in result["roots"]} == {"F:/", "G:/"}
+    occurrences = result["playlists"][0]["occurrences"]
+    assert occurrences[0]["path"]["provider_item_id"] == "Music/A.mp3"
+    assert occurrences[1]["path"]["provider_item_id"] == "Music/B.mp3"
+    assert result["mapping_summary"] == {"matched": 2, "unresolved": 0, "ambiguous": 0, "unsupported": 0}
+
+
+def test_lowercase_and_uppercase_drive_letters_merge_into_one_root(tmp_path):
+    body = """
+    <key>Tracks</key><dict>
+      <key>1</key><dict><key>Track ID</key><integer>1</integer>
+        <key>Location</key><string>file://localhost/F:/Music/A.mp3</string></dict>
+      <key>2</key><dict><key>Track ID</key><integer>2</integer>
+        <key>Location</key><string>file://localhost/f:/Music/B.mp3</string></dict>
+    </dict>
+    <key>Playlists</key><array></array>
+    """
+    result = module.inspect_itunes_xml(write_library(tmp_path, body))
+    assert result["path_roots"] == [{"root": "F:/", "source_root": "F:/", "track_count": 2}]
+
+
+def test_mapping_prefix_matches_regardless_of_case_and_accepts_backslash_separators(tmp_path):
+    body = """
+    <key>Tracks</key><dict>
+      <key>1</key><dict><key>Track ID</key><integer>1</integer>
+        <key>Location</key><string>file://localhost/F:/Music/Song.mp3</string></dict>
+    </dict>
+    <key>Playlists</key><array>
+      <dict><key>Name</key><string>Case</string><key>Playlist Persistent ID</key><string>PL</string>
+        <key>Playlist Items</key><array><dict><key>Track ID</key><integer>1</integer></dict></array></dict>
+    </array>
+    """
+    result = module.inspect_itunes_xml(
+        write_library(tmp_path, body),
+        path_mappings=[{"source_prefix": "f:\\music\\", "target_prefix": "Media\\Sub", "provider_instance_id": "fs"}],
+    )
+    mapped = result["playlists"][0]["occurrences"][0]["path"]
+    assert mapped["state"] == "mapped"
+    assert mapped["provider_item_id"] == "Media/Sub/Song.mp3"
+
+
+def test_percent_encoded_unicode_location_decodes_correctly(tmp_path):
+    body = """
+    <key>Tracks</key><dict>
+      <key>1</key><dict><key>Track ID</key><integer>1</integer>
+        <key>Location</key><string>file://localhost/F:/Musique/Chanson%20%C3%A9t%C3%A9.mp3</string></dict>
+    </dict>
+    <key>Playlists</key><array>
+      <dict><key>Name</key><string>Unicode</string><key>Playlist Persistent ID</key><string>PL</string>
+        <key>Playlist Items</key><array><dict><key>Track ID</key><integer>1</integer></dict></array></dict>
+    </array>
+    """
+    result = module.inspect_itunes_xml(
+        write_library(tmp_path, body),
+        path_mappings=[{"source_prefix": "F:/Musique/", "target_prefix": "Musique", "provider_instance_id": "fs"}],
+    )
+    mapped = result["playlists"][0]["occurrences"][0]["path"]
+    assert mapped["provider_item_id"] == "Musique/Chanson été.mp3"
+
+
 def test_missing_library_identity_and_playlist_identity_have_stable_fallbacks(tmp_path):
     body = """
       <key>Tracks</key><dict></dict><key>Playlists</key><array>

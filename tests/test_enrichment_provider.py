@@ -587,6 +587,80 @@ def _itunes_apply_preview(plugin, *, resolved=True, duplicate=False):
     return inspected, preview
 
 
+def test_itunes_apply_always_suffixes_the_created_playlist_name_with_itunes(plugin):
+    inspected, preview = _itunes_apply_preview(plugin)
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    destination = types.SimpleNamespace(
+        item_id="itunes-playlist-1",
+        provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="itunes-file")],
+    )
+    seen_header = {}
+
+    async def import_playlist(m3u, *, library_matching):
+        seen_header["line"] = m3u.splitlines()[1]
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    asyncio.run(plugin.provider.itunes_apply(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    ))
+    # Source playlist in the fixture is named "Favorites" (see _write_itunes_xml).
+    assert seen_header["line"] == "#PLAYLIST:Favorites (iTunes)"
+    assert plugin.provider._store.get_itunes_apply(preview["inspection_id"])["requested_name"] == "Favorites (iTunes)"
+
+
+def test_itunes_apply_long_playlist_name_keeps_the_itunes_suffix_within_the_length_limit(plugin):
+    long_name = "A" * 200
+    source = _write_itunes_xml(plugin)
+    source.write_text(source.read_text(encoding="utf-8").replace("Favorites", long_name), encoding="utf-8")
+    filesystem = types.SimpleNamespace(
+        instance_id="filesystem-a", domain="filesystem_local", available=True, is_streaming_provider=False,
+    )
+    plugin.provider.mass.music.providers.append(filesystem)
+    mapping = types.SimpleNamespace(provider_instance="filesystem-a", item_id="Music/Artist/Song.mp3")
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(
+        item_id="library-track-1", provider_mappings=[mapping]
+    )
+    inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    preview = asyncio.run(plugin.provider.itunes_preview(
+        inspected["inspection_id"], inspected["source_digest"],
+        [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "filesystem-a"}],
+        ["PLAYLIST"],
+    ))
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    destination = types.SimpleNamespace(
+        item_id="itunes-playlist-1",
+        provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="itunes-file")],
+    )
+    seen_header = {}
+
+    async def import_playlist(m3u, *, library_matching):
+        seen_header["line"] = m3u.splitlines()[1]
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    asyncio.run(plugin.provider.itunes_apply(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    ))
+    applied_name = seen_header["line"].removeprefix("#PLAYLIST:")
+    assert len(applied_name) == 120
+    assert applied_name.endswith(" (iTunes)")
+
+
 def test_itunes_apply_uses_verified_library_ids_and_preserves_ordered_duplicates(plugin):
     inspected, preview = _itunes_apply_preview(plugin, duplicate=True)
     assert preview["matched"] == 2 and preview["unresolved"] == 0
@@ -649,6 +723,140 @@ def test_itunes_preview_rejects_unbound_or_streaming_path_provider(plugin):
             inspected["inspection_id"], inspected["source_digest"],
             [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "spotify-a"}],
             ["PLAYLIST"],
+        ))
+
+
+def test_itunes_preview_marks_duplicate_exact_provider_mappings_as_ambiguous(plugin):
+    source = _write_itunes_xml(plugin)
+    filesystem = types.SimpleNamespace(
+        instance_id="filesystem-a", domain="filesystem_local", available=True, is_streaming_provider=False,
+    )
+    plugin.provider.mass.music.providers.append(filesystem)
+    # Two provider_mappings entries both exactly match the resolved (provider, item_id)
+    # key, so the library lookup itself cannot tell which library item is the real one.
+    mapping = types.SimpleNamespace(provider_instance="filesystem-a", item_id="Music/Artist/Song.mp3")
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(
+        item_id="library-track-1", provider_mappings=[mapping, mapping]
+    )
+    inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    preview = asyncio.run(plugin.provider.itunes_preview(
+        inspected["inspection_id"], inspected["source_digest"],
+        [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "filesystem-a"}],
+        ["PLAYLIST"],
+    ))
+    assert preview["ambiguous"] == 1 and preview["matched"] == 0
+    assert preview["playlists"][0]["rows"][0]["state"] == "ambiguous"
+
+
+def test_itunes_apply_rejects_source_that_changed_after_preview(plugin):
+    inspected, preview = _itunes_apply_preview(plugin)
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock()
+
+    # Mutate the staged XML on disk after preview committed a digest, before apply re-reads it.
+    source = plugin.provider._itunes_import_root / "legacy.xml"
+    source.write_text(source.read_text(encoding="utf-8").replace("Song", "Song (edited)"), encoding="utf-8")
+
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    with pytest.raises(Exception, match="source changed"):
+        asyncio.run(plugin.provider.itunes_apply(**args))
+    plugin.provider.mass.music.playlists.import_playlist.assert_not_called()
+
+
+def test_itunes_apply_rejects_filesystem_provider_that_disappeared_after_preview(plugin):
+    inspected, preview = _itunes_apply_preview(plugin)
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock()
+
+    # The filesystem provider that resolved during preview is now gone (removed, rebound
+    # to a different instance id, or just marked unavailable) by the time apply runs.
+    plugin.provider.mass.music.providers = [
+        candidate for candidate in plugin.provider.mass.music.providers
+        if candidate.instance_id != "filesystem-a"
+    ]
+
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    with pytest.raises(Exception, match="unavailable to this user"):
+        asyncio.run(plugin.provider.itunes_apply(**args))
+    plugin.provider.mass.music.playlists.import_playlist.assert_not_called()
+
+
+def test_itunes_apply_becomes_uncertain_and_is_not_retried_when_verification_fails_after_creation(plugin):
+    inspected, preview = _itunes_apply_preview(plugin)
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(side_effect=OSError("disk read failed")),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    destination = types.SimpleNamespace(
+        item_id="itunes-playlist-1",
+        provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="itunes-file")],
+    )
+    import_playlist = AsyncMock(return_value=destination)
+    plugin.provider.mass.music.playlists.import_playlist = import_playlist
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    # The playlist was actually created in Music Assistant before the crash, so this must
+    # not be reported as a clean failure, and a retry must not create a second playlist.
+    with pytest.raises(Exception, match="outcome uncertain"):
+        asyncio.run(plugin.provider.itunes_apply(**args))
+    status = asyncio.run(plugin.provider.itunes_apply_status(preview["inspection_id"]))
+    assert status["state"] == "uncertain"
+    # A retry with the identical, still-matching intent must not blindly recreate the
+    # playlist: it returns the existing uncertain outcome instead of trying again.
+    retried = asyncio.run(plugin.provider.itunes_apply(**args))
+    assert retried["state"] == "uncertain"
+    assert import_playlist.await_count == 1
+
+
+def test_itunes_preview_and_apply_enforce_the_occurrence_limit(plugin, monkeypatch):
+    inspected, preview = _itunes_apply_preview(plugin)
+    assert preview["selected_occurrences"] == 1
+    # Lowering the configured limit below what was already resolved at preview time
+    # (e.g. an admin retightened it) must still fail closed at apply.
+    monkeypatch.setattr(plugin.module, "MAX_ITUNES_APPLY_OCCURRENCES", 0)
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock()
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    with pytest.raises(Exception, match="exceeds its limit"):
+        asyncio.run(plugin.provider.itunes_apply(**args))
+    plugin.provider.mass.music.playlists.import_playlist.assert_not_called()
+
+    # And preview itself refuses to stage a selection above the configured limit.
+    source = _write_itunes_xml(plugin)
+    monkeypatch.setattr(plugin.module, "MAX_ITUNES_APPLY_OCCURRENCES", 0)
+    inspected_again = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    with pytest.raises(Exception, match="exceed 0 occurrences"):
+        asyncio.run(plugin.provider.itunes_preview(
+            inspected_again["inspection_id"], inspected_again["source_digest"],
+            [], ["PLAYLIST"],
         ))
 
 
