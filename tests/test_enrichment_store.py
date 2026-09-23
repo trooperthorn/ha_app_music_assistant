@@ -109,6 +109,52 @@ def test_playback_policy_cas_and_projection_checkpoint_are_independent(tmp_path)
     store.close()
 
 
+def test_mirror_checkpoint_preserves_last_applied_version_and_requires_explicit_detach(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version_a = capture(store, sub)
+    version_b = capture(store, sub, snapshot="B")
+    mirror = store.configure_mirror(sub, True, False, 0)
+    assert mirror["state"] == "pending" and mirror["enabled"] == 1
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.configure_mirror(sub, True, False, 0)
+    store.prepare_mirror(sub, version_a, "a" * 64)
+    store.mark_mirror_writing(sub)
+    applied = store.commit_mirror(sub, "mirror-1", "builtin", "a" * 64, "b" * 64)
+    assert applied["applied_version_id"] == version_a
+    store.prepare_mirror(sub, version_b, "c" * 64)
+    failed = store.fail_mirror(sub, "Destination unavailable")
+    assert failed["state"] == "failed" and failed["applied_version_id"] == version_a
+    assert failed["destination_item_id"] == "mirror-1"
+    store.prepare_mirror(sub, version_b, "c" * 64)
+    store.mark_mirror_writing(sub)
+    uncertain = store.fail_mirror(sub, "Write outcome unknown", uncertain=True)
+    assert uncertain["state"] == "uncertain" and uncertain["applied_version_id"] == version_a
+    with pytest.raises(ValueError, match="reconciliation"):
+        store.configure_mirror(sub, False, False, uncertain["revision"])
+    with pytest.raises(ValueError, match="unresolved"):
+        store.detach_mirror(sub, "mirror-1", "b" * 64)
+    store.close()
+
+
+def test_mirror_detach_preserves_identity_until_explicit_new_destination(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.configure_mirror(sub, True, True, 0)
+    store.prepare_mirror(sub, version, "a" * 64)
+    store.mark_mirror_writing(sub)
+    store.commit_mirror(sub, "mirror-1", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="changed"):
+        store.detach_mirror(sub, "wrong", "b" * 64)
+    detached = store.detach_mirror(sub, "mirror-1", "b" * 64)
+    assert detached["state"] == "detached" and detached["destination_item_id"] == "mirror-1"
+    renewed = store.configure_mirror(sub, True, True, detached["revision"])
+    assert renewed["state"] == "pending" and renewed["destination_item_id"] is None
+    assert renewed["applied_version_id"] is None
+    store.close()
+
+
 def test_faithful_occurrences_and_empty_playlist(tmp_path):
     store = ArchiveStore(tmp_path / "archive.db")
     sub = subscribe(store)

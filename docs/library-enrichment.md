@@ -52,13 +52,20 @@ provider before its commands are registered. It never auto-starts a capture.
 - Playback projection is a separate, explicit write with digest and policy-revision
   preconditions. Its durable checkpoint is independent of archive-copy apply.
   Synchronization never creates or updates a playback playlist.
+- A maintained mirror is separately opt-in per source subscription. It writes a
+  builtin playlist of ordered Spotify track references after a complete committed
+  source capture, and skips a destination write when projected content is unchanged.
+  Its own checkpoint records the last applied version and the exact destination
+  fingerprint. Archive refresh still succeeds when a mirror write fails. External
+  playlist edits stop mirror updates; explicit detach preserves that playlist and
+  permits a later new destination. Uncertain writes are never retried automatically.
 - Read-only provenance extracts a bounded, typed Spotify field set from the
   committed immutable payload without refreshing Spotify or Music Assistant.
 - That provenance read can append a version-bound snapshot of MusicBrainz
   recording, release-track, release, release-group and ordered artist-credit
   identities already present in the Music Assistant library. It uses only the
   existing Spotify provider mapping and never searches or refreshes a provider.
-- Playlist item provenance links known builtin archive and playback destinations
+- Playlist item provenance links known builtin archive, playback and mirror destinations
   to their subscription, snapshots, and durable check state.
 - A staged legacy iTunes XML export can be inspected with bounded parsing and
   explicit path mappings. The source digest, selection and preview are durable;
@@ -69,8 +76,8 @@ provider before its commands are registered. It never auto-starts a capture.
 
 These are metadata/reference archives, not downloaded audio. A visible applied
 playlist contains Spotify references and does not establish local playback. This
-slice does not automatically update an applied visible playlist or playback
-projection, expose a bulk UI, support Liked Songs, automatically approve local
+slice does not automatically update an archive-copy playlist or playback
+projection, support Liked Songs, automatically approve local
 matches, or replace coordinated
 MA backup/restore. It does not change ordinary detail-page behavior. The existing
 bridge bulk copy remains a separate name-based export and is not a durable archive.
@@ -94,7 +101,7 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/version` | `version_id` | immutable ordered occurrence capture, verified against content digest |
 | `library_enrichment/versions` | `subscription_id`, optional `limit` (1..200, default 50), `offset` | newest-first version metadata; stable timestamp/ID ordering |
 | `library_enrichment/provenance` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned typed provenance and effective values; no inline raw payload |
-| `library_enrichment/item_provenance` | `media_type` (`playlist`), `library_item_id` | builtin destination linkage and `current`, `source_changed`, `capture_pending`, `capture_failed`, or `unknown` state |
+| `library_enrichment/item_provenance` | `media_type` (`playlist`), `library_item_id` | builtin destination linkage and current, source/capture, mirror conflict/uncertain/detached, or unknown state |
 | `library_enrichment/itunes_inspect` | `library_path` under the advertised staging directory | bounded XML inventory, stable identities, playlist classifications and old path roots; no MA library write |
 | `library_enrichment/itunes_preview` | `inspection_id`, `source_digest`, explicit provider-bound `path_mappings`, selected `playlist_ids` | durable digest-bound actual MA library resolution and ordered preview; no write |
 | `library_enrichment/itunes_apply` | `inspection_id`, `revision`, `source_digest`, `preview_digest`, one `playlist_id`, optional `allow_partial` | explicitly create and verify one ordered builtin playlist; also requires `library.write` |
@@ -114,6 +121,12 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/playback_preview` | `version_id` | ordered rows, explicit fallbacks, visible gaps, counts, policy revision and digest |
 | `library_enrichment/playback_apply` | `version_id`, `expected_digest`, `expected_policy_revision`, optional `allow_partial` | explicitly write and verify the builtin playback projection; also requires `library.write` |
 | `library_enrichment/playback_status` | `subscription_id` | policy plus independent durable projection state and destination |
+| `library_enrichment/playback_detach` | `subscription_id`, `expected_destination_item_id`, `expected_content_digest` | release ownership of an edited playback destination without deleting its playlist; also requires `library.write` |
+| `library_enrichment/mirror_status` | `subscription_id` | separate revisioned mirror state, last applied version, destination and failure |
+| `library_enrichment/mirror_preview` | `subscription_id` | current committed source projection, order, omissions and digest; no write |
+| `library_enrichment/mirror_configure` | `subscription_id`, `enabled`, `allow_partial`, `expected_revision` | opt in or pause with compare-and-swap; also requires `library.write` |
+| `library_enrichment/mirror_apply` | `subscription_id`, `expected_version_id`, `expected_digest` | explicitly create or update the verified builtin mirror; also requires `library.write` |
+| `library_enrichment/mirror_detach` | `subscription_id`, `expected_destination_item_id`, `expected_content_digest` | preserve the destination playlist and release it from automatic updates; also requires `library.write` |
 
 Local match review is an overlay on the immutable Spotify occurrence archive. It
 uses direct MA library lookups and only considers mappings owned by an available,

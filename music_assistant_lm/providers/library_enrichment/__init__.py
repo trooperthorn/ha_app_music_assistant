@@ -44,6 +44,10 @@ MAX_ITUNES_ZIP_UPLOAD_BYTES = 15 * 1024 * 1024
 MAX_ITUNES_APPLY_OCCURRENCES = 10000
 
 
+class MirrorDestinationConflict(Exception):
+    """A user or another provider changed a mirror destination outside this provider."""
+
+
 async def setup(mass, manifest, config):
     """Construct the provider using the standard MA lifecycle."""
     return LibraryEnrichmentProvider(mass, manifest, config)
@@ -105,6 +109,11 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("playback_apply", self.playback_apply),
             ("playback_status", self.playback_status),
             ("playback_detach", self.playback_detach),
+            ("mirror_status", self.mirror_status),
+            ("mirror_preview", self.mirror_preview),
+            ("mirror_configure", self.mirror_configure),
+            ("mirror_apply", self.mirror_apply),
+            ("mirror_detach", self.mirror_detach),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -191,7 +200,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             "itunes_zip_directory": str(self._itunes_zip_root),
             "max_itunes_preview_page": 200,
             "inspection": "library_only_no_refresh",
-            "mirror_apply": False,
+            "mirror_apply": True,
+            "mirror_api_version": 1,
             "archive_apply": True,
             "apply_api_version": 1,
             "subscription_sync": True,
@@ -1256,7 +1266,8 @@ class LibraryEnrichmentProvider(PluginProvider):
                     else None
                 )
                 playback = self._store.get_playback_projection(subscription["id"])
-                for kind, destination in (("archive", archive), ("playback", playback)):
+                mirror = self._store.get_mirror(subscription["id"])
+                for kind, destination in (("archive", archive), ("playback", playback), ("mirror", mirror)):
                     if destination and str(destination.get("destination_item_id")) == library_item_id:
                         capture_jobs = [
                             job for job in self._store.list_jobs() if job["subscription_id"] == subscription["id"]
@@ -1278,6 +1289,15 @@ class LibraryEnrichmentProvider(PluginProvider):
             capture_jobs and capture_jobs[-1]["state"] == "failed"
         ):
             state = "capture_failed"
+        elif kind == "mirror" and destination.get("state") == "conflict":
+            state = "mirror_conflict"
+        elif kind == "mirror" and destination.get("state") in ("writing", "uncertain"):
+            state = "mirror_uncertain"
+        elif kind == "mirror" and destination.get("state") in ("detached", "disabled"):
+            state = "mirror_detached"
+        elif kind == "mirror" and (destination.get("state") != "applied" or
+                                   destination.get("applied_version_id") != subscription.get("committed_version_id")):
+            state = "source_changed"
         elif subscription.get("observed_snapshot") and subscription.get("observed_snapshot") != subscription.get("committed_snapshot"):
             state = "source_changed"
         elif subscription.get("committed_version_id"):
@@ -1291,7 +1311,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             "state": state,
             "destination": {"kind": kind, "item_id": library_item_id,
                             "provider_instance_id": destination.get("destination_provider_instance"),
-                            "version_id": destination.get("version_id"), "updated_at": destination.get("updated_at")},
+                            "version_id": destination.get("version_id") or destination.get("applied_version_id"),
+                            "updated_at": destination.get("updated_at")},
             "subscription": {key: subscription.get(key) for key in
                              ("id", "provider_domain", "account_id", "source_playlist_id", "name")},
             "snapshots": {
@@ -1689,6 +1710,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             await self._store_operation(self._store.observe_sync, job["id"], preview["snapshot_id"])
             if preview["snapshot_id"] == subscription["committed_snapshot"]:
                 await self._store_operation(self._store.succeed_sync, job["id"], subscription["committed_version_id"])
+                await self._advance_enabled_mirror(subscription["id"])
                 return
             preparation = asyncio.create_task(asyncio.to_thread(
                 self._store.begin_capture, subscription["id"], preview["snapshot_id"], job["id"]
@@ -1714,6 +1736,7 @@ class LibraryEnrichmentProvider(PluginProvider):
                     snapshot_after=result["snapshot_after"], total=result["total"], occurrences=result["occurrences"])
             )
             await self._store_operation(self._store.succeed_sync, job["id"], version_id)
+            await self._advance_enabled_mirror(subscription["id"])
         except BaseException as err:
             if capture_id:
                 try:
@@ -1748,6 +1771,24 @@ class LibraryEnrichmentProvider(PluginProvider):
             task_id = self._sync_jobs.pop(job["id"], None)
             if task_id:
                 self._sync_stopping.discard(task_id)
+
+    async def _advance_enabled_mirror(self, subscription_id: str) -> None:
+        """A destination failure never invalidates the successful immutable source capture."""
+        try:
+            mirror = await self._store_operation(self._store.get_mirror, subscription_id)
+            if mirror is None or not mirror["enabled"]:
+                return
+            user = get_current_user()
+            if user is None or not has_scope(user, Scope.LIBRARY_WRITE):
+                await self._store_operation(self._store.fail_mirror, subscription_id,
+                                            "Mirror owner no longer has library write permission")
+                return
+            async with self._write_lock:
+                await self._advance_mirror(subscription_id)
+        except Exception:
+            # _advance_mirror records the specific destination failure. The source
+            # sync has already committed and is independently successful.
+            return
 
     @staticmethod
     def _projection(version):
@@ -1786,6 +1827,161 @@ class LibraryEnrichmentProvider(PluginProvider):
                                      "uri": f"library://playlist/{job['destination_item_id']}", "name": job["requested_name"],
                                      "builtin_provider_instance": job.get("destination_provider_instance")}
         return result
+
+    @staticmethod
+    def _mirror_projection(version: dict, subscription: dict) -> tuple[dict, str, list[str]]:
+        """A stable Spotify-reference mirror, separate from archive copies and playback policy."""
+        ids, omitted = [], []
+        for occurrence in version["occurrences"]:
+            source_id = occurrence.get("source_item_id")
+            if occurrence.get("state") == "track" and isinstance(source_id, str) \
+                    and re.fullmatch(r"[A-Za-z0-9]{22}", source_id):
+                ids.append(source_id)
+            else:
+                omitted.append({"position": occurrence["position"], "state": occurrence.get("state", "invalid")})
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", subscription.get("name") or "Spotify playlist").strip()
+        name = f"{name[:120] or 'Spotify playlist'} - mirror"
+        document = {"name": name, "ids": ids, "omitted": omitted}
+        digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        uris = [f"spotify://track/{item}" for item in ids]
+        m3u = "#EXTM3U\n#PLAYLIST:" + name + "\n" + "".join(f"{uri}\n" for uri in uris)
+        preview = {"subscription_id": subscription["id"], "version_id": version["id"], "name": name,
+                   "source_count": version["total"], "projected_count": len(ids), "omitted_count": len(omitted),
+                   "omitted": omitted, "projection_digest": digest, "requires_partial_consent": bool(omitted)}
+        return preview, m3u, uris
+
+    async def mirror_status(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        mirror = await self._read_store(self._store.get_mirror, subscription_id)
+        return mirror or {"subscription_id": subscription_id, "revision": 0, "enabled": 0,
+                          "allow_partial": 0, "state": "disabled", "destination_item_id": None}
+
+    async def mirror_preview(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        subscription = await self._read_store(self._store.get_subscription, subscription_id)
+        if not subscription["committed_version_id"]:
+            raise InvalidDataError("Capture this source before creating a maintained mirror")
+        version = await self._read_store(self._store.get_version, subscription["committed_version_id"])
+        preview, _, _ = self._mirror_projection(version, subscription)
+        return preview
+
+    async def mirror_configure(self, subscription_id: str, enabled: bool, allow_partial: bool,
+                               expected_revision: int) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Configuring a maintained mirror requires library write permission")
+        async with self._write_lock:
+            try:
+                return await self._store_operation(
+                    self._store.configure_mirror, subscription_id, enabled, allow_partial, expected_revision,
+                )
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+
+    async def mirror_apply(self, subscription_id: str, expected_version_id: str,
+                           expected_digest: str) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Applying a maintained mirror requires library write permission")
+        async with self._write_lock:
+            return await self._advance_mirror(subscription_id, expected_version_id, expected_digest)
+
+    async def mirror_detach(self, subscription_id: str, expected_destination_item_id: str,
+                            expected_content_digest: str | None = None) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Detaching a maintained mirror requires library write permission")
+        async with self._write_lock:
+            try:
+                return await self._store_operation(
+                    self._store.detach_mirror, subscription_id, expected_destination_item_id,
+                    expected_content_digest,
+                )
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+
+    async def _advance_mirror(self, subscription_id: str, expected_version_id: str | None = None,
+                              expected_digest: str | None = None) -> dict[str, Any]:
+        """Advance a committed source mirror; never make archive sync depend on destination writes."""
+        subscription = await self._store_operation(self._store.get_subscription, subscription_id)
+        version_id = subscription["committed_version_id"]
+        if not version_id or (expected_version_id is not None and version_id != expected_version_id):
+            raise InvalidDataError("Committed source changed; preview the mirror again")
+        mirror = await self._store_operation(self._store.get_mirror, subscription_id)
+        if mirror is None or not mirror["enabled"] or mirror["state"] in ("uncertain", "conflict", "writing"):
+            raise InvalidDataError("Mirror is disabled or requires reconciliation")
+        version = await self._store_operation(self._store.get_version, version_id)
+        preview, m3u, uris = self._mirror_projection(version, subscription)
+        digest = preview["projection_digest"]
+        if expected_digest is not None and expected_digest != digest:
+            raise InvalidDataError("Mirror preview changed; review it again")
+        if preview["requires_partial_consent"] and not mirror["allow_partial"]:
+            await self._store_operation(self._store.fail_mirror, subscription_id,
+                                        "Source contains unsupported occurrences; approve a partial mirror")
+            raise InvalidDataError("Source contains unsupported occurrences; approve a partial mirror")
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not all(callable(getattr(builtin, name, None)) for name in
+                                      ("_read_m3u_file", "_write_m3u_file", "_get_playlist_lock")):
+            await self._store_operation(self._store.fail_mirror, subscription_id, "Builtin playlist provider unavailable")
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        started = False
+        try:
+            if mirror["destination_item_id"]:
+                destination = await self.mass.music.playlists.get_library_item(mirror["destination_item_id"])
+                mapping = next((m for m in destination.provider_mappings
+                                if m.provider_instance == builtin.instance_id), None)
+                if mapping is None:
+                    raise MirrorDestinationConflict("Mirror destination lost its builtin mapping")
+                async with builtin._get_playlist_lock(mapping.item_id):
+                    current_raw = await builtin._read_m3u_file(mapping.item_id)
+                    if hashlib.sha256(current_raw.encode()).hexdigest() != mirror["destination_content_digest"]:
+                        raise MirrorDestinationConflict("Mirror destination was edited; detach it before creating another")
+                    if mirror["state"] == "applied" and mirror["applied_digest"] == digest:
+                        return await self._store_operation(
+                            self._store.advance_mirror_unchanged, subscription_id, version_id, digest,
+                        )
+                    await self._store_operation(self._store.prepare_mirror, subscription_id, version_id, digest)
+                    playlist_helpers = importlib.import_module("music_assistant.helpers.playlists")
+                    await self._store_operation(self._store.mark_mirror_writing, subscription_id)
+                    started = True
+                    await builtin._write_m3u_file(mapping.item_id, preview["name"], playlist_helpers.parse_m3u(m3u))
+                    raw = await builtin._read_m3u_file(mapping.item_id)
+                    self._verify_mirror_contents(raw, uris)
+                    return await self._store_operation(self._store.commit_mirror, subscription_id,
+                                                       str(destination.item_id), builtin.instance_id, digest,
+                                                       hashlib.sha256(raw.encode()).hexdigest())
+            await self._store_operation(self._store.prepare_mirror, subscription_id, version_id, digest)
+            await self._store_operation(self._store.mark_mirror_writing, subscription_id)
+            started = True
+            destination = await self.mass.music.playlists.import_playlist(m3u, library_matching=False)
+            mapping = next((m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None)
+            if mapping is None:
+                raise InvalidDataError("Created mirror has no expected builtin mapping")
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            self._verify_mirror_contents(raw, uris)
+            return await self._store_operation(self._store.commit_mirror, subscription_id,
+                                               str(destination.item_id), builtin.instance_id, digest,
+                                               hashlib.sha256(raw.encode()).hexdigest())
+        except BaseException as err:
+            await self._store_operation(
+                self._store.fail_mirror, subscription_id,
+                str(err) if isinstance(err, MirrorDestinationConflict) else
+                "Mirror write outcome uncertain" if started else "Mirror update failed before writing",
+                started, isinstance(err, MirrorDestinationConflict),
+            )
+            if isinstance(err, asyncio.CancelledError):
+                raise
+            if isinstance(err, MirrorDestinationConflict):
+                raise InvalidDataError(str(err)) from None
+            if started:
+                raise InvalidDataError("Mirror write outcome uncertain; inspect builtin playlists") from None
+            raise InvalidDataError("Mirror update failed before writing") from None
+
+    @staticmethod
+    def _verify_mirror_contents(raw: str, expected_uris: list[str]) -> None:
+        actual = [line.strip() for line in raw.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        if actual != expected_uris:
+            raise InvalidDataError("Mirror destination differs from the committed source projection")
 
     async def playback_policy(self, subscription_id: str) -> dict[str, Any]:
         """Return the explicit source-selection policy for one subscription."""

@@ -17,7 +17,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
 PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
@@ -56,7 +56,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -75,10 +75,13 @@ class ArchiveStore:
                     required.add("itunes_apply_jobs")
                 if version >= 9:
                     required.add("bulk_match_operations")
+                if version >= 11:
+                    required.add("maintained_mirrors")
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 later_tables = {
                     "itunes_import_documents", "itunes_import_batches",
                     "itunes_apply_jobs", "bulk_match_operations",
+                    "maintained_mirrors",
                 }
                 if actual != required and not (
                     version < 9 and required <= actual <= required | later_tables
@@ -112,6 +115,8 @@ class ArchiveStore:
                     self._migrate_v9()
                 if version <= 9:
                     self._migrate_v10()
+                if version <= 10:
+                    self._migrate_v11()
         except Exception:
             self._db.close()
             raise
@@ -393,6 +398,27 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v10_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=10")
+
+    def _migrate_v11(self) -> None:
+        """Keep opt-in current mirrors separate from immutable captures and playback projections."""
+        self._db.execute("""CREATE TABLE IF NOT EXISTS maintained_mirrors (
+            subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+            revision INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+            allow_partial INTEGER NOT NULL DEFAULT 0 CHECK(allow_partial IN (0,1)),
+            state TEXT NOT NULL CHECK(state IN
+              ('pending','prepared','writing','applied','failed','uncertain','conflict','detached','disabled')),
+            applied_version_id TEXT REFERENCES versions(id),
+            applied_digest TEXT,
+            target_version_id TEXT REFERENCES versions(id),
+            target_digest TEXT,
+            destination_item_id TEXT,
+            destination_provider_instance TEXT,
+            destination_content_digest TEXT,
+            error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v11_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=11")
 
     @staticmethod
     def _bounded_json(value, label: str, expected_type: type, limit: int = 65536) -> str:
@@ -1819,6 +1845,134 @@ class ArchiveStore:
                 raise ValueError("Playback destination changed; refresh before detaching")
             self._db.execute("DELETE FROM playback_projections WHERE subscription_id=?", (subscription_id,))
             return row
+
+    def get_mirror(self, subscription_id: str) -> dict | None:
+        with self._lock:
+            self.get_subscription(subscription_id)
+            row = self._db.execute(
+                "SELECT * FROM maintained_mirrors WHERE subscription_id=?", (subscription_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def configure_mirror(self, subscription_id: str, enabled: bool, allow_partial: bool,
+                         expected_revision: int) -> dict:
+        if type(enabled) is not bool or type(allow_partial) is not bool:
+            raise ValueError("Mirror settings must be boolean")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("Expected mirror revision must be a nonnegative integer")
+        with self._transaction():
+            current = self.get_mirror(subscription_id)
+            if (current["revision"] if current else 0) != expected_revision:
+                raise ValueError("Mirror configuration revision conflict")
+            if current and current["state"] in ("writing", "uncertain"):
+                raise ValueError("Mirror write outcome requires reconciliation")
+            if current and current["state"] == "conflict" and enabled:
+                raise ValueError("Detach the edited mirror destination before enabling a new one")
+            now = _now()
+            if current is None:
+                self._db.execute("""INSERT INTO maintained_mirrors
+                    (subscription_id,revision,enabled,allow_partial,state,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?)""",
+                    (subscription_id, 1, int(enabled), int(allow_partial),
+                     "pending" if enabled else "disabled", now, now),
+                )
+            else:
+                reset = current["state"] == "detached" and enabled
+                self._db.execute("""UPDATE maintained_mirrors SET revision=revision+1,enabled=?,allow_partial=?,
+                    state=?,applied_version_id=CASE WHEN ? THEN NULL ELSE applied_version_id END,
+                    applied_digest=CASE WHEN ? THEN NULL ELSE applied_digest END,
+                    destination_item_id=CASE WHEN ? THEN NULL ELSE destination_item_id END,
+                    destination_provider_instance=CASE WHEN ? THEN NULL ELSE destination_provider_instance END,
+                    destination_content_digest=CASE WHEN ? THEN NULL ELSE destination_content_digest END,
+                    target_version_id=NULL,target_digest=NULL,error=NULL,updated_at=? WHERE subscription_id=?""",
+                    (int(enabled), int(allow_partial), "pending" if enabled else "disabled",
+                     *([int(reset)] * 5), now, subscription_id),
+                )
+            return self.get_mirror(subscription_id)
+
+    def prepare_mirror(self, subscription_id: str, version_id: str, target_digest: str) -> dict:
+        target_digest = self._sha256(target_digest, "target_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            version = self.get_version(version_id)
+            if version["subscription_id"] != subscription_id:
+                raise ValueError("Mirror version belongs to another source")
+            if mirror is None or not mirror["enabled"] or mirror["state"] in ("writing", "uncertain", "conflict"):
+                raise ValueError("Mirror is not enabled or needs reconciliation")
+            self._db.execute("""UPDATE maintained_mirrors SET state='prepared',target_version_id=?,
+                target_digest=?,error=NULL,updated_at=? WHERE subscription_id=?""",
+                (version_id, target_digest, _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def mark_mirror_writing(self, subscription_id: str) -> None:
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None or mirror["state"] != "prepared" or not mirror["enabled"]:
+                raise ValueError("Mirror is not prepared")
+            self._db.execute("UPDATE maintained_mirrors SET state='writing',updated_at=? WHERE subscription_id=?",
+                             (_now(), subscription_id))
+
+    def commit_mirror(self, subscription_id: str, destination_item_id: str,
+                      destination_provider_instance: str, target_digest: str,
+                      destination_content_digest: str) -> dict:
+        target_digest = self._sha256(target_digest, "target_digest")
+        destination_content_digest = self._sha256(destination_content_digest, "destination_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None or mirror["state"] != "writing" or mirror["target_digest"] != target_digest:
+                raise ValueError("Mirror write does not match its prepared target")
+            self._db.execute("""UPDATE maintained_mirrors SET state='applied',
+                applied_version_id=target_version_id,applied_digest=target_digest,
+                target_version_id=NULL,target_digest=NULL,destination_item_id=?,
+                destination_provider_instance=?,destination_content_digest=?,error=NULL,updated_at=?
+                WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, destination_content_digest,
+                 _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def advance_mirror_unchanged(self, subscription_id: str, version_id: str, target_digest: str) -> dict:
+        target_digest = self._sha256(target_digest, "target_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            version = self.get_version(version_id)
+            if (mirror is None or not mirror["enabled"] or mirror["state"] != "applied"
+                    or mirror["applied_digest"] != target_digest or version["subscription_id"] != subscription_id):
+                raise ValueError("Mirror content or source changed")
+            self._db.execute("UPDATE maintained_mirrors SET applied_version_id=?,updated_at=? WHERE subscription_id=?",
+                             (version_id, _now(), subscription_id))
+            return self.get_mirror(subscription_id)
+
+    def fail_mirror(self, subscription_id: str, error: str, uncertain: bool = False,
+                    conflict: bool = False) -> dict:
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None:
+                raise ValueError("Mirror is missing")
+            state = "conflict" if conflict else "uncertain" if uncertain or mirror["state"] == "writing" else "failed"
+            self._db.execute("""UPDATE maintained_mirrors SET state=?,enabled=CASE WHEN ? THEN 0 ELSE enabled END,
+                error=?,updated_at=? WHERE subscription_id=?""",
+                (state, int(conflict), error[:500], _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def detach_mirror(self, subscription_id: str, expected_destination_item_id: str,
+                      expected_content_digest: str | None) -> dict:
+        if expected_content_digest is not None:
+            expected_content_digest = self._sha256(expected_content_digest, "expected_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None or mirror["state"] in ("writing", "uncertain", "prepared"):
+                raise ValueError("Mirror destination has an unresolved write")
+            if (not expected_destination_item_id or mirror["destination_item_id"] != expected_destination_item_id
+                    or mirror["destination_content_digest"] != expected_content_digest):
+                raise ValueError("Mirror destination changed; refresh before detaching")
+            self._db.execute("""UPDATE maintained_mirrors SET enabled=0,state='detached',revision=revision+1,
+                target_version_id=NULL,target_digest=NULL,error=NULL,updated_at=? WHERE subscription_id=?""",
+                (_now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
 
     def close(self) -> None:
         with self._lock:
