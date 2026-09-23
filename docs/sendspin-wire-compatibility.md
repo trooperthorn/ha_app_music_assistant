@@ -8,8 +8,13 @@ current Sendspin player v1 specification calls the equivalent field
 
 Before the compatibility patch, parsing a current-spec player state with
 `supported_commands: ["set_output_delay"]` raises `InvalidFieldValue` because
-the pinned `PlayerCommand` enum has no such value. The build-time patch accepts
-either reported field and either advertised command. Internally the pinned
+the pinned `PlayerCommand` enum has no such value. The same spec-compliant
+client also omits the old `client/hello` supported-commands field and may
+advertise `volume` and `mute` in `client/state`; the pinned model previously
+required the former and rejected the latter. The build-time patch accepts
+both handshake layouts and either reported delay field. It reads reported
+volume and mute even when those values are read-only, while sending control
+commands only when the client advertises them. Internally the pinned
 server continues to use its existing delay, timing and persistence path. When
 the server sends a delay update, it chooses `set_output_delay` with
 `output_delay_ms` for a current-spec client, or the legacy command and field

@@ -23,6 +23,10 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '    SET_STATIC_DELAY = "set_static_delay"\n    SET_OUTPUT_DELAY = "set_output_delay"\n'),
     ],
     MODEL: [
+        ('from dataclasses import dataclass\n', 'from dataclasses import dataclass, field\n'),
+        ('    supported_commands: list[PlayerCommand]\n    """Subset of: \'volume\', \'mute\'."""\n',
+         '    supported_commands: list[PlayerCommand] = field(default_factory=list)\n'
+         '    """Legacy hello commands; current-spec clients advertise in client/state."""\n'),
         ('    static_delay_ms: int | None = None\n    """Static delay in milliseconds (0-5000). Required on the initial state message;\n',
          '    output_delay_ms: int | None = None\n    """Current-spec output delay in milliseconds (0-5000)."""\n'
          '    static_delay_ms: int | None = None\n    """Static delay in milliseconds (0-5000). Required on the initial state message;\n'),
@@ -31,7 +35,8 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '            raise ValueError("output_delay_ms must be in range 0-5000")\n'
          '        if self.static_delay_ms is not None and not 0 <= self.static_delay_ms <= 5000:\n'),
         ('        VALID_STATE_COMMANDS = {PlayerCommand.SET_STATIC_DELAY}  # noqa: N806\n',
-         '        VALID_STATE_COMMANDS = {PlayerCommand.SET_STATIC_DELAY, PlayerCommand.SET_OUTPUT_DELAY}  # noqa: N806\n'),
+         '        VALID_STATE_COMMANDS = {PlayerCommand.VOLUME, PlayerCommand.MUTE,\n'
+         '                                PlayerCommand.SET_STATIC_DELAY, PlayerCommand.SET_OUTPUT_DELAY}  # noqa: N806\n'),
         ('    static_delay_ms: int | None = None\n    """Delay in milliseconds (0-5000), only set if command is set_static_delay."""\n',
          '    output_delay_ms: int | None = None\n    """Current-spec delay, only set if command is set_output_delay."""\n'
          '    static_delay_ms: int | None = None\n    """Delay in milliseconds (0-5000), only set if command is set_static_delay."""\n'),
@@ -44,6 +49,43 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '        if self.command == PlayerCommand.SET_STATIC_DELAY:\n'),
     ],
     ROLE: [
+        ('        if not support or PlayerCommand.VOLUME not in support.supported_commands:\n            return\n',
+         '        commands = set(support.supported_commands if support else []) | set(self.state_supported_commands)\n'
+         '        if PlayerCommand.VOLUME not in commands:\n            return\n'),
+        ('        if not support or PlayerCommand.MUTE not in support.supported_commands:\n            return\n',
+         '        commands = set(support.supported_commands if support else []) | set(self.state_supported_commands)\n'
+         '        if PlayerCommand.MUTE not in commands:\n            return\n'),
+        ('        commands = support.supported_commands if support else []\n'
+         '        if PlayerCommand.VOLUME in commands and player.volume is None:\n',
+         '        commands = set(support.supported_commands if support else []) | set(player.supported_commands or [])\n'
+         '        if PlayerCommand.VOLUME in commands and player.volume is None:\n'),
+        ('        support = self._client.info.player_support\n'
+         '        commands = support.supported_commands if support else []\n'
+         '        reasons: list[str] = []\n',
+         '        reasons: list[str] = []\n'),
+        ('        if state.volume is not None and PlayerCommand.VOLUME not in commands:\n'
+         '            reasons.append("sent volume without declaring the volume command")\n'
+         '        if state.muted is not None and PlayerCommand.MUTE not in commands:\n'
+         '            reasons.append("sent muted without declaring the mute command")\n',
+         '        # Current-spec clients may report read-only volume and mute.\n'),
+        ('        support = self._client.info.player_support\n'
+         '        commands = support.supported_commands if support else []\n'
+         '        changed = False\n',
+         '        changed = False\n'),
+        ('            and PlayerCommand.VOLUME in commands\n            and self.volume != state.volume\n',
+         '            and self.volume != state.volume\n'),
+        ('        if state.muted is not None and PlayerCommand.MUTE in commands and self.muted != state.muted:\n',
+         '        if state.muted is not None and self.muted != state.muted:\n'),
+        ('        if changed:\n'
+         '            self.emit_client_event(VolumeChangedEvent(volume=self.volume, muted=self.muted))\n\n'
+         '        if state.supported_commands is not None:\n'
+         '            self.state_supported_commands = state.supported_commands\n',
+         '        if (state.supported_commands is not None\n'
+         '                and self.state_supported_commands != state.supported_commands):\n'
+         '            self.state_supported_commands = state.supported_commands\n'
+         '            changed = True\n'
+         '        if changed:\n'
+         '            self.emit_client_event(VolumeChangedEvent(volume=self.volume, muted=self.muted))\n'),
         ('        if PlayerCommand.SET_STATIC_DELAY not in self.state_supported_commands:\n            return\n\n'
          '        self._client.send_message(\n',
          '        commands = self.state_supported_commands\n'
@@ -71,6 +113,28 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '            self.emit_client_event(StaticDelayChangedEvent(static_delay_ms=reported_delay))\n'),
     ],
     PROVIDER: [
+        ('            case VolumeChangedEvent(volume=volume, muted=muted):\n'
+         '                self._attr_volume_level = volume\n'
+         '                self._attr_volume_muted = muted\n'
+         '                self.update_state()\n'
+         '            case StaticDelayChangedEvent(static_delay_ms=delay_ms):\n',
+         '            case VolumeChangedEvent(volume=volume, muted=muted):\n'
+         '                self._attr_volume_level = volume\n'
+         '                self._attr_volume_muted = muted\n'
+         '                role = self._player_role\n'
+         '                if role is not None:\n'
+         '                    support = self.api.info.player_support\n'
+         '                    advertised = set(role.state_supported_commands)\n'
+         '                    if support is not None:\n'
+         '                        advertised.update(support.supported_commands)\n'
+         '                    for command, feature in ((PlayerCommand.VOLUME, PlayerFeature.VOLUME_SET),\n'
+         '                                             (PlayerCommand.MUTE, PlayerFeature.VOLUME_MUTE)):\n'
+         '                        if command in advertised:\n'
+         '                            self._attr_supported_features.add(feature)\n'
+         '                        else:\n'
+         '                            self._attr_supported_features.discard(feature)\n'
+         '                self.update_state()\n'
+         '            case StaticDelayChangedEvent(static_delay_ms=delay_ms):\n'),
         ('                and PlayerCommand.SET_STATIC_DELAY in player_role.state_supported_commands\n',
          '                and ({PlayerCommand.SET_STATIC_DELAY, PlayerCommand.SET_OUTPUT_DELAY}\n'
          '                     & set(player_role.state_supported_commands))\n'),

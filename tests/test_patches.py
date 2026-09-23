@@ -76,12 +76,77 @@ def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() 
     assert all(output_delay.apply(source, module) == source for module, source in patched.items())
     assert 'SET_OUTPUT_DELAY = "set_output_delay"' in patched[output_delay.TYPES]
     assert 'output_delay_ms: int | None = None' in patched[output_delay.MODEL]
+    assert 'supported_commands: list[PlayerCommand] = field(default_factory=list)' in patched[output_delay.MODEL]
+    assert 'PlayerCommand.VOLUME, PlayerCommand.MUTE' in patched[output_delay.MODEL]
     assert 'command = PlayerCommand.SET_OUTPUT_DELAY' in patched[output_delay.ROLE]
     assert 'command = PlayerCommand.SET_STATIC_DELAY' in patched[output_delay.ROLE]
     assert 'PlayerCommand.SET_OUTPUT_DELAY}' in patched[output_delay.PROVIDER]
     assert "sendspin_output_delay_compat.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
     with pytest.raises(SystemExit, match="anchor found 0 times"):
         output_delay.apply("class PlayerStatePayload: pass", output_delay.MODEL)
+
+    role_tree = ast.parse(patched[output_delay.ROLE])
+    role_class = next(node for node in role_tree.body if isinstance(node, ast.ClassDef) and node.name == "PlayerV1Role")
+    methods = [node for node in role_class.body if isinstance(node, ast.FunctionDef)
+               and node.name in ("set_volume", "set_mute", "set_static_delay")]
+    class_source = "class Role:\n" + "\n".join(
+        "\n".join("    " + line for line in ast.unparse(method).splitlines()) for method in methods
+    )
+    commands = SimpleNamespace(
+        VOLUME="volume", MUTE="mute", SET_STATIC_DELAY="set_static_delay", SET_OUTPUT_DELAY="set_output_delay"
+    )
+    namespace = {
+        "PlayerCommand": commands,
+        "ServerCommandMessage": lambda payload: payload,
+        "ServerCommandPayload": lambda player: player,
+        "PlayerCommandPayload": lambda **kwargs: kwargs,
+    }
+    exec(class_source, namespace)  # noqa: S102
+    role = namespace["Role"]()
+    sent = []
+    role._client = SimpleNamespace(
+        info=SimpleNamespace(player_support=SimpleNamespace(supported_commands=[])), send_message=sent.append
+    )
+    role.state_supported_commands = ["volume", "mute", "set_output_delay"]
+    role.set_volume(42)
+    role.set_mute(True)
+    role.set_static_delay(250)
+    assert sent == [
+        {"command": "volume", "volume": 42},
+        {"command": "mute", "mute": True},
+        {"command": "set_output_delay", "output_delay_ms": 250},
+    ]
+    sent.clear()
+    role.state_supported_commands = ["set_static_delay"]
+    role.set_static_delay(250)
+    assert sent == [{"command": "set_static_delay", "static_delay_ms": 250}]
+    sent.clear()
+    role.state_supported_commands = []
+    role.set_static_delay(250)
+    assert sent == []
+
+    provider_tree = ast.parse(patched[output_delay.PROVIDER])
+    player_class = next(node for node in provider_tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "SendspinPlayer")
+    event_method = next(node for node in player_class.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "event_cb")
+    event_match = next(node for node in event_method.body if isinstance(node, ast.Match))
+    volume_case = event_match.cases[0]
+    body = "\n".join("    " + line for statement in volume_case.body
+                     for line in ast.unparse(statement).splitlines())
+    namespace.update({"PlayerFeature": SimpleNamespace(VOLUME_SET="set", VOLUME_MUTE="mute")})
+    exec("def update(self, volume, muted):\n" + body, namespace)  # noqa: S102
+    player = SimpleNamespace(
+        _attr_supported_features=set(),
+        _player_role=SimpleNamespace(state_supported_commands=["volume", "mute"]),
+        api=SimpleNamespace(info=SimpleNamespace(player_support=SimpleNamespace(supported_commands=[]))),
+        update_state=lambda: None,
+    )
+    namespace["update"](player, 35, False)
+    assert player._attr_supported_features == {"set", "mute"}
+    player._player_role.state_supported_commands = []
+    namespace["update"](player, 35, False)
+    assert player._attr_supported_features == set()
 
 
 @requires_py314
