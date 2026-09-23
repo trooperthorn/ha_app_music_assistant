@@ -139,10 +139,26 @@ def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() 
     })
     exec(format_source, namespace)  # noqa: S102
     requested = []
-    format_role = SimpleNamespace(on_stream_request_format=requested.append)
+    format_role = SimpleNamespace(on_stream_request_format=requested.append,
+                                  _client_format_override_active=False)
     format_state = SimpleNamespace(format=SimpleNamespace(codec="pcm", sample_rate=48000, channels=2, bit_depth=16))
     namespace["apply_format"](format_role, format_state)
     assert vars(requested[0].player) == {"codec": "pcm", "sample_rate": 48000, "channels": 2, "bit_depth": 16}
+    assert format_role._client_format_override_active is True
+
+    transitions = []
+    active_format = ["pcm"]
+    format_role._effective_format = lambda: active_format[0]
+    def restore_format() -> None:
+        transitions.append("restore")
+        active_format[0] = "flac"
+    format_role._ensure_preferred_format = restore_format
+    format_role._ensure_audio_requirements = lambda **kwargs: transitions.append("requirements")
+    format_role._begin_format_transition = lambda: transitions.append("transition")
+    format_role._client = SimpleNamespace(group=SimpleNamespace(has_active_stream=True))
+    namespace["apply_format"](format_role, SimpleNamespace(format=None))
+    assert format_role._client_format_override_active is False
+    assert transitions == ["restore", "requirements", "transition"]
 
     provider_tree = ast.parse(patched[output_delay.PROVIDER])
     player_class = next(node for node in provider_tree.body if isinstance(node, ast.ClassDef)

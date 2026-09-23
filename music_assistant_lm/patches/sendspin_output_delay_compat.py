@@ -59,6 +59,9 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          'from aiosendspin.models.player import (\n'
          '    PlayerCommandPayload, StreamRequestFormatPlayer, StreamStartPlayer, SupportedAudioFormat,\n'
          ')\n'),
+        ('        self._last_sent_format: tuple[AudioCodec, int, int, int, str | None] | None = None\n',
+         '        self._last_sent_format: tuple[AudioCodec, int, int, int, str | None] | None = None\n'
+         '        self._client_format_override_active = False\n'),
         ('        if not support or PlayerCommand.VOLUME not in support.supported_commands:\n            return\n',
          '        commands = set(support.supported_commands if support else []) | set(self.state_supported_commands)\n'
          '        if PlayerCommand.VOLUME not in commands:\n            return\n'),
@@ -132,7 +135,18 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '            self.on_stream_request_format(StreamRequestFormatPayload(player=StreamRequestFormatPlayer(\n'
          '                codec=fmt.codec, sample_rate=fmt.sample_rate, channels=fmt.channels,\n'
          '                bit_depth=fmt.bit_depth,\n'
-         '            )))\n'),
+         '            )))\n'
+         '            self._client_format_override_active = True\n'
+         '        elif self._client_format_override_active:\n'
+         '            # A full player state without format clears the client preference.\n'
+         '            # Restore the server override, if one is configured, or hello priority.\n'
+         '            self._client_format_override_active = False\n'
+         '            previous_format = self._effective_format()\n'
+         '            self._ensure_preferred_format()\n'
+         '            self._ensure_audio_requirements(force=True)\n'
+         '            if (self._client.group.has_active_stream\n'
+         '                    and self._effective_format() != previous_format):\n'
+         '                self._begin_format_transition()\n'),
     ],
     PROVIDER: [
         ('            case VolumeChangedEvent(volume=volume, muted=muted):\n'
