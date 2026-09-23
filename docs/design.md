@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are twelve: eight anchor patches that rewrite exact lines in an
+Today there are thirteen: nine anchor patches that rewrite exact lines in an
 already-installed file, and four plugin providers that add a self-contained
 new provider directory instead (see `docs/extension-points.md` for the
 distinction).
@@ -118,6 +118,8 @@ Anchor patches:
   `sendspin/discovery_status` command. It reports listener, advertising,
   client-discovery, manual-address validity, and connected-client status
   without returning pairing credentials or altering connections.
+- `sendspin_non_audio_clients.py`: classifies artwork, color and controller-only
+  clients as non-audio devices, so they cannot be selected as speakers.
 
 Plugin providers:
 

@@ -23,6 +23,7 @@ import sendspin_cast_delay as cast_delay  # noqa: E402
 import sendspin_cast_status as cast_status  # noqa: E402
 import sendspin_controller_switch as switch  # noqa: E402
 import sendspin_discovery_status as discovery  # noqa: E402
+import sendspin_non_audio_clients as non_audio  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 import sendspin_timing_status as timing  # noqa: E402
 
@@ -47,6 +48,59 @@ AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
 SENDSPIN_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_provider_2_10_4.py"
+
+
+@requires_py314
+def test_sendspin_non_audio_roles_never_create_audio_player() -> None:
+    original = SENDSPIN_PROVIDER.read_text(encoding="utf-8")
+    patched = non_audio.apply(discovery.apply(original))
+    assert non_audio.apply(patched) == patched
+    assert "sendspin_non_audio_clients.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin non-audio anchor found 0 times"):
+        non_audio.apply("class SendspinProvider: pass")
+
+    tree = ast.parse(patched)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinProvider")
+    method = next(node for node in provider.body if isinstance(node, ast.FunctionDef) and node.name == "_create_player")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+
+    class Audio:
+        def __init__(self, *_: object, **__: object) -> None:
+            self.static_delay_default_ms = None
+
+    class Display:
+        def __init__(self, *_: object, **__: object) -> None:
+            self._attr_supported_features = {"set_members"}
+
+    class Source:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+    kinds = type("Kinds", (), {"DISPLAY": "display", "VISUALIZER": "visualizer"})
+    runtime = {
+        "SendspinPlayer": Audio,
+        "SendspinVisualizerPlayer": Display,
+        "SendspinSourcePlayer": Source,
+        "PlayerType": kinds,
+        "role_family": lambda role: role.split("@", 1)[0],
+    }
+    exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
+    instance = runtime["Provider"]()
+    for attr in ("_bridge_identifiers", "_bridge_player_types", "_bridge_underlying_players", "_bridge_static_delay_defaults"):
+        setattr(instance, attr, {})
+
+    def create(*roles: str) -> object:
+        client = type("Client", (), {"negotiated_role_ids": roles})()
+        return instance._create_player("test-client", client, None)
+
+    assert isinstance(create("player@v1"), Audio)
+    assert isinstance(create("source@v1"), Source)
+    for role in ("metadata@v1", "artwork@v1", "color@v1", "visualizer@v1", "controller@v1"):
+        result = create(role)
+        assert isinstance(result, Display), role
+        assert result._attr_type in {"display", "visualizer"}
+        if role == "controller@v1":
+            assert result._attr_supported_features == set()
 
 
 @requires_py314
