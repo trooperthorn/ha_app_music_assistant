@@ -1,4 +1,4 @@
-"""Expose observed Sendspin source health without changing source routing."""
+"""Expose Sendspin source health and guarded stop alongside native routing."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ EDITS: list[tuple[str, str]] = [
     (
         "        self._server_unsubscribe: Callable[[], None] | None = None\n",
         "        self._server_unsubscribe: Callable[[], None] | None = None\n"
-        "        self._status_unsubscribe: Callable[[], None] | None = None\n",
+        "        self._status_unsubscribe: Callable[[], None] | None = None\n"
+        "        self._stop_unsubscribe: Callable[[], None] | None = None\n",
     ),
     (
         "        self._unloading = False\n        if (sendspin := self._sendspin_provider) is None:\n",
@@ -27,6 +28,11 @@ EDITS: list[tuple[str, str]] = [
         "            self.source_status,\n"
         "            required_scope=Scope.CONFIG_PROVIDERS_READ,\n"
         "        )\n"
+        "        self._stop_unsubscribe = self.mass.register_api_command(\n"
+        '            "sendspin_source/stop",\n'
+        "            self.stop_source,\n"
+        "            required_scope=Scope.PLAYERS_CONTROL,\n"
+        "        )\n"
         "        if (sendspin := self._sendspin_provider) is None:\n",
     ),
     (
@@ -35,6 +41,9 @@ EDITS: list[tuple[str, str]] = [
         "        if self._status_unsubscribe is not None:\n"
         "            self._status_unsubscribe()\n"
         "            self._status_unsubscribe = None\n"
+        "        if self._stop_unsubscribe is not None:\n"
+        "            self._stop_unsubscribe()\n"
+        "            self._stop_unsubscribe = None\n"
         "        if self._server_unsubscribe is not None:\n",
     ),
     (
@@ -71,13 +80,30 @@ EDITS: list[tuple[str, str]] = [
         "                    {\n"
         '                        "client_id": client.client_id,\n'
         '                        "name": info.name if info else client.client_id,\n'
+        '                        "source_uri": create_uri(MediaType.AUDIO_SOURCE, self.instance_id, client.client_id),\n'
         '                        "signal": state.signal.value if state and state.signal else None,\n'
         '                        "selected_player_id": session.player_id if session else None,\n'
+        '                        "owner_player_id": session.owner_player_id if session else None,\n'
+        '                        "playback_session_id": session.playback_session_id if session else None,\n'
         '                        "receiving_pcm": receiving,\n'
         '                        "last_pcm_age_ms": last_pcm_age_ms,\n'
         "                    }\n"
         "                )\n"
         '        return {"target_latency_ms": target_latency_ms, "sources": sources}\n'
+        "\n"
+        "    async def stop_source(self, client_id: str, playback_session_id: str) -> None:\n"
+        '        """Stop only the exact Sendspin source selection the caller observed."""\n'
+        "        state = self._clients.get(client_id)\n"
+        "        session = state.session if state else None\n"
+        "        if session is None or session.playback_session_id != playback_session_id:\n"
+        '            raise PlayerCommandFailed("Sendspin source selection changed; refresh before stopping")\n'
+        "        self.mass.player_queues._check_player_permission(session.owner_player_id)\n"
+        "        await self.mass.players.deselect_source(\n"
+        "            session.owner_player_id,\n"
+        "            provider_instance_id=self.instance_id,\n"
+        "            source_id=client_id,\n"
+        "            playback_session_id=playback_session_id,\n"
+        "        )\n"
         "\n"
         "    async def get_audio_sources(self) -> list[AudioSource]:\n",
     ),

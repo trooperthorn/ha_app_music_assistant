@@ -55,7 +55,7 @@ SENDSPIN_SOURCE_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_source_provid
 
 
 @requires_py314
-def test_sendspin_source_status_reports_observed_signal_without_controlling_source() -> None:
+def test_sendspin_source_status_and_guarded_stop() -> None:
     original = SENDSPIN_SOURCE_PROVIDER.read_text(encoding="utf-8")
     patched = source_status.apply(original)
     assert source_status.apply(patched) == patched
@@ -70,7 +70,15 @@ def test_sendspin_source_status_reports_observed_signal_without_controlling_sour
     provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinSourceProvider")
     method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "source_status")
     method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
-    runtime = {"cast": cast, "time": time, "CONF_TARGET_LATENCY": "latency", "DEFAULT_TARGET_LATENCY_MS": 100}
+    runtime = {
+        "cast": cast,
+        "time": time,
+        "CONF_TARGET_LATENCY": "latency",
+        "DEFAULT_TARGET_LATENCY_MS": 100,
+        "create_uri": lambda media_type, instance, item: f"{instance}://{media_type}/{item}",
+        "MediaType": type("MediaType", (), {"AUDIO_SOURCE": "audio_source"}),
+        "PlayerCommandFailed": RuntimeError,
+    }
     exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
 
     client = type("Client", (), {"client_id": "source-a", "info_or_none": type("Info", (), {"name": "Turntable"})()})()
@@ -79,6 +87,8 @@ def test_sendspin_source_status_reports_observed_signal_without_controlling_sour
         (),
         {
             "player_id": "living-room",
+            "owner_player_id": "living-room",
+            "playback_session_id": "session-1",
             "bridge": object(),
             "ingest_task": type("Task", (), {"done": lambda self: False})(),
             "pcm_received": type("Event", (), {"is_set": lambda self: True})(),
@@ -90,11 +100,14 @@ def test_sendspin_source_status_reports_observed_signal_without_controlling_sour
     instance._clients = {"source-a": state}
     instance._sendspin_provider = type("Sendspin", (), {"server_api": type("Server", (), {"connected_clients": [client]})()})()
     instance._get_source_role = lambda _: object()
+    instance.instance_id = "sendspin_source--1"
     instance.config = type("Config", (), {"get_value": lambda self, _: 80})()
     result = asyncio.run(instance.source_status())
     assert result["target_latency_ms"] == 80
     assert result["sources"][0]["signal"] == "present"
     assert result["sources"][0]["selected_player_id"] == "living-room"
+    assert result["sources"][0]["source_uri"] == "sendspin_source--1://audio_source/source-a"
+    assert result["sources"][0]["playback_session_id"] == "session-1"
     assert result["sources"][0]["receiving_pcm"] is True
     assert 0 <= result["sources"][0]["last_pcm_age_ms"] < 1000
     assert "measured_latency_ms" not in result
@@ -102,6 +115,33 @@ def test_sendspin_source_status_reports_observed_signal_without_controlling_sour
     stale = asyncio.run(instance.source_status())
     assert stale["sources"][0]["receiving_pcm"] is False
     assert stale["sources"][0]["last_pcm_age_ms"] >= 2000
+
+    stop_method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "stop_source")
+    stop_source = "\n".join(f"    {line}" for line in ast.unparse(stop_method).splitlines())
+    exec("from __future__ import annotations\nclass StopProvider:\n" + stop_source, runtime)  # noqa: S102
+    stops = []
+    checks = []
+
+    async def deselect_source(player_id, **kwargs):
+        stops.append((player_id, kwargs))
+
+    stopper = runtime["StopProvider"]()
+    stopper._clients = instance._clients
+    stopper.instance_id = instance.instance_id
+    stopper.mass = type("Mass", (), {
+        "player_queues": type("Queues", (), {"_check_player_permission": lambda self, player: checks.append(player)})(),
+        "players": type("Players", (), {"deselect_source": staticmethod(deselect_source)})(),
+    })()
+    with pytest.raises(RuntimeError, match="selection changed"):
+        asyncio.run(stopper.stop_source("source-a", "stale-session"))
+    assert not stops
+    asyncio.run(stopper.stop_source("source-a", "session-1"))
+    assert checks == ["living-room"]
+    assert stops == [("living-room", {
+        "provider_instance_id": "sendspin_source--1",
+        "source_id": "source-a",
+        "playback_session_id": "session-1",
+    })]
 
 
 @requires_py314
