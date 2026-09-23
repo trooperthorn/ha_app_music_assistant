@@ -1089,6 +1089,46 @@ class ArchiveStore:
             result["evidence"] = json.loads(result.pop("evidence_json"))
             return result
 
+    def relocate_local_asset_location(
+        self,
+        asset_id: str,
+        provider_instance_id: str,
+        old_item_id: str,
+        new_item_id: str,
+        evidence: dict | None = None,
+    ) -> dict:
+        """Move one reviewed location while retaining its stable asset and match decisions."""
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (asset_id, provider_instance_id, old_item_id, new_item_id)
+        ) or old_item_id == new_item_id:
+            raise ValueError("Distinct old and new local track locations are required")
+        evidence_json = self._json_object(evidence, "Relocation evidence")
+        with self._transaction():
+            old = self._db.execute(
+                """SELECT id,asset_id FROM local_asset_locations
+                WHERE provider_instance_id=? AND item_id=?""",
+                (provider_instance_id, old_item_id),
+            ).fetchone()
+            if old is None or old["asset_id"] != asset_id:
+                raise ValueError("Old location no longer belongs to the expected asset")
+            if self._db.execute(
+                """SELECT 1 FROM local_asset_locations
+                WHERE provider_instance_id=? AND item_id=?""",
+                (provider_instance_id, new_item_id),
+            ).fetchone():
+                raise ValueError("New location is already bound")
+            self._db.execute(
+                """UPDATE local_asset_locations SET item_id=?,evidence_json=?,updated_at=?
+                WHERE id=?""",
+                (new_item_id, evidence_json, _now(), old["id"]),
+            )
+            result = dict(
+                self._db.execute("SELECT * FROM local_asset_locations WHERE id=?", (old["id"],)).fetchone()
+            )
+            result["evidence"] = json.loads(result.pop("evidence_json"))
+            return result
+
     def get_local_asset(self, asset_id: str) -> dict:
         with self._lock:
             row = self._db.execute("SELECT * FROM local_assets WHERE id=?", (asset_id,)).fetchone()

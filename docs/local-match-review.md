@@ -34,5 +34,14 @@ algorithm version and are isolated by Spotify account.
 
 Both commands require an authenticated user with `config.providers.write`.
 Changing a decision additionally requires `library.write`. Neither command
-changes provider mappings or promises any playback behavior. Playback policies
-and final stream enforcement remain a later Phase 4 deliverable.
+changes provider mappings. A separate explicit playback projection can use an
+approved local asset; `local_only` requests are enforced in the final stream
+selector and buffer acquisition, including cached details and capacity retries.
+These code paths have fixture tests against the pinned server but have not yet
+been acoustically validated on the installed players.
+
+The store can relocate an existing asset's provider location atomically after a
+reviewed move, retaining its asset ID and decision history while rejecting a
+stale old path or a destination already bound to another asset. This is a
+store-level primitive; the provider API and UI still need a live mapping check
+and explicit correction workflow before users can invoke it.

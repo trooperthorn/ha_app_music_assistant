@@ -743,6 +743,47 @@ def test_match_assets_candidates_decisions_and_version_overlay(tmp_path):
     store.close()
 
 
+def test_reviewed_local_file_relocation_preserves_asset_and_decision(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    asset = store.upsert_local_asset("track", "filesystem", "old/song.flac")
+    key = ("spotify", "account-a", "track", "source-track")
+    store.replace_match_candidates(
+        *key, [{"asset_id": asset["id"], "score": 0.5}], "v1"
+    )
+    store.set_match_decision(*key, "approve", asset["id"], 0, "admin")
+    other = store.upsert_local_asset("track", "filesystem", "other/song.flac")
+
+    with pytest.raises(ValueError, match="expected asset"):
+        store.relocate_local_asset_location(
+            other["id"], "filesystem", "old/song.flac", "new/song.flac"
+        )
+    with pytest.raises(ValueError, match="already bound"):
+        store.relocate_local_asset_location(
+            asset["id"], "filesystem", "old/song.flac", "other/song.flac"
+        )
+    assert store.get_local_asset(asset["id"])["locations"][0]["item_id"] == "old/song.flac"
+
+    moved = store.relocate_local_asset_location(
+        asset["id"], "filesystem", "old/song.flac", "new/song.flac",
+        {"kind": "reviewed_move", "actor": "admin"},
+    )
+    assert moved["asset_id"] == asset["id"]
+    assert moved["item_id"] == "new/song.flac"
+    assert moved["evidence"]["kind"] == "reviewed_move"
+    assert store.get_match_overlay(*key)["approved_asset_id"] == asset["id"]
+    with pytest.raises(ValueError, match="expected asset"):
+        store.relocate_local_asset_location(
+            asset["id"], "filesystem", "old/song.flac", "another/song.flac"
+        )
+    store.close()
+
+    reopened = ArchiveStore(path)
+    assert reopened.get_local_asset(asset["id"])["locations"][0]["item_id"] == "new/song.flac"
+    assert reopened.get_match_overlay(*key)["approved_asset_id"] == asset["id"]
+    reopened.close()
+
+
 def test_bulk_match_approval_is_atomic_idempotent_and_bounded(tmp_path):
     store = ArchiveStore(tmp_path / "archive.db")
     assets = []
