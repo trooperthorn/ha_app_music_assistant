@@ -36,8 +36,15 @@ def _data(root: Path) -> Path:
     (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     for name in ("library.db", "auth.db"):
         with closing(sqlite3.connect(root / name)) as db:
-            db.execute("CREATE TABLE marker (value TEXT)")
-            db.execute("INSERT INTO marker VALUES (?)", (name,))
+            tables = (
+                ("settings", "artists", "albums", "tracks", "playlists", "provider_mappings")
+                if name == "library.db"
+                else ("settings", "users", "user_auth_providers", "auth_tokens")
+            )
+            for table in tables:
+                db.execute(f"CREATE TABLE {table} (key TEXT, value TEXT)")
+            if name == "library.db":
+                db.execute("INSERT INTO settings VALUES ('version', ?)", (str(recovery.PINNED_LIBRARY_SCHEMA),))
             db.commit()
     archive = root / "library_enrichment" / "enrichment.db"
     store = store_module.ArchiveStore(archive)
@@ -152,6 +159,27 @@ def test_invalid_encryption_key_never_publishes(tmp_path: Path) -> None:
     settings["encryption_key"] = "not-a-fernet-key"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     with pytest.raises(ValueError, match="key is invalid"):
+        recovery.create(source, tmp_path / "invalid-set", VERSIONS)
+    assert not (tmp_path / "invalid-set").exists()
+
+
+@pytest.mark.parametrize("name", ["library.db", "auth.db"])
+def test_missing_core_tables_never_publish(tmp_path: Path, name: str) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    with closing(sqlite3.connect(source / name)) as db:
+        db.execute("DROP TABLE settings")
+        db.commit()
+    with pytest.raises(ValueError, match="missing required tables"):
+        recovery.create(source, tmp_path / "invalid-set", VERSIONS)
+    assert not (tmp_path / "invalid-set").exists()
+
+
+def test_empty_replacement_library_never_publishes(tmp_path: Path) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    with closing(sqlite3.connect(source / "library.db")) as db:
+        db.execute("DELETE FROM settings WHERE key='version'")
+        db.commit()
+    with pytest.raises(ValueError, match="schema differs"):
         recovery.create(source, tmp_path / "invalid-set", VERSIONS)
     assert not (tmp_path / "invalid-set").exists()
 

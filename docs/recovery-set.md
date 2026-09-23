@@ -24,6 +24,10 @@ settings, and checks SQLite integrity. Verification repeats the byte and
 database checks. Staging refuses an existing destination, a version mismatch,
 an older or unsupported archive schema, corruption, missing files, symlinks,
 and an incomplete marker. The tool **never replaces the live directory**.
+The verifier is pinned to server 2.10.4 and library schema 58. It checks the
+expected library and authentication tables and rejects a library with no schema
+version, including an empty replacement database left by a failed migration.
+Support for another server/schema pair requires an explicit compatibility update.
 
 Music Assistant 2.10.4 stores its server ID and Fernet encryption key in
 `settings.json`. This verifier requires both the ID and a structurally valid

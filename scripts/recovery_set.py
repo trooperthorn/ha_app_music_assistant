@@ -24,6 +24,8 @@ DATA = "data"
 ARCHIVE = "library_enrichment/enrichment.db"
 FORMAT_VERSION = 1
 MAX_ARCHIVE_SCHEMA = 11
+PINNED_SERVER_VERSION = "2.10.4"
+PINNED_LIBRARY_SCHEMA = 58
 REQUIRED = {"settings.json", "library.db", "auth.db", ARCHIVE}
 
 
@@ -131,10 +133,21 @@ def _verify_core(root: Path) -> None:
             raise ValueError("Music Assistant encryption key is invalid")
     except (UnicodeError, json.JSONDecodeError) as err:
         raise ValueError("Music Assistant settings cannot be parsed") from err
-    for name in ("library.db", "auth.db"):
+    required_tables = {
+        "library.db": {"settings", "artists", "albums", "tracks", "playlists", "provider_mappings"},
+        "auth.db": {"settings", "users", "user_auth_providers", "auth_tokens"},
+    }
+    for name, expected_tables in required_tables.items():
         with closing(sqlite3.connect((root / name).resolve().as_uri() + "?mode=ro", uri=True)) as db:
-            if db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0] == 0:
-                raise ValueError(f"Music Assistant database has no tables: {name}")
+            tables = {
+                row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if not expected_tables <= tables:
+                raise ValueError(f"Music Assistant database is missing required tables: {name}")
+            if name == "library.db":
+                version = db.execute("SELECT value FROM settings WHERE key='version'").fetchone()
+                if version is None or version[0] != str(PINNED_LIBRARY_SCHEMA):
+                    raise ValueError("Music Assistant library schema differs from pinned server 2.10.4")
 
 
 def _write_exclusive(path: Path, payload: bytes) -> None:
@@ -156,6 +169,8 @@ def create(source: Path, destination: Path, versions: dict[str, str]) -> dict:
         isinstance(value, str) and value.strip() for value in versions.values()
     ):
         raise ValueError("Installed app, server, and frontend versions are required")
+    if versions["server"] != PINNED_SERVER_VERSION:
+        raise ValueError("Recovery set creation requires the validated server version 2.10.4")
     before = _files(source)
     identity = _archive_identity(source / ARCHIVE)
     _verify_databases(source, before)
@@ -208,6 +223,13 @@ def verify(recovery_set: Path, expected_versions: dict[str, str] | None = None) 
     manifest = json.loads(manifest_bytes)
     if not isinstance(manifest, dict) or manifest.get("format_version") != FORMAT_VERSION:
         raise ValueError("Unsupported recovery set format")
+    versions = manifest.get("versions")
+    if not isinstance(versions, dict) or set(versions) != {"app", "server", "frontend"} or any(
+        not isinstance(value, str) or not value.strip() for value in versions.values()
+    ):
+        raise ValueError("Invalid recovery set versions")
+    if versions["server"] != PINNED_SERVER_VERSION:
+        raise ValueError("Recovery set server version is not supported by this verifier")
     if expected_versions is not None and manifest.get("versions") != expected_versions:
         raise ValueError("Recovery set versions differ from the requested installation")
     files = manifest.get("files")
