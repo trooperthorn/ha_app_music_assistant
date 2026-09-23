@@ -37,15 +37,26 @@ jobs:
           python scripts/build_release_artifacts.py --validate-only
 
   image-build:
-    name: App image builds
-    runs-on: ubuntu-latest
+    name: App image builds (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the app image
         run: |
           VERSION="$(python3 scripts/build_release_artifacts.py --validate-only)"
-          docker build --build-arg "BUILD_VERSION=$VERSION" --build-arg BUILD_ARCH=amd64 \
+          docker build --build-arg "BUILD_VERSION=$VERSION" --build-arg "BUILD_ARCH=${{ matrix.arch }}" \
             --tag "local/music_assistant_lm:${{ github.sha }}" music_assistant_lm
+          EXPECTED_PLATFORM="${{ matrix.arch }}"
+          if [ "$EXPECTED_PLATFORM" = aarch64 ]; then EXPECTED_PLATFORM=arm64; fi
+          test "$(docker image inspect --format '{{.Architecture}}' "local/music_assistant_lm:${{ github.sha }}")" = "$EXPECTED_PLATFORM"
       - name: Report what the image serves
         run: |
           docker run --rm --entrypoint /app/venv/bin/python "local/music_assistant_lm:${{ github.sha }}" \
