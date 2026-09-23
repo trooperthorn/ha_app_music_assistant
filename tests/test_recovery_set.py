@@ -72,6 +72,89 @@ def test_recovery_set_round_trip_and_version_gate(tmp_path: Path) -> None:
     assert not (tmp_path / "wrong-version").exists()
 
 
+def test_offline_cutover_retains_previous_data_for_rollback(tmp_path: Path) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    recovery_set = tmp_path / "recovery-set"
+    recovery.create(source, recovery_set, VERSIONS)
+    staged = tmp_path / "staged-data"
+    recovery.stage_restore(recovery_set, staged, VERSIONS)
+    current = _data(tmp_path / "current-data")
+    (current / "prior.txt").write_text("keep this installation", encoding="utf-8")
+    rollback = tmp_path / "previous-data"
+
+    with pytest.raises(ValueError, match="confirmed stopped"):
+        recovery.cutover(recovery_set, staged, current, rollback, VERSIONS, stopped_confirmed=False)
+    assert (current / "prior.txt").exists() and staged.exists() and not rollback.exists()
+
+    recovery.cutover(recovery_set, staged, current, rollback, VERSIONS, stopped_confirmed=True)
+    assert recovery._files(current) == recovery._files(source)
+    assert (rollback / "prior.txt").read_text(encoding="utf-8") == "keep this installation"
+    assert not staged.exists()
+
+
+def test_cutover_failure_restores_previous_data(tmp_path: Path, monkeypatch) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    recovery_set = tmp_path / "recovery-set"
+    recovery.create(source, recovery_set, VERSIONS)
+    staged = tmp_path / "staged-data"
+    recovery.stage_restore(recovery_set, staged, VERSIONS)
+    current = _data(tmp_path / "current-data")
+    (current / "prior.txt").write_text("original", encoding="utf-8")
+    rollback = tmp_path / "previous-data"
+    original_rename = recovery.os.rename
+    calls = 0
+
+    def fail_install(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated install failure")
+        return original_rename(src, dst)
+
+    monkeypatch.setattr(recovery.os, "rename", fail_install)
+    with pytest.raises(OSError, match="simulated install failure"):
+        recovery.cutover(recovery_set, staged, current, rollback, VERSIONS, stopped_confirmed=True)
+    assert (current / "prior.txt").read_text(encoding="utf-8") == "original"
+    assert staged.exists() and not rollback.exists()
+
+
+def test_cutover_post_swap_validation_failure_rolls_back(tmp_path: Path, monkeypatch) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    recovery_set = tmp_path / "recovery-set"
+    recovery.create(source, recovery_set, VERSIONS)
+    staged = tmp_path / "staged-data"
+    recovery.stage_restore(recovery_set, staged, VERSIONS)
+    current = _data(tmp_path / "current-data")
+    (current / "prior.txt").write_text("original", encoding="utf-8")
+    rollback = tmp_path / "previous-data"
+    original_files = recovery._files
+
+    def invalid_after_swap(path):
+        if path == current and rollback.exists() and not staged.exists():
+            return {}
+        return original_files(path)
+
+    monkeypatch.setattr(recovery, "_files", invalid_after_swap)
+    with pytest.raises(ValueError, match="Cutover data differs"):
+        recovery.cutover(recovery_set, staged, current, rollback, VERSIONS, stopped_confirmed=True)
+    assert (current / "prior.txt").read_text(encoding="utf-8") == "original"
+    assert staged.exists() and not rollback.exists()
+
+
+def test_corrupt_staging_cannot_replace_current_data(tmp_path: Path) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    recovery_set = tmp_path / "recovery-set"
+    recovery.create(source, recovery_set, VERSIONS)
+    staged = tmp_path / "staged-data"
+    recovery.stage_restore(recovery_set, staged, VERSIONS)
+    (staged / "library.db").write_bytes(b"corrupt")
+    current = _data(tmp_path / "current-data")
+    rollback = tmp_path / "previous-data"
+    with pytest.raises(ValueError, match="Staged data differs"):
+        recovery.cutover(recovery_set, staged, current, rollback, VERSIONS, stopped_confirmed=True)
+    assert current.exists() and not rollback.exists()
+
+
 def test_corrupt_partial_or_incomplete_set_cannot_stage(tmp_path: Path) -> None:
     source = _data(tmp_path / "quiesced-data")
     recovery_set = tmp_path / "recovery-set"

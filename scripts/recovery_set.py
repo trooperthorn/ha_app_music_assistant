@@ -277,13 +277,65 @@ def stage_restore(recovery_set: Path, destination: Path, expected_versions: dict
             shutil.rmtree(candidate)
 
 
+def cutover(
+    recovery_set: Path, staged_data: Path, current_data: Path, rollback_data: Path,
+    expected_versions: dict[str, str], *, stopped_confirmed: bool,
+) -> dict:
+    """Swap verified staged data into a stopped installation, retaining the old directory."""
+    if not stopped_confirmed:
+        raise ValueError("The Music Assistant app must be confirmed stopped before cutover")
+    manifest = verify(recovery_set, expected_versions)
+    if manifest["archive"]["schema_version"] != MAX_ARCHIVE_SCHEMA:
+        raise ValueError("Archive schema needs an explicit migration review before cutover")
+    for name, path in (("staged", staged_data), ("current", current_data)):
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(f"{name.capitalize()} data must be a real directory")
+    staged = staged_data.resolve(strict=True)
+    current = current_data.resolve(strict=True)
+    rollback = rollback_data.parent.resolve(strict=True) / rollback_data.name
+    recovery_root = recovery_set.resolve(strict=True)
+    if os.path.lexists(rollback):
+        raise ValueError("Rollback destination must be new")
+    if len({staged, current, rollback, recovery_root}) != 4 or any(
+        a.is_relative_to(b) for a in (staged, current, rollback) for b in (staged, current, rollback)
+        if a != b
+    ) or any(
+        a.is_relative_to(b) for a, b in (
+            (current, recovery_root), (staged, recovery_root),
+            (recovery_root, current), (recovery_root, staged),
+        )
+    ):
+        raise ValueError("Cutover paths must be distinct, separate directories")
+    if len({staged.stat().st_dev, current.stat().st_dev, rollback.parent.stat().st_dev}) != 1:
+        raise ValueError("Cutover and rollback must be on the same filesystem")
+    if _files(staged) != manifest["files"] or _archive_identity(staged / ARCHIVE) != manifest["archive"]:
+        raise ValueError("Staged data differs from the verified recovery set")
+    _verify_databases(staged, manifest["files"])
+    _verify_core(staged)
+
+    os.rename(current, rollback)
+    try:
+        os.rename(staged, current)
+        if _files(current) != manifest["files"]:
+            raise ValueError("Cutover data differs from the verified recovery set")
+    except BaseException:
+        if current.exists() and not staged.exists():
+            os.rename(current, staged)
+        os.rename(rollback, current)
+        raise
+    return manifest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("create", "verify", "stage"))
+    parser.add_argument("action", choices=("create", "verify", "stage", "cutover"))
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path, nargs="?")
     for name in ("app", "server", "frontend"):
         parser.add_argument(f"--{name}-version")
+    parser.add_argument("--staged-data", type=Path)
+    parser.add_argument("--rollback-data", type=Path)
+    parser.add_argument("--confirm-stopped", action="store_true")
     args = parser.parse_args()
     versions = {name: getattr(args, f"{name}_version") for name in ("app", "server", "frontend")}
     if any(versions.values()) and not all(versions.values()):
@@ -294,11 +346,19 @@ def main() -> None:
         result = create(args.source, args.destination, versions)
     elif args.action == "verify":
         result = verify(args.source, versions if all(versions.values()) else None)
-    else:
+    elif args.action == "stage":
         if args.destination is None:
             parser.error("stage requires a destination")
         result = stage_restore(args.source, args.destination, versions)
-    print(json.dumps({"status": "verified", "files": len(result["files"]), "versions": result["versions"]}))
+    else:
+        if args.destination is None or args.staged_data is None or args.rollback_data is None or not args.confirm_stopped:
+            parser.error("cutover requires current data, --staged-data, --rollback-data, and --confirm-stopped")
+        result = cutover(
+            args.source, args.staged_data, args.destination, args.rollback_data,
+            versions, stopped_confirmed=True,
+        )
+    print(json.dumps({"status": "cutover" if args.action == "cutover" else "verified",
+                      "files": len(result["files"]), "versions": result["versions"]}))
 
 
 if __name__ == "__main__":
