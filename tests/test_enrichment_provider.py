@@ -542,7 +542,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 41
+    assert len(plugin.registered) == 43
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -1254,6 +1254,47 @@ def test_provenance_states_pagination_unknown_version_and_account_isolation(plug
     for kwargs in ({"limit": 0}, {"limit": 201}, {"limit": True}, {"offset": -1}):
         with pytest.raises(plugin.module.InvalidDataError, match="Provenance page"):
             asyncio.run(plugin.provider.provenance(first, **kwargs))
+
+
+def test_provenance_override_survives_refresh_and_can_be_cleared(plugin):
+    _, version = _provenance_fixture(plugin)
+    source_id = "T" * 22
+    initial = asyncio.run(plugin.provider.provenance(version, limit=1))
+    field = initial["items"][0]["provenance"]["fields"]["isrc"]
+    assert field["revision"] == 0
+    corrected = asyncio.run(plugin.provider.set_provenance_override(
+        version, source_id, "isrc", "corrected-isrc", 0,
+    ))
+    assert corrected["fields"]["isrc"]["effective"]["value"] == "corrected-isrc"
+    assert corrected["fields"]["isrc"]["observation"]["value"] == "USRC17607839"
+    reread = asyncio.run(plugin.provider.provenance(version, limit=1))
+    assert reread["items"][0]["provenance"]["fields"]["isrc"]["revision"] == 1
+    with pytest.raises(plugin.module.InvalidDataError, match="revision conflict"):
+        asyncio.run(plugin.provider.set_provenance_override(
+            version, source_id, "isrc", "stale-write", 0,
+        ))
+    cleared = asyncio.run(plugin.provider.clear_provenance_override(
+        version, source_id, "isrc", 1,
+    ))
+    assert cleared["fields"]["isrc"]["override"] is None
+    assert cleared["fields"]["isrc"]["effective"]["value"] == "USRC17607839"
+
+
+def test_provenance_override_is_scoped_to_archive_subject(plugin):
+    _, version = _provenance_fixture(plugin)
+    asyncio.run(plugin.provider.provenance(version, limit=1))
+    with pytest.raises(plugin.module.InvalidDataError, match="not in"):
+        asyncio.run(plugin.provider.set_provenance_override(
+            version, "other-track", "isrc", "forged", 0,
+        ))
+    with pytest.raises(plugin.module.InvalidDataError, match="observed field"):
+        asyncio.run(plugin.provider.set_provenance_override(
+            version, "T" * 22, "not_observed", "forged", 0,
+        ))
+    with pytest.raises(plugin.module.InvalidDataError, match="4096"):
+        asyncio.run(plugin.provider.set_provenance_override(
+            version, "T" * 22, "isrc", "x" * 4097, 0,
+        ))
 
 
 def test_spotify_provenance_distinguishes_missing_empty_not_loaded_and_inaccessible(plugin):

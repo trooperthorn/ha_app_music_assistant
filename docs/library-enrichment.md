@@ -69,6 +69,9 @@ provider before its commands are registered. It never auto-starts a capture.
   recording, release-track, release, release-group and ordered artist-credit
   identities already present in the Music Assistant library. It uses only the
   existing Spotify provider mapping and never searches or refreshes a provider.
+- Provider administrators can correct an observed provenance field with an
+  expected revision, or clear the correction. The original observation remains
+  intact and later source reads do not remove the correction.
 - Playlist item provenance links known builtin archive, playback and mirror destinations
   to their subscription, snapshots, and durable check state.
 - A staged legacy iTunes XML export can be inspected with bounded parsing and
@@ -105,6 +108,8 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/version` | `version_id` | immutable ordered occurrence capture, verified against content digest |
 | `library_enrichment/versions` | `subscription_id`, optional `limit` (1..200, default 50), `offset` | newest-first version metadata; stable timestamp/ID ordering |
 | `library_enrichment/provenance` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned typed provenance and effective values; no inline raw payload |
+| `library_enrichment/set_provenance_override` | `version_id`, `source_item_id`, `field_name`, JSON `value`, `expected_revision` | revision-checked administrator correction for an observed field in that version |
+| `library_enrichment/clear_provenance_override` | `version_id`, `source_item_id`, `field_name`, `expected_revision` | revision-checked clear, restoring the observed effective value |
 | `library_enrichment/item_provenance` | `media_type` (`playlist`), `library_item_id` | builtin destination linkage and current, source/capture, mirror conflict/uncertain/detached, or unknown state |
 | `library_enrichment/itunes_inspect` | `library_path` under the advertised staging directory | bounded XML inventory, stable identities, playlist classifications and old path roots; no MA library write |
 | `library_enrichment/itunes_preview` | `inspection_id`, `source_digest`, explicit provider-bound `path_mappings`, selected `playlist_ids` | durable digest-bound actual MA library resolution and ordered preview; no write |
@@ -146,6 +151,7 @@ it is not retried automatically. See `local-match-review.md` for the exact
 contract and current boundary.
 
 Capabilities advertise `provenance_read`, `provenance_api_version: 1`,
+`provenance_override_api_version: 1`,
 `max_provenance_page: 200`, `raw_payload_inline: false`, `item_provenance`, and
 `item_provenance_api_version: 1`. `musicbrainz_identity_api_version: 1` advertises
 the additive local-library identity snapshot. See `provenance.md` for field and

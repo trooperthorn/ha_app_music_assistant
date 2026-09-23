@@ -88,6 +88,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("version", self.archive_version),
             ("versions", self.archive_versions),
             ("provenance", self.provenance),
+            ("set_provenance_override", self.set_provenance_override),
+            ("clear_provenance_override", self.clear_provenance_override),
             ("item_provenance", self.item_provenance),
             ("itunes_inspect", self.itunes_inspect),
             ("itunes_preview", self.itunes_preview),
@@ -185,6 +187,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "version_listing": True,
             "provenance_read": True,
             "provenance_api_version": 1,
+            "provenance_override_api_version": 1,
             "musicbrainz_identity_api_version": 1,
             "max_provenance_page": 200,
             "raw_payload_inline": False,
@@ -1257,6 +1260,87 @@ class LibraryEnrichmentProvider(PluginProvider):
             "has_more": offset + len(page) < len(occurrences),
             "raw_payload_inline": False,
         }
+
+    async def _change_provenance_override(
+        self, version_id: str, source_item_id: str, field_name: str,
+        expected_revision: int, *, clear: bool, value: Any = None,
+    ) -> dict[str, Any]:
+        """Apply one reviewed field correction to a source in this archive version."""
+        user = self._authorize()
+        if (
+            not isinstance(version_id, str) or not version_id
+            or not isinstance(source_item_id, str) or not source_item_id
+            or not isinstance(field_name, str) or not field_name
+            or type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise InvalidDataError("A version, source, field, and expected revision are required")
+        try:
+            version = await self._read_store(self._store.get_version, version_id)
+            subscription = await self._read_store(
+                self._store.get_subscription, version["subscription_id"]
+            )
+        except KeyError:
+            raise InvalidDataError("Archive version was not found") from None
+        if not any(
+            item.get("source_item_id") == source_item_id for item in version["occurrences"]
+        ):
+            raise InvalidDataError("Source is not in the selected archive version")
+        account_id = subscription["account_id"]
+        overlay = await self._read_store(
+            self._store.get_provenance_overlay,
+            "spotify", account_id, "track", source_item_id, version_id,
+        )
+        field = overlay["fields"].get(field_name)
+        if field is None or field.get("observation") is None:
+            raise InvalidDataError("Read provenance before correcting an observed field")
+        if not clear:
+            try:
+                encoded_value = json.dumps(value, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError):
+                raise InvalidDataError("Correction must be a JSON value") from None
+            if len(encoded_value.encode("utf-8")) > 4096:
+                raise InvalidDataError("Correction exceeds 4096 bytes")
+        try:
+            operation = (
+                self._store.clear_provenance_override if clear
+                else self._store.set_provenance_override
+            )
+            arguments = (
+                "spotify", account_id, "track", source_item_id, field_name,
+                expected_revision, user.user_id,
+            )
+            if clear:
+                await self._store_operation(operation, *arguments)
+            else:
+                await self._store_operation(
+                    operation, "spotify", account_id, "track", source_item_id,
+                    field_name, value, expected_revision, user.user_id,
+                )
+        except (TypeError, ValueError) as err:
+            raise InvalidDataError(str(err)) from None
+        return await self._read_store(
+            self._store.get_provenance_overlay,
+            "spotify", account_id, "track", source_item_id, version_id,
+        )
+
+    async def set_provenance_override(
+        self, version_id: str, source_item_id: str, field_name: str,
+        value: Any, expected_revision: int,
+    ) -> dict[str, Any]:
+        """Set an administrator correction without altering source evidence."""
+        return await self._change_provenance_override(
+            version_id, source_item_id, field_name, expected_revision,
+            clear=False, value=value,
+        )
+
+    async def clear_provenance_override(
+        self, version_id: str, source_item_id: str, field_name: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Clear a correction, exposing the original observation again."""
+        return await self._change_provenance_override(
+            version_id, source_item_id, field_name, expected_revision, clear=True,
+        )
 
     async def item_provenance(self, media_type: str = "playlist", library_item_id: str = "") -> dict[str, Any]:
         """Link one builtin playlist destination to its durable archive checkpoints."""
