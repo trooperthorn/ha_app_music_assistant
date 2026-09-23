@@ -104,6 +104,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("match_review", self.match_review),
             ("set_match_decision", self.set_match_decision),
             ("approve_match_candidates", self.approve_match_candidates),
+            ("relocate_match_asset", self.relocate_match_asset),
             ("playback_policy", self.playback_policy),
             ("set_playback_policy", self.set_playback_policy),
             ("playback_preview", self.playback_preview),
@@ -213,6 +214,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "interval_bounds": {"min": 3600, "max": 604800},
             "local_matching": True,
             "match_review_api_version": 2,
+            "match_relocation_api_version": 1,
             "max_match_review_page": 200,
             "max_match_approvals": 200,
             "playback_policy": True,
@@ -1465,6 +1467,94 @@ class LibraryEnrichmentProvider(PluginProvider):
             "candidate_freshness": candidate_freshness,
             "candidate_error": candidate_error,
             "items": items,
+        }
+
+    async def relocate_match_asset(
+        self,
+        version_id: str,
+        source_item_id: str,
+        asset_id: str,
+        provider_instance_id: str,
+        old_item_id: str,
+        new_item_id: str,
+        expected_revision: int,
+        provisional_asset_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Confirm a reviewed file move against current MA mappings, then retain its decision."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Match corrections require library write permission")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise InvalidDataError("Expected match revision required")
+        version = await self._read_store(self._store.get_version, version_id)
+        subscription = await self._read_store(
+            self._store.get_subscription, version["subscription_id"]
+        )
+        if not any(
+            row.get("state") == "track" and row.get("source_item_id") == source_item_id
+            for row in version["occurrences"]
+        ):
+            raise InvalidDataError("Source item is not a reviewable occurrence in this archive version")
+        source_key = (
+            subscription["provider_domain"], subscription["account_id"], "track", source_item_id
+        )
+        overlay = await self._read_store(self._store.get_match_overlay, *source_key)
+        if overlay["revision"] != expected_revision or overlay["approved_asset_id"] != asset_id:
+            raise InvalidDataError("Approved match changed during relocation")
+        try:
+            asset = await self._read_store(self._store.get_local_asset, asset_id)
+        except KeyError:
+            raise InvalidDataError("Approved local asset is missing") from None
+        if not any(
+            location["provider_instance_id"] == provider_instance_id
+            and location["item_id"] == old_item_id
+            for location in asset["locations"]
+        ):
+            raise InvalidDataError("Old location does not belong to the approved asset")
+        if provisional_asset_id is not None and provisional_asset_id not in {
+            candidate["asset_id"] for candidate in overlay["candidates"]
+        }:
+            raise InvalidDataError("Provisional asset is not a current candidate")
+        controller = self.mass.music.get_controller(MediaType.TRACK)
+        try:
+            item = await controller.get_library_item_by_prov_id(
+                source_item_id, subscription["provider_instance_id"]
+            )
+        except Exception:
+            raise InvalidDataError("Current library mapping could not be verified") from None
+        if item is None:
+            raise InvalidDataError("Current library track is unavailable")
+        same_instance = [
+            mapping for mapping in item.provider_mappings
+            if mapping.provider_instance == provider_instance_id
+        ]
+        if any(str(mapping.item_id) == old_item_id for mapping in same_instance):
+            raise InvalidDataError("Old location is still in the current library mapping")
+        current = [
+            mapping for mapping in same_instance
+            if self._local_mapping_candidate(mapping) is not None
+        ]
+        if not any(str(mapping.item_id) == new_item_id for mapping in current):
+            raise InvalidDataError("New location is not in the current local library mapping")
+        evidence = {
+            "kind": "reviewed_local_file_move",
+            "actor_id": user.user_id,
+            "version_id": version_id,
+            "source_item_id": source_item_id,
+            "library_item_id": str(item.item_id),
+            "old_item_id": old_item_id,
+        }
+        try:
+            location = await self._read_store(
+                self._store.relocate_local_asset_location,
+                asset_id, provider_instance_id, old_item_id, new_item_id,
+                evidence, provisional_asset_id, source_key, expected_revision,
+            )
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+        return {
+            "location": location,
+            "match": await self._read_store(self._store.get_match_overlay, *source_key),
         }
 
     async def set_match_decision(

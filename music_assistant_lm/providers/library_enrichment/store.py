@@ -1096,6 +1096,9 @@ class ArchiveStore:
         old_item_id: str,
         new_item_id: str,
         evidence: dict | None = None,
+        expected_target_asset_id: str | None = None,
+        source_key: tuple[str, str, str, str] | None = None,
+        expected_revision: int | None = None,
     ) -> dict:
         """Move one reviewed location while retaining its stable asset and match decisions."""
         if not all(
@@ -1104,7 +1107,26 @@ class ArchiveStore:
         ) or old_item_id == new_item_id:
             raise ValueError("Distinct old and new local track locations are required")
         evidence_json = self._json_object(evidence, "Relocation evidence")
+        if source_key is not None and (
+            not isinstance(source_key, tuple)
+            or len(source_key) != 4
+            or type(expected_revision) is not int
+            or expected_revision < 0
+        ):
+            raise ValueError("A source and expected match revision are required")
         with self._transaction():
+            if source_key is not None:
+                source = self._db.execute(
+                    """SELECT revision,approved_asset_id FROM match_sources
+                    WHERE provider_domain=? AND account_id=? AND media_type=? AND source_item_id=?""",
+                    source_key,
+                ).fetchone()
+                if (
+                    source is None
+                    or source["revision"] != expected_revision
+                    or source["approved_asset_id"] != asset_id
+                ):
+                    raise ValueError("Approved match changed during relocation")
             old = self._db.execute(
                 """SELECT id,asset_id FROM local_asset_locations
                 WHERE provider_instance_id=? AND item_id=?""",
@@ -1112,12 +1134,60 @@ class ArchiveStore:
             ).fetchone()
             if old is None or old["asset_id"] != asset_id:
                 raise ValueError("Old location no longer belongs to the expected asset")
-            if self._db.execute(
-                """SELECT 1 FROM local_asset_locations
+            target = self._db.execute(
+                """SELECT id,asset_id FROM local_asset_locations
                 WHERE provider_instance_id=? AND item_id=?""",
                 (provider_instance_id, new_item_id),
-            ).fetchone():
-                raise ValueError("New location is already bound")
+            ).fetchone()
+            if target is not None:
+                # A fresh review may already have registered the moved path as a
+                # provisional asset. Merge only when the caller names it and it
+                # has no decision or other location of its own.
+                provisional_id = target["asset_id"]
+                if (
+                    provisional_id == asset_id
+                    or provisional_id != expected_target_asset_id
+                    or self._db.execute(
+                        "SELECT COUNT(*) FROM local_asset_locations WHERE asset_id=?",
+                        (provisional_id,),
+                    ).fetchone()[0] != 1
+                    or self._db.execute(
+                        "SELECT 1 FROM match_decisions WHERE asset_id=?",
+                        (provisional_id,),
+                    ).fetchone()
+                    or self._db.execute(
+                        "SELECT 1 FROM match_sources WHERE approved_asset_id=?",
+                        (provisional_id,),
+                    ).fetchone()
+                ):
+                    raise ValueError("New location is already bound to a reviewed asset")
+                for candidate in self._db.execute(
+                    "SELECT * FROM match_candidates WHERE asset_id=?",
+                    (provisional_id,),
+                ).fetchall():
+                    existing = self._db.execute(
+                        "SELECT id FROM match_candidates WHERE source_id=? AND asset_id=?",
+                        (candidate["source_id"], asset_id),
+                    ).fetchone()
+                    if existing is not None:
+                        self._db.execute(
+                            """UPDATE match_candidates SET score=?,evidence_json=?,
+                            algorithm_version=?,observed_at=?,active=?
+                            WHERE id=?""",
+                            (
+                                candidate["score"], candidate["evidence_json"],
+                                candidate["algorithm_version"], candidate["observed_at"],
+                                candidate["active"], existing["id"],
+                            ),
+                        )
+                        self._db.execute("DELETE FROM match_candidates WHERE id=?", (candidate["id"],))
+                    else:
+                        self._db.execute(
+                            "UPDATE match_candidates SET asset_id=? WHERE id=?",
+                            (asset_id, candidate["id"]),
+                        )
+                self._db.execute("DELETE FROM local_asset_locations WHERE id=?", (target["id"],))
+                self._db.execute("DELETE FROM local_assets WHERE id=?", (provisional_id,))
             self._db.execute(
                 """UPDATE local_asset_locations SET item_id=?,evidence_json=?,updated_at=?
                 WHERE id=?""",
@@ -1208,6 +1278,7 @@ class ArchiveStore:
                     "decision": None,
                     "decision_history": [],
                     "approved_asset_id": None,
+                    "approved_asset": None,
                     "candidates": [],
                 }
             source = dict(source_row)
@@ -1238,6 +1309,10 @@ class ArchiveStore:
                 "decision": decisions[-1] if decisions else None,
                 "decision_history": decisions,
                 "approved_asset_id": source["approved_asset_id"],
+                "approved_asset": (
+                    self.get_local_asset(source["approved_asset_id"])
+                    if source["approved_asset_id"] else None
+                ),
                 "candidates": candidates,
             }
 

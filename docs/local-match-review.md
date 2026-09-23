@@ -43,5 +43,10 @@ been acoustically validated on the installed players.
 The store can relocate an existing asset's provider location atomically after a
 reviewed move, retaining its asset ID and decision history while rejecting a
 stale old path or a destination already bound to another asset. This is a
-store-level primitive; the provider API and UI still need a live mapping check
-and explicit correction workflow before users can invoke it.
+provider command `library_enrichment/relocate_match_asset` performs a direct
+Music Assistant library mapping check, requires the approved match revision, and
+rejects a still-listed old location. If a refreshed review has already created
+an unreviewed provisional asset at the new path, the caller must name its ID;
+the store refuses to merge a provisional asset with decisions or other
+locations. The capability-gated review UI displays the exact old and new paths
+before sending the correction. A live file-move exercise remains outstanding.

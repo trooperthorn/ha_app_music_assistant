@@ -542,7 +542,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 40
+    assert len(plugin.registered) == 41
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -1421,6 +1421,70 @@ def test_match_decision_requires_library_write_and_uses_revision_cas(plugin):
     assert next(
         item for item in rejected["match"]["candidates"] if item["asset_id"] == candidate["asset_id"]
     )["rejected"] is True
+
+
+def test_reviewed_file_move_requires_current_mapping_and_keeps_approval(plugin):
+    version_id = _match_fixture(plugin)
+    source_id = "T" * 22
+    review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    approved_candidate = next(
+        candidate for candidate in review["items"][0]["match"]["candidates"]
+        if candidate["evidence"]["provider_instance_id"] == "local-a"
+    )
+    asset_id = approved_candidate["asset_id"]
+    asyncio.run(
+        plugin.provider.set_match_decision(version_id, source_id, 0, "approve", asset_id)
+    )
+    plugin.auth.user.allowed_scopes = {plugin.module.Scope.CONFIG_PROVIDERS_WRITE}
+    with pytest.raises(Exception, match="library write permission"):
+        asyncio.run(plugin.provider.relocate_match_asset(
+            version_id, source_id, asset_id, "local-a",
+            "music/track.flac", "music/moved.flac", 1,
+        ))
+    plugin.auth.user.allowed_scopes = set(plugin.module.Scope)
+    with pytest.raises(Exception, match="Old location is still"):
+        asyncio.run(plugin.provider.relocate_match_asset(
+            version_id, source_id, asset_id, "local-a",
+            "music/track.flac", "music/moved.flac", 1,
+        ))
+
+    item = plugin.controller.get_library_item_by_prov_id.return_value
+    mapping = next(
+        mapping for mapping in item.provider_mappings
+        if mapping.provider_instance == "local-a"
+    )
+    mapping.item_id = "music/moved.flac"
+    moved_review = asyncio.run(plugin.provider.match_review(version_id, limit=1))
+    provisional_id = next(
+        candidate["asset_id"]
+        for candidate in moved_review["items"][0]["match"]["candidates"]
+        if candidate["evidence"]["provider_instance_id"] == "local-a"
+    )
+    assert provisional_id != asset_id
+    assert moved_review["items"][0]["match"]["approved_asset"]["locations"][0]["item_id"] == "music/track.flac"
+    with pytest.raises(Exception, match="already bound"):
+        asyncio.run(plugin.provider.relocate_match_asset(
+            version_id, source_id, asset_id, "local-a",
+            "music/track.flac", "music/moved.flac", 1,
+        ))
+    with pytest.raises(Exception, match="changed"):
+        asyncio.run(plugin.provider.relocate_match_asset(
+            version_id, source_id, asset_id, "local-a",
+            "music/track.flac", "music/moved.flac", 0, provisional_id,
+        ))
+    result = asyncio.run(plugin.provider.relocate_match_asset(
+        version_id, source_id, asset_id, "local-a",
+        "music/track.flac", "music/moved.flac", 1, provisional_id,
+    ))
+    assert result["location"]["asset_id"] == asset_id
+    assert result["location"]["item_id"] == "music/moved.flac"
+    assert result["match"]["approved_asset_id"] == asset_id
+    assert next(
+        candidate for candidate in result["match"]["candidates"]
+        if candidate["asset_id"] == asset_id
+    )["asset"]["locations"][0]["item_id"] == "music/moved.flac"
+    with pytest.raises(KeyError):
+        plugin.provider._store.get_local_asset(provisional_id)
 
 
 def test_bulk_match_approval_uses_checked_subset_and_is_idempotent(plugin):

@@ -784,6 +784,38 @@ def test_reviewed_local_file_relocation_preserves_asset_and_decision(tmp_path):
     reopened.close()
 
 
+def test_reviewed_move_requires_explicit_safe_provisional_merge(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    reviewed = store.upsert_local_asset("track", "filesystem", "old.flac")
+    provisional = store.upsert_local_asset("track", "filesystem", "new.flac")
+    key = ("spotify", "account-a", "track", "song")
+    store.replace_match_candidates(
+        *key, [{"asset_id": provisional["id"], "score": 0.5}], "v1"
+    )
+    with pytest.raises(ValueError, match="already bound"):
+        store.relocate_local_asset_location(
+            reviewed["id"], "filesystem", "old.flac", "new.flac"
+        )
+    with pytest.raises(ValueError, match="already bound"):
+        store.relocate_local_asset_location(
+            reviewed["id"], "filesystem", "old.flac", "new.flac",
+            expected_target_asset_id="wrong",
+        )
+    assert store.get_local_asset(reviewed["id"])["locations"][0]["item_id"] == "old.flac"
+
+    store.relocate_local_asset_location(
+        reviewed["id"], "filesystem", "old.flac", "new.flac",
+        {"kind": "reviewed_move"},
+        expected_target_asset_id=provisional["id"],
+    )
+    overlay = store.get_match_overlay(*key)
+    assert overlay["candidates"][0]["asset_id"] == reviewed["id"]
+    assert store.get_local_asset(reviewed["id"])["locations"][0]["item_id"] == "new.flac"
+    with pytest.raises(KeyError):
+        store.get_local_asset(provisional["id"])
+    store.close()
+
+
 def test_bulk_match_approval_is_atomic_idempotent_and_bounded(tmp_path):
     store = ArchiveStore(tmp_path / "archive.db")
     assets = []

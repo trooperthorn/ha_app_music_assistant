@@ -120,6 +120,7 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/sync_status` | `subscription_id` | policy, state, recent jobs and latest job |
 | `library_enrichment/match_review` | `version_id`, optional `limit` (1..200, default 100), `offset` | occurrence-aligned local candidates from existing merged mappings, including ambiguity and freshness |
 | `library_enrichment/set_match_decision` | `version_id`, `source_item_id`, `expected_revision`, `action` (`approve`, `reject` or `clear`), `asset_id` for approval or rejection | revisioned decision overlay; also requires `library.write` |
+| `library_enrichment/relocate_match_asset` | `version_id`, `source_item_id`, approved `asset_id`, `provider_instance_id`, `old_item_id`, `new_item_id`, `expected_revision`, optional `provisional_asset_id` | verifies the current MA local mapping, then carries an approval to a reviewed file move without changing MA mappings; also requires `library.write` |
 | `library_enrichment/playback_policy` | `subscription_id` | current mode, revision, actor and update time |
 | `library_enrichment/set_playback_policy` | `subscription_id`, `mode`, `expected_revision` | CAS update only; never writes a playlist |
 | `library_enrichment/playback_preview` | `version_id` | ordered rows, explicit fallbacks, visible gaps, counts, policy revision and digest |
