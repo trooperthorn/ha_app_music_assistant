@@ -220,6 +220,7 @@ def test_large_archive_backup_can_be_verified_and_staged_without_replacing_live_
         {"position": position, "item": {"id": f"track-{position % 50}"}}
         for position in range(10000)
     ]
+    rows[5_000] = {"position": 5_000, "reason": "missing", "omitted": True, "fallback": None}
     version = capture(store, subscription, rows=rows)
     backup = tmp_path / "backup.db"
     manifest = store.backup(backup)
@@ -232,6 +233,7 @@ def test_large_archive_backup_can_be_verified_and_staged_without_replacing_live_
     recovered_rows = recovered.get_version(version)["occurrences"]
     assert len(recovered_rows) == 10000
     assert recovered_rows[0] == rows[0]
+    assert recovered_rows[5_000] == rows[5_000]
     assert recovered_rows[-1] == rows[-1]
     recovered.close()
     assert source.exists()
