@@ -34,3 +34,7 @@ change AirPlay or Squeezelite's signed `sync_adjust`, browser-local timing, or
 the Cast receiver's separate saved delay. A real client must acknowledge its
 new value through a later state report; acoustic alignment remains a live
 device test rather than a conclusion from wire compatibility alone.
+
+Source input has a separate latency boundary. See
+[Sendspin source-to-output latency](sendspin-source-latency.md) for the
+reported bridge diagnostics and the acoustic measurement procedure.
