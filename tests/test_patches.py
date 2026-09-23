@@ -7,7 +7,9 @@ import asyncio
 import os
 import re
 import sys
+import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -25,6 +27,7 @@ import sendspin_controller_switch as switch  # noqa: E402
 import sendspin_discovery_status as discovery  # noqa: E402
 import sendspin_non_audio_clients as non_audio  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
+import sendspin_source_status as source_status  # noqa: E402
 import sendspin_timing_status as timing  # noqa: E402
 
 # streams_audio_2_10_4.py and sendspin_player_2_10_4.py are verbatim pinned
@@ -48,6 +51,53 @@ AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
 SENDSPIN_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_provider_2_10_4.py"
+SENDSPIN_SOURCE_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_source_provider_2_10_4.py"
+
+
+@requires_py314
+def test_sendspin_source_status_reports_observed_signal_without_controlling_source() -> None:
+    original = SENDSPIN_SOURCE_PROVIDER.read_text(encoding="utf-8")
+    patched = source_status.apply(original)
+    assert source_status.apply(patched) == patched
+    assert '"sendspin_source/status"' in patched
+    assert "required_scope=Scope.CONFIG_PROVIDERS_READ" in patched
+    assert "self._status_unsubscribe()" in patched
+    assert "sendspin_source_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin source status anchor found 0 times"):
+        source_status.apply("class SendspinSourceProvider: pass")
+
+    tree = ast.parse(patched)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinSourceProvider")
+    method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "source_status")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+    runtime = {"cast": cast, "time": time, "CONF_TARGET_LATENCY": "latency", "DEFAULT_TARGET_LATENCY_MS": 100}
+    exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
+
+    client = type("Client", (), {"client_id": "source-a", "info_or_none": type("Info", (), {"name": "Turntable"})()})()
+    session = type(
+        "Session",
+        (),
+        {
+            "player_id": "living-room",
+            "bridge": object(),
+            "ingest_task": type("Task", (), {"done": lambda self: False})(),
+            "pcm_received": type("Event", (), {"is_set": lambda self: True})(),
+            "last_pcm_monotonic": time.monotonic() - 0.05,
+        },
+    )()
+    state = type("State", (), {"session": session, "signal": type("Signal", (), {"value": "present"})()})()
+    instance = runtime["Provider"]()
+    instance._clients = {"source-a": state}
+    instance._sendspin_provider = type("Sendspin", (), {"server_api": type("Server", (), {"connected_clients": [client]})()})()
+    instance._get_source_role = lambda _: object()
+    instance.config = type("Config", (), {"get_value": lambda self, _: 80})()
+    result = asyncio.run(instance.source_status())
+    assert result["target_latency_ms"] == 80
+    assert result["sources"][0]["signal"] == "present"
+    assert result["sources"][0]["selected_player_id"] == "living-room"
+    assert result["sources"][0]["receiving_pcm"] is True
+    assert 0 <= result["sources"][0]["last_pcm_age_ms"] < 1000
+    assert "measured_latency_ms" not in result
 
 
 @requires_py314
