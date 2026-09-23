@@ -29,6 +29,7 @@ import sendspin_controller_switch as switch  # noqa: E402
 import sendspin_discovery_status as discovery  # noqa: E402
 import sendspin_non_audio_clients as non_audio  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
+import sendspin_output_delay_compat as output_delay  # noqa: E402
 import sendspin_source_status as source_status  # noqa: E402
 import sendspin_timing_status as timing  # noqa: E402
 
@@ -50,11 +51,37 @@ STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_4.py"
 # aiosendspin as server 2.10.4 pins it (aiosendspin[server]==9.1.1)
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
+AIOSENDSPIN_TYPES = ROOT / "tests" / "fixtures" / "aiosendspin_types_9_1_1.py"
+AIOSENDSPIN_PLAYER_MODEL = ROOT / "tests" / "fixtures" / "aiosendspin_player_model_9_1_1.py"
 AIOSENDSPIN_CLIENT = ROOT / "tests" / "fixtures" / "aiosendspin_client_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
 SENDSPIN_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_provider_2_10_4.py"
 SENDSPIN_SOURCE_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_source_provider_2_10_4.py"
+
+
+@requires_py314
+def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() -> None:
+    sources = {
+        output_delay.TYPES: AIOSENDSPIN_TYPES.read_text(encoding="utf-8"),
+        output_delay.MODEL: AIOSENDSPIN_PLAYER_MODEL.read_text(encoding="utf-8"),
+        output_delay.ROLE: opus.apply(
+            AIOSENDSPIN_PLAYER_V1.read_text(encoding="utf-8"), opus.EDITS[opus.PLAYER_ROLE]
+        ),
+        output_delay.PROVIDER: timing.apply(cast_delay.apply(opus.apply(
+            SENDSPIN_PLAYER.read_text(encoding="utf-8"), opus.EDITS[opus.PROVIDER]
+        ))),
+    }
+    patched = {module: output_delay.apply(source, module) for module, source in sources.items()}
+    assert all(output_delay.apply(source, module) == source for module, source in patched.items())
+    assert 'SET_OUTPUT_DELAY = "set_output_delay"' in patched[output_delay.TYPES]
+    assert 'output_delay_ms: int | None = None' in patched[output_delay.MODEL]
+    assert 'command = PlayerCommand.SET_OUTPUT_DELAY' in patched[output_delay.ROLE]
+    assert 'command = PlayerCommand.SET_STATIC_DELAY' in patched[output_delay.ROLE]
+    assert 'PlayerCommand.SET_OUTPUT_DELAY}' in patched[output_delay.PROVIDER]
+    assert "sendspin_output_delay_compat.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="anchor found 0 times"):
+        output_delay.apply("class PlayerStatePayload: pass", output_delay.MODEL)
 
 
 @requires_py314
