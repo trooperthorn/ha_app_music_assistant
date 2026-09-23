@@ -1267,7 +1267,7 @@ def test_item_provenance_links_playback_and_unknown_is_explicit(plugin):
     digest = "d" * 64
     plugin.provider._store.prepare_playback_projection(subscription, version, 0, digest, 2, 2, "[]")
     plugin.provider._store.mark_playback_projection_writing(subscription)
-    plugin.provider._store.commit_playback_projection(subscription, "playback-1", "builtin", digest)
+    plugin.provider._store.commit_playback_projection(subscription, "playback-1", "builtin", digest, "a" * 64)
     linked = asyncio.run(plugin.provider.item_provenance("playlist", "playback-1"))
     assert linked["linked"] is True and linked["destination"]["kind"] == "playback"
     unknown = asyncio.run(plugin.provider.item_provenance("playlist", "missing"))
@@ -1540,6 +1540,38 @@ def test_local_only_apply_rejects_destination_that_drops_strict_sentinels(plugin
             )
         )
     assert asyncio.run(plugin.provider.playback_status(subscription_id))["projection"]["state"] == "uncertain"
+
+
+def test_playback_projection_preserves_edited_destination(plugin):
+    version_id = _match_fixture(plugin)
+    preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True,
+        _read_m3u_file=AsyncMock(), _write_m3u_file=AsyncMock(),
+        _get_playlist_lock=lambda _: asyncio.Lock(),
+    )
+    destination = types.SimpleNamespace(
+        item_id="playback-1", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="projection")]
+    )
+
+    async def import_playlist(m3u, *, library_matching):
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    plugin.provider.mass.music.providers.append(builtin)
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    plugin.provider.mass.music.playlists.get_library_item = AsyncMock(return_value=destination)
+    first = asyncio.run(plugin.provider.playback_apply(
+        version_id, preview["projection_digest"], preview["policy_revision"], allow_partial=True,
+    ))
+    assert first["state"] == "applied"
+    builtin._read_m3u_file.return_value += "spotify://track/user-added\n"
+    with pytest.raises(plugin.module.InvalidDataError, match="destination was edited"):
+        asyncio.run(plugin.provider.playback_apply(
+            version_id, preview["projection_digest"], preview["policy_revision"], allow_partial=True,
+        ))
+    builtin._write_m3u_file.assert_not_awaited()
+    assert builtin._read_m3u_file.return_value.endswith("spotify://track/user-added\n")
 
 
 def test_match_review_returns_stale_overlay_without_retry_or_ma_mutation(plugin):

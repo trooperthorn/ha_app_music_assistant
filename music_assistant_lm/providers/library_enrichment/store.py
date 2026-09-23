@@ -17,7 +17,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
 PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
@@ -56,7 +56,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -110,6 +110,8 @@ class ArchiveStore:
                     self._migrate_v8()
                 if version <= 8:
                     self._migrate_v9()
+                if version <= 9:
+                    self._migrate_v10()
         except Exception:
             self._db.close()
             raise
@@ -382,6 +384,15 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v9_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=9")
+
+    def _migrate_v10(self) -> None:
+        """Remember the exact verified destination before any later rewrite."""
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(playback_projections)")}
+        if "destination_content_digest" not in columns:
+            self._db.execute("ALTER TABLE playback_projections ADD COLUMN destination_content_digest TEXT")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v10_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=10")
 
     @staticmethod
     def _bounded_json(value, label: str, expected_type: type, limit: int = 65536) -> str:
@@ -1768,7 +1779,9 @@ class ArchiveStore:
                              (_now(), subscription_id))
 
     def commit_playback_projection(self, subscription_id: str, destination_item_id: str,
-                                   destination_provider_instance: str, verified_digest: str) -> dict:
+                                   destination_provider_instance: str, verified_digest: str,
+                                   destination_content_digest: str) -> dict:
+        destination_content_digest = self._sha256(destination_content_digest, "destination_content_digest")
         with self._transaction():
             row = self.get_playback_projection(subscription_id)
             if row is None or row["state"] not in ("writing", "uncertain"):
@@ -1776,8 +1789,9 @@ class ArchiveStore:
             if verified_digest != row["projection_digest"]:
                 raise ValueError("Playback destination digest does not match preview")
             self._db.execute("""UPDATE playback_projections SET state='applied',destination_item_id=?,
-                destination_provider_instance=?,updated_at=?,error=NULL WHERE subscription_id=?""",
-                (destination_item_id, destination_provider_instance, _now(), subscription_id))
+                destination_provider_instance=?,destination_content_digest=?,updated_at=?,error=NULL
+                WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, destination_content_digest, _now(), subscription_id))
             return self.get_playback_projection(subscription_id)
 
     def fail_playback_projection(self, subscription_id: str, error: str, uncertain: bool = False) -> None:

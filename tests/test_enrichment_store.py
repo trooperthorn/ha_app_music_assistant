@@ -96,7 +96,7 @@ def test_playback_policy_cas_and_projection_checkpoint_are_independent(tmp_path)
     )
     assert projection["state"] == "prepared"
     store.mark_playback_projection_writing(subscription)
-    committed = store.commit_playback_projection(subscription, "playback", "builtin", "a" * 64)
+    committed = store.commit_playback_projection(subscription, "playback", "builtin", "a" * 64, "b" * 64)
     assert committed["state"] == "applied"
     # The playback checkpoint does not advance the older archive-copy checkpoint.
     assert store.get_subscription(subscription)["applied_version_id"] is None
