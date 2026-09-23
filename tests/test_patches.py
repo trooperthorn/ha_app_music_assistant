@@ -82,6 +82,8 @@ def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() 
     assert 'command = PlayerCommand.SET_OUTPUT_DELAY' in patched[output_delay.ROLE]
     assert 'command = PlayerCommand.SET_STATIC_DELAY' in patched[output_delay.ROLE]
     assert 'PlayerCommand.SET_OUTPUT_DELAY}' in patched[output_delay.PROVIDER]
+    assert ("self._client_format_override_active = False\n"
+            "        self._ensure_preferred_format()") in patched[output_delay.ROLE]
     assert "sendspin_output_delay_compat.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
     with pytest.raises(SystemExit, match="anchor found 0 times"):
         output_delay.apply("class PlayerStatePayload: pass", output_delay.MODEL)

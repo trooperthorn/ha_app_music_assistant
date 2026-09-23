@@ -62,6 +62,11 @@ EDITS: dict[str, list[tuple[str, str]]] = {
         ('        self._last_sent_format: tuple[AudioCodec, int, int, int, str | None] | None = None\n',
          '        self._last_sent_format: tuple[AudioCodec, int, int, int, str | None] | None = None\n'
          '        self._client_format_override_active = False\n'),
+        ('        self._ensure_preferred_format()\n        self._ensure_audio_requirements(force=True)\n\n'
+         '    def on_deactivate(self) -> None:\n',
+         '        self._client_format_override_active = False\n'
+         '        self._ensure_preferred_format()\n        self._ensure_audio_requirements(force=True)\n\n'
+         '    def on_deactivate(self) -> None:\n'),
         ('        if not support or PlayerCommand.VOLUME not in support.supported_commands:\n            return\n',
          '        commands = set(support.supported_commands if support else []) | set(self.state_supported_commands)\n'
          '        if PlayerCommand.VOLUME not in commands:\n            return\n'),
