@@ -98,6 +98,10 @@ def test_sendspin_source_status_reports_observed_signal_without_controlling_sour
     assert result["sources"][0]["receiving_pcm"] is True
     assert 0 <= result["sources"][0]["last_pcm_age_ms"] < 1000
     assert "measured_latency_ms" not in result
+    session.last_pcm_monotonic = time.monotonic() - 3
+    stale = asyncio.run(instance.source_status())
+    assert stale["sources"][0]["receiving_pcm"] is False
+    assert stale["sources"][0]["last_pcm_age_ms"] >= 2000
 
 
 @requires_py314

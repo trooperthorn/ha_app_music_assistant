@@ -53,12 +53,18 @@ EDITS: list[tuple[str, str]] = [
         "                    continue\n"
         "                state = self._clients.get(client.client_id)\n"
         "                session = state.session if state else None\n"
+        "                last_pcm_age_ms = (\n"
+        "                    round(max(0, time.monotonic() - session.last_pcm_monotonic) * 1000)\n"
+        "                    if session and session.pcm_received.is_set()\n"
+        "                    else None\n"
+        "                )\n"
         "                receiving = bool(\n"
         "                    session is not None\n"
         "                    and session.bridge is not None\n"
         "                    and session.ingest_task is not None\n"
         "                    and not session.ingest_task.done()\n"
-        "                    and session.pcm_received.is_set()\n"
+        "                    and last_pcm_age_ms is not None\n"
+        "                    and last_pcm_age_ms <= 2000\n"
         "                )\n"
         "                info = client.info_or_none\n"
         "                sources.append(\n"
@@ -68,11 +74,7 @@ EDITS: list[tuple[str, str]] = [
         '                        "signal": state.signal.value if state and state.signal else None,\n'
         '                        "selected_player_id": session.player_id if session else None,\n'
         '                        "receiving_pcm": receiving,\n'
-        '                        "last_pcm_age_ms": (\n'
-        "                            round(max(0, time.monotonic() - session.last_pcm_monotonic) * 1000)\n"
-        "                            if session and session.pcm_received.is_set()\n"
-        "                            else None\n"
-        "                        ),\n"
+        '                        "last_pcm_age_ms": last_pcm_age_ms,\n'
         "                    }\n"
         "                )\n"
         '        return {"target_latency_ms": target_latency_ms, "sources": sources}\n'
