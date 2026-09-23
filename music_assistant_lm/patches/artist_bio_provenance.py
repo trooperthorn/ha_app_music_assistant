@@ -43,6 +43,22 @@ def apply(source: str, module: str) -> str:
         )
         source = _replace_once(
             source,
+            "            if lang_changed or self.description is None:\n"
+            "                self.description = new_values.description\n"
+            "                self.description_language = new_lang\n",
+            "            if self.description_source == \"manual\" and "
+            "new_values.description_source != \"manual\":\n"
+            "                pass  # Keep an explicit library override during provider updates.\n"
+            "            elif new_values.description_source is not None or "
+            "lang_changed or self.description is None:\n"
+            "                self.description = new_values.description\n"
+            "                self.description_language = new_lang\n"
+            "                self.description_source = new_values.description_source\n"
+            "                self.description_observed_at = new_values.description_observed_at\n",
+            module,
+        )
+        source = _replace_once(
+            source,
             'if fld.name in ("description", "description_language"):',
             'if fld.name in ("description", "description_language", '
             '"description_source", "description_observed_at"):',

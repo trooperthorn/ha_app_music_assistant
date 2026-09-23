@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,30 @@ def _selector(source: str):
     selector = namespace["Selector"]()
     selector.preferred_language = "fr"
     return selector._select_description
+
+
+def _metadata_class(source: str):
+    """Run the pinned model's real merge method on a minimal dataclass."""
+    tree = ast.parse(source)
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MediaItemMetadata")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "update")
+    method.returns = None
+    for argument in (*method.args.posonlyargs, *method.args.args, *method.args.kwonlyargs):
+        argument.annotation = None
+    namespace = {"fields": fields, "UniqueList": list, "merge_lists": lambda old, new: old + new}
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    exec(compile(module, "metadata_merge", "exec"), namespace)  # noqa: S102 - pinned pure method
+
+    @dataclass
+    class Metadata:
+        description: str | None = None
+        description_language: str | None = None
+        description_source: str | None = None
+        description_observed_at: int | None = None
+        last_refresh: int | None = None
+
+    Metadata.update = namespace["update"]
+    return Metadata
 
 
 def test_pinned_artist_bio_patch_is_idempotent_and_preserves_model_fields() -> None:
@@ -60,6 +85,22 @@ def test_bio_source_follows_language_selection_and_preserved_copy() -> None:
     assert select(candidates, "My biography", "es", "manual") == (
         "My biography", "es", "manual", False
     )
+
+
+def test_biography_provenance_persists_and_manual_override_wins() -> None:
+    model = bio.apply(MODEL.read_text(encoding="utf-8"), bio.MODEL)
+    Metadata = _metadata_class(model)
+    stored = Metadata("Old", "en", "provider-a", 100, 100)
+    stored.update(Metadata("New", "en", "provider-b", 200, 200))
+    assert (stored.description, stored.description_source, stored.description_observed_at) == (
+        "New", "provider-b", 200
+    )
+    manual = Metadata("Mine", "en", "manual", 300, 300)
+    manual.update(Metadata("Provider text", "fr", "provider-c", 400, 400))
+    assert (manual.description, manual.description_source, manual.description_observed_at) == (
+        "Mine", "manual", 300
+    )
+    assert manual.last_refresh == 400
 
 
 def test_pinned_patch_rejects_unknown_model_anchor() -> None:
