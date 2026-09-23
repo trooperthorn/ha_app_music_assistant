@@ -76,7 +76,7 @@ RUN set -eu \
     else \
         echo "No fork frontend pinned; the upstream frontend stays installed"; \
     fi \
-    && "$VIRTUAL_ENV/bin/python" /tmp/patches/hass_source_select.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/play_source_steer.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/sendspin_opus_bitrate.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/playlist_bridge.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/folder_browser.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/library_trash.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/library_enrichment.py     && rm -rf /tmp/patches /tmp/providers     && chmod -R a+rX "$VIRTUAL_ENV/lib"
+    && "$VIRTUAL_ENV/bin/python" /tmp/patches/hass_source_select.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/play_source_steer.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/sendspin_opus_bitrate.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/sendspin_cast_delay.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/playlist_bridge.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/folder_browser.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/library_trash.py     && "$VIRTUAL_ENV/bin/python" /tmp/patches/library_enrichment.py     && rm -rf /tmp/patches /tmp/providers     && chmod -R a+rX "$VIRTUAL_ENV/lib"
 
 ARG BUILD_VERSION
 ARG BUILD_ARCH

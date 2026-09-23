@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are six: three anchor patches that rewrite exact lines in an
+Today there are seven: four anchor patches that rewrite exact lines in an
 already-installed file, and three plugin providers that add a self-contained
 new provider directory instead (see `docs/extension-points.md` for the
 distinction).
@@ -92,6 +92,12 @@ Anchor patches:
   web player uses it as the lower rungs of its adaptive mode and from the
   phone layout's menu. Its fixtures are pinned to the aiosendspin release
   the server pins (9.1.1 for 2.10.3).
+- `sendspin_cast_delay.py`: exposes the Cast receiver's 0–5000 ms
+  `sendspin_static_delay` setting on its derived Sendspin player before the
+  receiver connects. The pinned Cast bridge already sends the saved value as
+  `syncDelay` at launch and after configuration changes, but its provisional
+  role does not advertise the generic delay command, hiding the setting while
+  idle. Other bridges retain capability-gated delay controls.
 
 Plugin providers:
 

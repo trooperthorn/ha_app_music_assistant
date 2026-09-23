@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import os
 import re
 import sys
@@ -18,6 +19,7 @@ import hass_source_select as patch  # noqa: E402
 import library_trash as trash  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
+import sendspin_cast_delay as cast_delay  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 
 # streams_audio_2_10_4.py and sendspin_player_2_10_4.py are verbatim pinned
@@ -41,6 +43,50 @@ AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 
 
+@requires_py314
+def test_cast_bridge_delay_is_configurable_before_receiver_connects() -> None:
+    source = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    patched = cast_delay.apply(source)
+    assert cast_delay.apply(patched) == patched
+    assert 'underlying.provider.domain == "chromecast"' in patched
+    assert "PlayerCommand.SET_STATIC_DELAY in player_role.state_supported_commands" in patched
+    assert "range=(0, 5000)" in patched
+    assert "sendspin_cast_delay.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Cast delay anchor found 0 times"):
+        cast_delay.apply("class SendspinPlayer: pass")
+
+    tree = ast.parse(patched)
+    player = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinPlayer")
+    method = next(node for node in player.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_config_entries")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+    namespace = {
+        "ConfigEntry": lambda **kwargs: kwargs,
+        "ConfigEntryType": type("ConfigEntryType", (), {"INTEGER": "integer"}),
+        "CONF_SENDSPIN_STATIC_DELAY": "sendspin_static_delay",
+        "PlayerCommand": type("PlayerCommand", (), {"SET_STATIC_DELAY": "set_static_delay"}),
+        "HIDDEN_ANNOUNCE_VOLUME_CONFIG_ENTRIES": [],
+    }
+    class_source = "class Base:\n    async def get_config_entries(self): return []\nclass Player(Base):\n" + method_source
+    exec(class_source, namespace)  # noqa: S102
+    instance = namespace["Player"]()
+    instance.static_delay_default_ms = 330
+    instance._hass_announce_entity_id = None
+    instance._player_role = None
+    for domain, expected in (("chromecast", 1), ("airplay", 0)):
+        underlying = type("Underlying", (), {"provider": type("Provider", (), {"domain": domain})()})()
+        players = type("Players", (), {"get_player": lambda self, _, u=underlying: u})()
+        instance.mass = type("Mass", (), {"players": players})()
+        instance.underlying_player_id = "base-id"
+        entries = asyncio.run(instance.get_config_entries())
+        assert len(entries) == expected
+        if expected:
+            assert entries[0]["key"] == "sendspin_static_delay"
+            assert entries[0]["default_value"] == 330
+            assert entries[0]["range"] == (0, 5000)
+    instance._player_role = type("Role", (), {"get_supported_formats": lambda self: [], "state_supported_commands": {"set_static_delay"}})()
+    assert len(asyncio.run(instance.get_config_entries())) == 1
+
+
 def test_the_fixture_matches_the_pinned_server_release() -> None:
     dockerfile = (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
     assert 'ARG SERVER_VERSION="2.10.4"' in dockerfile, (
@@ -58,7 +104,7 @@ def _parse_server_version(dockerfile_text: str) -> tuple[int, ...]:
     unit tested against synthetic input without touching the real Dockerfile.
     """
     match = re.search(r'ARG SERVER_VERSION="(\d+)\.(\d+)\.(\d+)', dockerfile_text)
-    assert match, "could not find ARG SERVER_VERSION=\"MAJOR.MINOR.PATCH...\" in the Dockerfile"
+    assert match, 'could not find ARG SERVER_VERSION="MAJOR.MINOR.PATCH..." in the Dockerfile'
     return tuple(int(part) for part in match.groups())
 
 
@@ -151,8 +197,7 @@ def test_strict_steer_contract_rejects_bad_targets_and_consumes_m3u_marker() -> 
     methods = {
         node.name: node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name in {"_play_source_steer", "_play_source_provider"}
+        if isinstance(node, ast.FunctionDef) and node.name in {"_play_source_steer", "_play_source_provider"}
     }
     source = "from __future__ import annotations\nclass Ctl:\n" + "\n".join(
         "\n".join(f"    {line}" if line else "" for line in ast.unparse(methods[name]).splitlines())
@@ -178,9 +223,7 @@ def test_strict_steer_contract_rejects_bad_targets_and_consumes_m3u_marker() -> 
     unavailable = Provider("filesystem_local--gone", "filesystem_local", available=False)
     providers = {item.instance_id: item for item in (local, spotify, unavailable)}
     providers["filesystem_local"] = local
-    ctl.mass = type(
-        "Mass", (), {"get_provider": lambda self, key, return_unavailable=False: providers.get(key)}
-    )()
+    ctl.mass = type("Mass", (), {"get_provider": lambda self, key, return_unavailable=False: providers.get(key)})()
 
     uri = "filesystem_local--abc://track/Music/example.flac"
     assert ctl._play_source_steer(f"local-only:{uri}") == (uri, "filesystem_local--abc")
@@ -531,9 +574,7 @@ def test_playlist_bridge_manifest_and_module_are_valid() -> None:
     assert '"playlist_bridge/archive_playlists"' in bridge.INIT_PY
     assert bridge.INIT_PY.count("required_scope=Scope.LIBRARY_WRITE") == 2
     # a long bulk archive job must never jump ahead of interactive tasks
-    assert "priority=True" not in bridge.INIT_PY.split("async def archive_playlists")[1].split(
-        "async def _archive_playlists"
-    )[0]
+    assert "priority=True" not in bridge.INIT_PY.split("async def archive_playlists")[1].split("async def _archive_playlists")[0]
     # the throwaway builtin copy created during a migration must always be
     # cleaned up, success or failure
     assert "await builtin.library_remove(matched_playlist.item_id, MediaType.PLAYLIST)" in bridge.INIT_PY
