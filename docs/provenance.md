@@ -36,6 +36,16 @@ The identity fields keep MusicBrainz entity types separate:
 - `musicbrainz_artist_credits` is an ordered list. Each entry includes its
   zero-based position, credited name, artist ID, and an explicit identity state.
 
+The same local lookup also snapshots `ma_label`, `ma_album_barcode`,
+`ma_artwork_sources`, and `ma_audio_formats` when the corresponding MA data is
+available. Artwork observations contain only type, provider, and proxy ID;
+provider mapping item IDs and raw artwork paths are excluded. Audio formats
+contain provider domain, content type, sample rate, bit depth, channels, and bit
+rate. The source remains `music_assistant.library`; no remote metadata lookup is
+performed. MA's track model does not expose a general catalog-number field, so
+this API does not invent one. A failed local read marks prior catalog values
+stale and retries on the next read.
+
 No field substitutes one MusicBrainz ID type for another. A missing library match
 is `not_loaded`. A failed local database read records `stale`; when an earlier
 successful identity observation exists, its value remains visible with that stale
@@ -59,7 +69,11 @@ Every field envelope has one of five states:
 - `inaccessible`: the containing structure or value had an unusable shape.
 
 The persisted field overlay contains its current observation, optional revisioned
-override, and effective value. This slice does not add an override write command.
+override, and effective value. Administrators with provider configuration permission
+can set or clear a correction for an observed field by supplying the archive version,
+source track ID, field name, and expected revision. The provider verifies that the
+track belongs to that version and keeps the original observation; a conflicting
+revision is rejected so the client must refresh before another edit.
 
 `library_enrichment/item_provenance` accepts `media_type: playlist` and a nonempty
 Music Assistant library item ID. For a known builtin archive-copy or playback
@@ -74,3 +88,4 @@ Clients must check both capability booleans and API versions. The server adverti
 `raw_payload_inline: false`; clients fail closed on an unknown state or API version.
 Clients must additionally require `musicbrainz_identity_api_version: 1` before
 depending on the additive Music Assistant identity fields.
+`local_catalog_api_version: 1` advertises the additive local catalog fields.

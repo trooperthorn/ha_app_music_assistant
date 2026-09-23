@@ -1130,6 +1130,33 @@ def test_provenance_adds_distinct_musicbrainz_identities_and_ordered_artist_cred
 def test_musicbrainz_identity_capability_is_explicit(plugin):
     capabilities = asyncio.run(plugin.provider.capabilities())
     assert capabilities["musicbrainz_identity_api_version"] == 1
+    assert capabilities["local_catalog_api_version"] == 1
+
+
+def test_local_catalog_snapshot_redacts_paths_and_keeps_typed_values(plugin):
+    _, version = _provenance_fixture(plugin)
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(to_dict=lambda: {
+        "external_ids": [], "artists": [],
+        "album": {"external_ids": [["barcode", "0123456789012"]]},
+        "metadata": {"label": "Example Records", "images": [
+            {"type": "thumb", "provider": "file", "proxy_id": "safe-proxy", "path": "private-token"},
+        ]},
+        "provider_mappings": [{
+            "provider_domain": "filesystem_local", "item_id": "C:/private/music.flac",
+            "audio_format": {"content_type": "flac", "sample_rate": 96000, "bit_depth": 24,
+                             "channels": 2, "bit_rate": 0},
+        }],
+    })
+    response = asyncio.run(plugin.provider.provenance(version, limit=1))
+    fields = response["items"][0]["provenance"]["fields"]
+    assert fields["ma_label"]["effective"]["value"] == "Example Records"
+    assert fields["ma_album_barcode"]["effective"]["value"] == "0123456789012"
+    assert fields["ma_artwork_sources"]["effective"]["value"] == [
+        {"type": "thumb", "provider": "file", "proxy_id": "safe-proxy"}
+    ]
+    assert fields["ma_audio_formats"]["effective"]["value"][0]["sample_rate"] == 96000
+    assert "private-token" not in json.dumps(response)
+    assert "C:/private/music.flac" not in json.dumps(response)
 
 
 def _next_provenance_version(plugin, subscription_id, snapshot, source_ids):
@@ -1168,6 +1195,20 @@ def test_transient_identity_failure_preserves_prior_value_as_stale(plugin):
     assert failed_fields["musicbrainz_recording_id"]["effective"]["state"] == "stale"
     assert failed_fields["musicbrainz_recording_id"]["effective"]["value"] == "known-recording"
     assert failed_fields["musicbrainz_release_id"]["effective"]["state"] == "inaccessible"
+
+
+def test_transient_catalog_failure_preserves_prior_label_as_stale(plugin):
+    subscription_id, first = _provenance_fixture(plugin)
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(to_dict=lambda: {
+        "external_ids": [], "artists": [], "album": None,
+        "metadata": {"label": "Known Label"},
+    })
+    asyncio.run(plugin.provider.provenance(first, limit=1))
+    second = _next_provenance_version(plugin, subscription_id, "snapshot-2", ["T" * 22])
+    plugin.controller.get_library_item_by_prov_id.side_effect = RuntimeError("library unavailable")
+    failed = asyncio.run(plugin.provider.provenance(second, limit=1))
+    label = failed["items"][0]["provenance"]["fields"]["ma_label"]["effective"]
+    assert label["state"] == "stale" and label["value"] == "Known Label"
 
 
 def test_first_identity_read_failure_is_inaccessible_and_retryable(plugin):

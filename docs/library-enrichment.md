@@ -154,7 +154,9 @@ Capabilities advertise `provenance_read`, `provenance_api_version: 1`,
 `provenance_override_api_version: 1`,
 `max_provenance_page: 200`, `raw_payload_inline: false`, `item_provenance`, and
 `item_provenance_api_version: 1`. `musicbrainz_identity_api_version: 1` advertises
-the additive local-library identity snapshot. See `provenance.md` for field and
+the additive local-library identity snapshot; `local_catalog_api_version: 1`
+advertises safe label, barcode, artwork source, and audio-format snapshots.
+See `provenance.md` for field and
 state details.
 
 Capabilities advertise `itunes_import`, `itunes_import_api_version: 1`,

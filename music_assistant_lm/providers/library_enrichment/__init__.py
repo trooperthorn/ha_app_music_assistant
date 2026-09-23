@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -189,6 +190,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "provenance_api_version": 1,
             "provenance_override_api_version": 1,
             "musicbrainz_identity_api_version": 1,
+            "local_catalog_api_version": 1,
             "max_provenance_page": 200,
             "raw_payload_inline": False,
             "item_provenance": True,
@@ -1148,6 +1150,105 @@ class LibraryEnrichmentProvider(PluginProvider):
         return result
 
     @staticmethod
+    def _library_catalog_values(library_item: Any, fetched_at: str) -> list[dict[str, Any]]:
+        """Snapshot safe catalog and format details from an already loaded MA track."""
+        fields = ("ma_label", "ma_album_barcode", "ma_artwork_sources", "ma_audio_formats")
+
+        def entry(name: str, state: str, value: Any = None) -> dict[str, Any]:
+            result = {
+                "field_name": name, "state": state, "source": "music_assistant.library",
+                "fetched_at": fetched_at, "parser_version": "ma-library-catalog-v1",
+            }
+            if state == "value":
+                result["value"] = value
+            return result
+
+        if library_item is None:
+            return [entry(name, "not_loaded") for name in fields]
+        try:
+            item = library_item.to_dict()
+        except Exception:
+            return [entry(name, "inaccessible") for name in fields]
+        if not isinstance(item, dict):
+            return [entry(name, "inaccessible") for name in fields]
+
+        metadata = item.get("metadata")
+        album = item.get("album")
+        album_metadata = album.get("metadata") if isinstance(album, dict) else None
+        label_container = metadata if isinstance(metadata, dict) and "label" in metadata else album_metadata
+        if label_container is None:
+            label = entry("ma_label", "not_loaded" if metadata is None else "missing")
+        elif not isinstance(label_container, dict):
+            label = entry("ma_label", "inaccessible")
+        elif "label" not in label_container:
+            label = entry("ma_label", "missing")
+        else:
+            raw_label = label_container["label"]
+            label = entry("ma_label", "not_loaded" if raw_label is None else "empty" if raw_label == ""
+                          else "value" if isinstance(raw_label, str) else "inaccessible", raw_label)
+
+        if album is None:
+            barcode = entry("ma_album_barcode", "not_loaded")
+        elif not isinstance(album, dict):
+            barcode = entry("ma_album_barcode", "inaccessible")
+        elif "external_ids" not in album:
+            barcode = entry("ma_album_barcode", "missing")
+        else:
+            raw_ids = album["external_ids"]
+            if raw_ids is None:
+                barcode = entry("ma_album_barcode", "not_loaded")
+            elif not isinstance(raw_ids, (list, tuple)):
+                barcode = entry("ma_album_barcode", "inaccessible")
+            else:
+                values = [pair[1] for pair in raw_ids
+                          if isinstance(pair, (list, tuple)) and len(pair) == 2
+                          and getattr(pair[0], "value", pair[0]) == "barcode"
+                          and isinstance(pair[1], str) and pair[1]]
+                barcode = entry("ma_album_barcode", "value" if values else "missing", values[0] if values else None)
+
+        if metadata is None:
+            artwork = entry("ma_artwork_sources", "not_loaded")
+        elif not isinstance(metadata, dict):
+            artwork = entry("ma_artwork_sources", "inaccessible")
+        elif "images" not in metadata:
+            artwork = entry("ma_artwork_sources", "missing")
+        else:
+            raw_images = metadata["images"]
+            if raw_images is None:
+                artwork = entry("ma_artwork_sources", "not_loaded")
+            elif not isinstance(raw_images, list) or any(not isinstance(image, dict) for image in raw_images):
+                artwork = entry("ma_artwork_sources", "inaccessible")
+            else:
+                safe_images = [{"type": getattr(image.get("type"), "value", image.get("type")),
+                                "provider": image["provider"],
+                                "proxy_id": image.get("proxy_id") if isinstance(image.get("proxy_id"), str) else None}
+                               for image in raw_images[:4]
+                               if isinstance(getattr(image.get("type"), "value", image.get("type")), str)
+                               and isinstance(image.get("provider"), str)]
+                artwork = entry("ma_artwork_sources", "value" if safe_images else "empty", safe_images)
+
+        mappings = item.get("provider_mappings")
+        if mappings is None:
+            formats = entry("ma_audio_formats", "not_loaded")
+        elif not isinstance(mappings, list) or any(not isinstance(mapping, dict) for mapping in mappings):
+            formats = entry("ma_audio_formats", "inaccessible")
+        else:
+            safe_formats = []
+            for mapping in mappings[:16]:
+                audio = mapping.get("audio_format")
+                if not isinstance(audio, dict) or not isinstance(mapping.get("provider_domain"), str):
+                    continue
+                detail = {
+                    "provider_domain": mapping["provider_domain"],
+                }
+                for name in ("content_type", "sample_rate", "bit_depth", "channels", "bit_rate"):
+                    raw = getattr(audio.get(name), "value", audio.get(name))
+                    detail[name] = raw if isinstance(raw, (str, int)) or (type(raw) is float and math.isfinite(raw)) else None
+                safe_formats.append(detail)
+            formats = entry("ma_audio_formats", "value" if safe_formats else "empty", safe_formats)
+        return [label, barcode, artwork, formats]
+
+    @staticmethod
     def _stale_musicbrainz_identity_values(
         prior_overlay: dict[str, Any], fetched_at: str
     ) -> list[dict[str, Any]]:
@@ -1177,6 +1278,23 @@ class LibraryEnrichmentProvider(PluginProvider):
             result.append(observation)
         return result
 
+    @staticmethod
+    def _stale_library_catalog_values(prior_overlay: dict[str, Any], fetched_at: str) -> list[dict[str, Any]]:
+        """Keep prior catalog evidence visible when the local library read fails."""
+        result = []
+        for field_name in ("ma_label", "ma_album_barcode", "ma_artwork_sources", "ma_audio_formats"):
+            observation = {
+                "field_name": field_name, "state": "inaccessible",
+                "source": "music_assistant.library", "fetched_at": fetched_at,
+                "parser_version": "ma-library-catalog-read-error-v1",
+            }
+            prior = prior_overlay.get("fields", {}).get(field_name, {}).get("observation")
+            if isinstance(prior, dict) and prior.get("state") in ("value", "stale") and prior.get("value") is not None:
+                observation["state"] = "stale"
+                observation["value"] = prior["value"]
+            result.append(observation)
+        return result
+
     async def provenance(self, version_id: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Return persisted typed provenance derived only from immutable archive JSON."""
         self._authorize()
@@ -1196,6 +1314,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "musicbrainz_recording_id", "musicbrainz_release_track_id", "musicbrainz_release_id",
             "musicbrainz_release_group_id", "musicbrainz_artist_credits",
         }
+        catalog_fields = {"ma_label", "ma_album_barcode", "ma_artwork_sources", "ma_audio_formats"}
         for occurrence in requested_occurrences:
             source_id = occurrence.get("source_item_id")
             if not isinstance(source_id, str) or not source_id:
@@ -1215,26 +1334,40 @@ class LibraryEnrichmentProvider(PluginProvider):
                     == "ma-library-identity-v1"
                     for field_name in identity_fields
                 )
-                if not identity_complete:
+                catalog_complete = catalog_fields.issubset(scoped_fields) and all(
+                    scoped_fields[field_name].get("observation", {}).get("parser_version")
+                    == "ma-library-catalog-v1"
+                    for field_name in catalog_fields
+                )
+                if not identity_complete or not catalog_complete:
                     fetched_at = datetime.now(UTC).isoformat()
                     try:
                         library_item = await self.mass.music.tracks.get_library_item_by_prov_id(
                             source_id, subscription["provider_instance_id"]
                         )
                         identity_values = self._musicbrainz_identity_values(library_item, fetched_at)
+                        catalog_values = self._library_catalog_values(library_item, fetched_at)
                     except Exception:
                         prior = await self._read_store(
                             self._store.get_provenance_overlay,
                             "spotify", subscription["account_id"], "track", source_id,
                         )
                         identity_values = self._stale_musicbrainz_identity_values(prior, fetched_at)
-                    for identity_value in identity_values:
+                        catalog_values = self._stale_library_catalog_values(prior, fetched_at)
+                    for identity_value in [
+                        *(identity_values if not identity_complete else []),
+                        *(catalog_values if not catalog_complete else []),
+                    ]:
                         identity_value["raw_reference"] = {
                             "version_id": version_id, "position": occurrence["position"], "json_pointer": None,
                         }
+                    values = [
+                        *(identity_values if not identity_complete else []),
+                        *(catalog_values if not catalog_complete else []),
+                    ]
                     await self._store_operation(
                         self._store.upsert_provenance_values,
-                        "spotify", subscription["account_id"], "track", source_id, identity_values,
+                        "spotify", subscription["account_id"], "track", source_id, values,
                     )
                 persisted[source_id] = await self._read_store(
                     self._store.get_provenance_overlay,
