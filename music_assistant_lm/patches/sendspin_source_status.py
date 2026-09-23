@@ -87,6 +87,10 @@ EDITS: list[tuple[str, str]] = [
         '                        "playback_session_id": session.playback_session_id if session else None,\n'
         '                        "receiving_pcm": receiving,\n'
         '                        "last_pcm_age_ms": last_pcm_age_ms,\n'
+        '                        "bridge_buffer_ms": (\n'
+        '                            round(session.bridge.occupancy_us / 1000)\n'
+        '                            if session and session.bridge and receiving else None\n'
+        '                        ),\n'
         "                    }\n"
         "                )\n"
         '        return {"target_latency_ms": target_latency_ms, "sources": sources}\n'

@@ -269,7 +269,7 @@ def test_sendspin_source_status_and_guarded_stop() -> None:
             "player_id": "living-room",
             "owner_player_id": "living-room",
             "playback_session_id": "session-1",
-            "bridge": object(),
+            "bridge": type("Bridge", (), {"occupancy_us": 72_600})(),
             "ingest_task": type("Task", (), {"done": lambda self: False})(),
             "pcm_received": type("Event", (), {"is_set": lambda self: True})(),
             "last_pcm_monotonic": time.monotonic() - 0.05,
@@ -290,11 +290,13 @@ def test_sendspin_source_status_and_guarded_stop() -> None:
     assert result["sources"][0]["playback_session_id"] == "session-1"
     assert result["sources"][0]["receiving_pcm"] is True
     assert 0 <= result["sources"][0]["last_pcm_age_ms"] < 1000
+    assert result["sources"][0]["bridge_buffer_ms"] == 73
     assert "measured_latency_ms" not in result
     session.last_pcm_monotonic = time.monotonic() - 3
     stale = asyncio.run(instance.source_status())
     assert stale["sources"][0]["receiving_pcm"] is False
     assert stale["sources"][0]["last_pcm_age_ms"] >= 2000
+    assert stale["sources"][0]["bridge_buffer_ms"] is None
 
     stop_method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "stop_source")
     stop_source = "\n".join(f"    {line}" for line in ast.unparse(stop_method).splitlines())
