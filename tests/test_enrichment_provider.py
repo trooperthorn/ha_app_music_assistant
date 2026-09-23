@@ -694,6 +694,54 @@ def test_itunes_apply_uses_verified_library_ids_and_preserves_ordered_duplicates
     assert plugin.provider.mass.music.playlists.import_playlist.await_count == 1
 
 
+def test_itunes_near_limit_playlist_preserves_all_occurrences_on_apply(plugin):
+    source = _write_itunes_xml(plugin)
+    member = '<dict><key>Track ID</key><integer>1</integer></dict>'
+    source.write_text(source.read_text(encoding="utf-8").replace(member, member * 9_999), encoding="utf-8")
+    plugin.provider.mass.music.providers.append(types.SimpleNamespace(
+        instance_id="filesystem-a", domain="filesystem_local", available=True, is_streaming_provider=False,
+    ))
+    mapping = types.SimpleNamespace(provider_instance="filesystem-a", item_id="Music/Artist/Song.mp3")
+    plugin.controller.get_library_item_by_prov_id.return_value = types.SimpleNamespace(
+        item_id="library-track-1", provider_mappings=[mapping],
+    )
+    inspected = asyncio.run(plugin.provider.itunes_inspect(source.name))
+    assert inspected["occurrences_total"] == 9_999
+    preview = asyncio.run(plugin.provider.itunes_preview(
+        inspected["inspection_id"], inspected["source_digest"],
+        [{"source_root": "G:/Music/", "target_root": "Music", "provider_instance_id": "filesystem-a"}],
+        ["PLAYLIST"],
+    ))
+    assert preview["selected_occurrences"] == preview["matched"] == 9_999
+    assert preview["unresolved"] == preview["ambiguous"] == 0
+    builtin = types.SimpleNamespace(
+        instance_id="builtin", domain="builtin", available=True, is_streaming_provider=False,
+        _read_m3u_file=AsyncMock(),
+    )
+    plugin.provider.mass.music.providers.append(builtin)
+    destination = types.SimpleNamespace(
+        item_id="itunes-large-playlist", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="large-file")],
+    )
+
+    async def import_playlist(m3u, *, library_matching):
+        assert library_matching is False
+        assert m3u.count("library://track/library-track-1") == 9_999
+        builtin._read_m3u_file.return_value = m3u
+        return destination
+
+    plugin.provider.mass.music.playlists.import_playlist = AsyncMock(side_effect=import_playlist)
+    args = dict(
+        inspection_id=preview["inspection_id"], revision=preview["revision"],
+        source_digest=inspected["source_digest"], preview_digest=preview["preview_digest"],
+        playlist_id="PLAYLIST",
+    )
+    applied = asyncio.run(plugin.provider.itunes_apply(**args))
+    replay = asyncio.run(plugin.provider.itunes_apply(**args))
+    assert applied["state"] == replay["state"] == "applied"
+    assert applied["source_count"] == 9_999
+    assert plugin.provider.mass.music.playlists.import_playlist.await_count == 1
+
+
 def test_itunes_apply_fails_closed_for_unresolved_and_requires_library_write(plugin):
     inspected, preview = _itunes_apply_preview(plugin, resolved=False)
     plugin.provider.mass.music.playlists.import_playlist = AsyncMock()
