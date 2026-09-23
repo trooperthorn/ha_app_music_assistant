@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are eleven: seven anchor patches that rewrite exact lines in an
+Today there are twelve: eight anchor patches that rewrite exact lines in an
 already-installed file, and four plugin providers that add a self-contained
 new provider directory instead (see `docs/extension-points.md` for the
 distinction).
@@ -114,6 +114,10 @@ Anchor patches:
   already handled by the pinned aiosendspin server. It cycles playing groups
   and prioritizes rejoining the client's previous group after a leave; the
   browser SDK still sends it only when advertised by the server.
+- `sendspin_discovery_status.py`: adds an admin-scoped, read-only
+  `sendspin/discovery_status` command. It reports listener, advertising,
+  client-discovery, manual-address validity, and connected-client status
+  without returning pairing credentials or altering connections.
 
 Plugin providers:
 

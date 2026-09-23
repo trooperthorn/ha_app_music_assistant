@@ -22,6 +22,7 @@ import playlist_bridge as bridge  # noqa: E402
 import sendspin_cast_delay as cast_delay  # noqa: E402
 import sendspin_cast_status as cast_status  # noqa: E402
 import sendspin_controller_switch as switch  # noqa: E402
+import sendspin_discovery_status as discovery  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 import sendspin_timing_status as timing  # noqa: E402
 
@@ -45,6 +46,62 @@ AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
+SENDSPIN_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_provider_2_10_4.py"
+
+
+@requires_py314
+def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
+    patched = discovery.apply(SENDSPIN_PROVIDER.read_text(encoding="utf-8"))
+    assert discovery.apply(patched) == patched
+    assert "sendspin_discovery_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    assert '"sendspin/discovery_status"' in patched
+    assert "required_scope=Scope.CONFIG_PROVIDERS_READ" in patched
+    with pytest.raises(SystemExit, match="Sendspin discovery anchor found 0 times"):
+        discovery.apply("class SendspinProvider: pass")
+
+    tree = ast.parse(patched)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinProvider")
+    method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "discovery_status")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+
+    def manual_url(address: str) -> str:
+        if address == "bad":
+            raise ValueError("invalid address")
+        return f"ws://{address}/sendspin"
+
+    runtime = {
+        "_manual_client_url": manual_url,
+        "SENDSPIN_SERVER_PORT": 8927,
+        "CONF_ALLOW_LEGACY_CLIENTS": "allow_legacy_clients",
+    }
+    exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
+    instance = runtime["Provider"]()
+    instance._manual_ip_config = ("192.168.1.10", "bad")
+    instance.server_api = type(
+        "Server",
+        (),
+        {
+            "_tcp_site": object(),
+            "_mdns_service": object(),
+            "_mdns_browser": None,
+            "_mdns_client_urls": {"Living Room._sendspin._tcp.local.": "ws://192.168.1.20:8927/sendspin"},
+            "clients": [object(), object()],
+            "connected_clients": [object()],
+        },
+    )()
+    instance.mass = type("Mass", (), {"streams": type("Streams", (), {"bind_ip": "127.0.0.1", "publish_ip": "192.168.1.2"})()})()
+    instance.config = type("Config", (), {"get_value": lambda self, *_: False})()
+    status = asyncio.run(instance.discovery_status())
+    assert status["listener_active"] is True
+    assert status["advertising_active"] is True
+    assert status["client_discovery_active"] is False
+    assert status["connected_clients"] == 1
+    assert status["manual_addresses"] == [
+        {"address": "192.168.1.10", "valid": True},
+        {"address": "bad", "valid": False},
+    ]
+    assert status["legacy_clients_allowed"] is False
+    assert "pairing" not in str(status).lower()
 
 
 @requires_py314
