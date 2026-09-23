@@ -59,6 +59,10 @@ provider before its commands are registered. It never auto-starts a capture.
   fingerprint. Archive refresh still succeeds when a mirror write fails. External
   playlist edits stop mirror updates; explicit detach preserves that playlist and
   permits a later new destination. Uncertain writes are never retried automatically.
+  On restart, a pending external write is marked uncertain. Reconciliation reads
+  the exact builtin playlist under its lock and verifies either the target or
+  previous content before changing the checkpoint. An explicit abandon records
+  that an orphaned playlist may remain; it never deletes the playlist.
 - Read-only provenance extracts a bounded, typed Spotify field set from the
   committed immutable payload without refreshing Spotify or Music Assistant.
 - That provenance read can append a version-bound snapshot of MusicBrainz
@@ -127,6 +131,9 @@ check `library_enrichment/capabilities` and hide dependent controls when unavail
 | `library_enrichment/mirror_configure` | `subscription_id`, `enabled`, `allow_partial`, `expected_revision` | opt in or pause with compare-and-swap; also requires `library.write` |
 | `library_enrichment/mirror_apply` | `subscription_id`, `expected_version_id`, `expected_digest` | explicitly create or update the verified builtin mirror; also requires `library.write` |
 | `library_enrichment/mirror_detach` | `subscription_id`, `expected_destination_item_id`, `expected_content_digest` | preserve the destination playlist and release it from automatic updates; also requires `library.write` |
+| `library_enrichment/mirror_reconcile_preview` | `subscription_id`, optional `candidate_item_id` | read a candidate builtin playlist and classify its content against the uncertain target and previous verified destination |
+| `library_enrichment/mirror_reconcile` | `subscription_id`, `candidate_item_id`, `expected_revision`, `expected_target_digest`, `expected_observed_content_digest` | re-read under the builtin playlist lock; commit a verified target or mark unchanged previous content retryable; also requires `library.write` |
+| `library_enrichment/mirror_abandon_uncertain` | `subscription_id`, `expected_revision`, `expected_target_digest` | explicitly stop an uncertain mirror without deleting a possible orphan playlist; also requires `library.write` |
 
 Local match review is an overlay on the immutable Spotify occurrence archive. It
 uses direct MA library lookups and only considers mappings owned by an available,

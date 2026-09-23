@@ -145,6 +145,8 @@ def test_mirror_detach_preserves_identity_until_explicit_new_destination(tmp_pat
     store.prepare_mirror(sub, version, "a" * 64)
     store.mark_mirror_writing(sub)
     store.commit_mirror(sub, "mirror-1", "builtin", "a" * 64, "b" * 64)
+    assert store.mirror_destination_claimed(sub, "mirror-1") is False
+    assert store.mirror_destination_claimed("another-subscription", "mirror-1") is True
     with pytest.raises(ValueError, match="changed"):
         store.detach_mirror(sub, "wrong", "b" * 64)
     detached = store.detach_mirror(sub, "mirror-1", "b" * 64)
@@ -153,6 +155,24 @@ def test_mirror_detach_preserves_identity_until_explicit_new_destination(tmp_pat
     assert renewed["state"] == "pending" and renewed["destination_item_id"] is None
     assert renewed["applied_version_id"] is None
     store.close()
+
+
+def test_mirror_restart_marks_external_write_uncertain_without_retry(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.configure_mirror(sub, True, False, 0)
+    store.prepare_mirror(sub, version, "a" * 64)
+    store.mark_mirror_writing(sub)
+    store.close()
+    reopened = ArchiveStore(path)
+    assert reopened.recover_mirror_pending() == (0, 1)
+    assert reopened.get_mirror(sub)["state"] == "uncertain"
+    with pytest.raises(ValueError, match="reconciliation"):
+        reopened.configure_mirror(sub, False, False, 1)
+    assert reopened.recover_mirror_pending() == (0, 0)
+    reopened.close()
 
 
 def test_faithful_occurrences_and_empty_playlist(tmp_path):

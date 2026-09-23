@@ -542,7 +542,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 37
+    assert len(plugin.registered) == 40
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -1687,6 +1687,99 @@ def test_maintained_mirror_updates_changed_source_and_skips_unchanged(plugin, mo
         f"spotify://track/{'T' * 22}", f"spotify://track/{'U' * 22}", f"spotify://track/{'T' * 22}",
     ]
     assert store.get_version(version_a)["occurrences"][0]["source_item_id"] == "T" * 22
+
+
+def test_uncertain_mirror_creation_can_attach_only_a_verified_candidate(plugin):
+    version_id, builtin, playlists = _apply_fixture(plugin)
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+    builtin._write_m3u_file = AsyncMock()
+    builtin._get_playlist_lock = lambda _: asyncio.Lock()
+    destination = types.SimpleNamespace(
+        item_id="123", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="copy")],
+    )
+    playlists.get_library_item = AsyncMock(return_value=destination)
+
+    async def response_lost(m3u, *, library_matching):
+        builtin._read_m3u_file.return_value = m3u
+        raise RuntimeError("response lost after creation")
+
+    playlists.import_playlist = AsyncMock(side_effect=response_lost)
+    preview = asyncio.run(plugin.provider.mirror_preview(subscription_id))
+    asyncio.run(plugin.provider.mirror_configure(subscription_id, True, False, 0))
+    with pytest.raises(plugin.module.InvalidDataError, match="uncertain"):
+        asyncio.run(plugin.provider.mirror_apply(subscription_id, version_id, preview["projection_digest"]))
+    uncertain = asyncio.run(plugin.provider.mirror_status(subscription_id))
+    assert uncertain["state"] == "uncertain" and uncertain["destination_item_id"] is None
+    review = asyncio.run(plugin.provider.mirror_reconcile_preview(subscription_id, "123"))
+    assert review["classification"] == "matches_target" and review["target_count"] == 2
+    with pytest.raises(plugin.module.InvalidDataError, match="changed"):
+        asyncio.run(plugin.provider.mirror_reconcile(
+            subscription_id, "123", review["revision"], review["target_digest"], "0" * 64,
+        ))
+    applied = asyncio.run(plugin.provider.mirror_reconcile(
+        subscription_id, "123", review["revision"], review["target_digest"], review["observed_content_digest"],
+    ))
+    assert applied["state"] == "applied" and applied["destination_item_id"] == "123"
+    assert playlists.import_playlist.await_count == 1
+
+
+def test_uncertain_mirror_can_be_explicitly_abandoned_without_playlist_write(plugin):
+    version_id, builtin, playlists = _apply_fixture(plugin)
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+    builtin._write_m3u_file = AsyncMock()
+    builtin._get_playlist_lock = lambda _: asyncio.Lock()
+    playlists.import_playlist = AsyncMock(side_effect=RuntimeError("response lost"))
+    preview = asyncio.run(plugin.provider.mirror_preview(subscription_id))
+    asyncio.run(plugin.provider.mirror_configure(subscription_id, True, False, 0))
+    with pytest.raises(plugin.module.InvalidDataError, match="uncertain"):
+        asyncio.run(plugin.provider.mirror_apply(subscription_id, version_id, preview["projection_digest"]))
+    uncertain = asyncio.run(plugin.provider.mirror_status(subscription_id))
+    with pytest.raises(plugin.module.InvalidDataError, match="changed"):
+        asyncio.run(plugin.provider.mirror_abandon_uncertain(subscription_id, uncertain["revision"], "0" * 64))
+    abandoned = asyncio.run(plugin.provider.mirror_abandon_uncertain(
+        subscription_id, uncertain["revision"], uncertain["target_digest"],
+    ))
+    assert abandoned["state"] == "detached" and abandoned["enabled"] == 0
+    assert playlists.import_playlist.await_count == 1
+
+
+def test_uncertain_mirror_rewrite_verifies_previous_content_before_retry(plugin, monkeypatch):
+    version_a, builtin, playlists = _apply_fixture(plugin)
+    store = plugin.provider._store
+    subscription_id = store.get_version(version_a)["subscription_id"]
+    builtin._write_m3u_file = AsyncMock()
+    builtin._get_playlist_lock = lambda _: asyncio.Lock()
+    playlists.get_library_item = AsyncMock(return_value=types.SimpleNamespace(
+        item_id="123", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="copy")],
+    ))
+    helpers = types.ModuleType("music_assistant.helpers.playlists")
+    helpers.parse_m3u = lambda m3u: m3u
+    monkeypatch.setitem(sys.modules, "music_assistant.helpers.playlists", helpers)
+    asyncio.run(plugin.provider.mirror_configure(subscription_id, True, False, 0))
+    preview_a = asyncio.run(plugin.provider.mirror_preview(subscription_id))
+    asyncio.run(plugin.provider.mirror_apply(subscription_id, version_a, preview_a["projection_digest"]))
+    old_raw = builtin._read_m3u_file.return_value
+    capture_id = store.begin_capture(subscription_id, "snapshot-b")
+    version_b = store.commit_capture(capture_id, snapshot_before="snapshot-b", snapshot_after="snapshot-b",
+                                     total=1, occurrences=[{"position": 0, "state": "track", "source_item_id": "U" * 22}])
+    preview_b = asyncio.run(plugin.provider.mirror_preview(subscription_id))
+    builtin._write_m3u_file = AsyncMock(side_effect=RuntimeError("write response lost"))
+    with pytest.raises(plugin.module.InvalidDataError, match="uncertain"):
+        asyncio.run(plugin.provider.mirror_apply(subscription_id, version_b, preview_b["projection_digest"]))
+    review = asyncio.run(plugin.provider.mirror_reconcile_preview(subscription_id))
+    assert review["classification"] == "unchanged_previous"
+    restored = asyncio.run(plugin.provider.mirror_reconcile(
+        subscription_id, "123", review["revision"], review["target_digest"], review["observed_content_digest"],
+    ))
+    assert restored["state"] == "failed" and restored["applied_version_id"] == version_a
+    assert builtin._read_m3u_file.return_value == old_raw
+
+    async def write_success(_item_id, _name, parsed):
+        builtin._read_m3u_file.return_value = parsed
+    builtin._write_m3u_file = AsyncMock(side_effect=write_success)
+    updated = asyncio.run(plugin.provider.mirror_apply(subscription_id, version_b, preview_b["projection_digest"]))
+    assert updated["state"] == "applied" and updated["applied_version_id"] == version_b
+    assert playlists.import_playlist.await_count == 1
 
 
 def test_match_review_returns_stale_overlay_without_retry_or_ma_mutation(plugin):

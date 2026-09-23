@@ -1854,6 +1854,18 @@ class ArchiveStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def recover_mirror_pending(self) -> tuple[int, int]:
+        """After restart, never retry a mirror write whose external outcome is unknown."""
+        with self._transaction():
+            now = _now()
+            prepared = self._db.execute("""UPDATE maintained_mirrors SET state='failed',
+                error='Mirror update interrupted before writing',updated_at=?
+                WHERE state='prepared'""", (now,)).rowcount
+            writing = self._db.execute("""UPDATE maintained_mirrors SET state='uncertain',
+                error='Mirror write interrupted; inspect destination before retrying',updated_at=?
+                WHERE state='writing'""", (now,)).rowcount
+            return prepared, writing
+
     def configure_mirror(self, subscription_id: str, enabled: bool, allow_partial: bool,
                          expected_revision: int) -> dict:
         if type(enabled) is not bool or type(allow_partial) is not bool:
@@ -1972,6 +1984,74 @@ class ArchiveStore:
                 target_version_id=NULL,target_digest=NULL,error=NULL,updated_at=? WHERE subscription_id=?""",
                 (_now(), subscription_id),
             )
+            return self.get_mirror(subscription_id)
+
+    def mirror_destination_claimed(self, subscription_id: str, destination_item_id: str) -> bool:
+        """Prevent a reconciliation from taking ownership of another managed playlist."""
+        with self._lock:
+            queries = (
+                ("SELECT 1 FROM maintained_mirrors WHERE destination_item_id=? AND subscription_id<>?", True),
+                ("SELECT 1 FROM playback_projections WHERE destination_item_id=?", False),
+                ("SELECT 1 FROM apply_jobs WHERE destination_item_id=?", False),
+                ("SELECT 1 FROM itunes_apply_jobs WHERE destination_item_id=?", False),
+            )
+            for query, scoped in queries:
+                args = (destination_item_id, subscription_id) if scoped else (destination_item_id,)
+                if self._db.execute(query, args).fetchone():
+                    return True
+            return False
+
+    def reconcile_mirror_applied(self, subscription_id: str, expected_revision: int,
+                                 expected_target_digest: str, destination_item_id: str,
+                                 destination_provider_instance: str, observed_content_digest: str) -> dict:
+        expected_target_digest = self._sha256(expected_target_digest, "expected_target_digest")
+        observed_content_digest = self._sha256(observed_content_digest, "observed_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if (mirror is None or mirror["state"] != "uncertain" or mirror["revision"] != expected_revision
+                    or mirror["target_digest"] != expected_target_digest or not mirror["target_version_id"]):
+                raise ValueError("Mirror reconciliation checkpoint changed")
+            if mirror["destination_item_id"] and mirror["destination_item_id"] != destination_item_id:
+                raise ValueError("Mirror has a different recorded destination")
+            if self.mirror_destination_claimed(subscription_id, destination_item_id):
+                raise ValueError("Playlist is already managed by another operation")
+            self._db.execute("""UPDATE maintained_mirrors SET state='applied',
+                applied_version_id=target_version_id,applied_digest=target_digest,
+                target_version_id=NULL,target_digest=NULL,destination_item_id=?,
+                destination_provider_instance=?,destination_content_digest=?,error=NULL,updated_at=?
+                WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, observed_content_digest,
+                 _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def reconcile_mirror_unwritten(self, subscription_id: str, expected_revision: int,
+                                   expected_target_digest: str, observed_content_digest: str) -> dict:
+        expected_target_digest = self._sha256(expected_target_digest, "expected_target_digest")
+        observed_content_digest = self._sha256(observed_content_digest, "observed_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if (mirror is None or mirror["state"] != "uncertain" or mirror["revision"] != expected_revision
+                    or mirror["target_digest"] != expected_target_digest or not mirror["destination_item_id"]
+                    or mirror["destination_content_digest"] != observed_content_digest):
+                raise ValueError("Mirror's previous verified destination changed")
+            self._db.execute("""UPDATE maintained_mirrors SET state='failed',target_version_id=NULL,
+                target_digest=NULL,error='Previous destination content verified; update may be retried',updated_at=?
+                WHERE subscription_id=?""", (_now(), subscription_id))
+            return self.get_mirror(subscription_id)
+
+    def abandon_uncertain_mirror(self, subscription_id: str, expected_revision: int,
+                                 expected_target_digest: str) -> dict:
+        expected_target_digest = self._sha256(expected_target_digest, "expected_target_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if (mirror is None or mirror["state"] != "uncertain" or mirror["revision"] != expected_revision
+                    or mirror["target_digest"] != expected_target_digest):
+                raise ValueError("Mirror uncertain checkpoint changed")
+            self._db.execute("""UPDATE maintained_mirrors SET state='detached',enabled=0,
+                revision=revision+1,target_version_id=NULL,target_digest=NULL,
+                error='Uncertain destination was explicitly abandoned; inspect for an orphan playlist',
+                updated_at=? WHERE subscription_id=?""", (_now(), subscription_id))
             return self.get_mirror(subscription_id)
 
     def close(self) -> None:

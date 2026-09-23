@@ -74,6 +74,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         await asyncio.to_thread(self._store.recover_pending)
         await asyncio.to_thread(self._store.recover_sync_pending)
         await asyncio.to_thread(self._store.recover_itunes_apply_pending)
+        await asyncio.to_thread(self._store.recover_mirror_pending)
 
     async def loaded_in_mass(self) -> None:
         for command, handler in (
@@ -114,6 +115,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("mirror_configure", self.mirror_configure),
             ("mirror_apply", self.mirror_apply),
             ("mirror_detach", self.mirror_detach),
+            ("mirror_reconcile_preview", self.mirror_reconcile_preview),
+            ("mirror_reconcile", self.mirror_reconcile),
+            ("mirror_abandon_uncertain", self.mirror_abandon_uncertain),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -201,7 +205,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "max_itunes_preview_page": 200,
             "inspection": "library_only_no_refresh",
             "mirror_apply": True,
-            "mirror_api_version": 1,
+            "mirror_api_version": 2,
             "archive_apply": True,
             "apply_api_version": 1,
             "subscription_sync": True,
@@ -1899,6 +1903,103 @@ class LibraryEnrichmentProvider(PluginProvider):
                 )
             except ValueError as err:
                 raise InvalidDataError(str(err)) from None
+
+    async def mirror_reconcile_preview(self, subscription_id: str,
+                                       candidate_item_id: str | None = None) -> dict[str, Any]:
+        self._authorize()
+        async with self._write_lock:
+            return await self._inspect_mirror_recovery(subscription_id, candidate_item_id)
+
+    async def mirror_reconcile(self, subscription_id: str, candidate_item_id: str,
+                               expected_revision: int, expected_target_digest: str,
+                               expected_observed_content_digest: str) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Reconciling a mirror requires library write permission")
+        async with self._write_lock:
+            result = await self._inspect_mirror_recovery(
+                subscription_id, candidate_item_id, expected_revision,
+                expected_target_digest, expected_observed_content_digest, apply=True,
+            )
+            return result["mirror"]
+
+    async def mirror_abandon_uncertain(self, subscription_id: str, expected_revision: int,
+                                      expected_target_digest: str) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Abandoning an uncertain mirror requires library write permission")
+        async with self._write_lock:
+            try:
+                return await self._store_operation(self._store.abandon_uncertain_mirror,
+                                                   subscription_id, expected_revision, expected_target_digest)
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+
+    async def _inspect_mirror_recovery(
+        self, subscription_id: str, candidate_item_id: str | None,
+        expected_revision: int | None = None, expected_target_digest: str | None = None,
+        expected_observed_content_digest: str | None = None, apply: bool = False,
+    ) -> dict[str, Any]:
+        mirror = await self._store_operation(self._store.get_mirror, subscription_id)
+        if mirror is None or mirror["state"] != "uncertain" or not mirror["target_version_id"]:
+            raise InvalidDataError("No uncertain mirror write is awaiting reconciliation")
+        if apply and (mirror["revision"] != expected_revision or mirror["target_digest"] != expected_target_digest):
+            raise InvalidDataError("Mirror reconciliation checkpoint changed; inspect again")
+        item_id = candidate_item_id or mirror["destination_item_id"]
+        if not isinstance(item_id, str) or not 1 <= len(item_id) <= 128:
+            raise InvalidDataError("Select the exact Music Assistant playlist ID to inspect")
+        if mirror["destination_item_id"] and item_id != mirror["destination_item_id"]:
+            raise InvalidDataError("The uncertain write has a different recorded destination")
+        if await self._store_operation(self._store.mirror_destination_claimed, subscription_id, item_id):
+            raise InvalidDataError("This playlist is already managed by another operation")
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)) \
+                or not callable(getattr(builtin, "_get_playlist_lock", None)):
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        destination = await self.mass.music.playlists.get_library_item(item_id)
+        if str(destination.item_id) != item_id:
+            raise InvalidDataError("Candidate playlist identity changed")
+        mapping = next((m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None)
+        if mapping is None:
+            raise InvalidDataError("Candidate is not a playlist of the configured builtin provider")
+        subscription = await self._store_operation(self._store.get_subscription, subscription_id)
+        version = await self._store_operation(self._store.get_version, mirror["target_version_id"])
+        preview, _, target_uris = self._mirror_projection(version, subscription)
+        async with builtin._get_playlist_lock(mapping.item_id):
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            observed_digest = hashlib.sha256(raw.encode()).hexdigest()
+            actual_uris = [line.strip() for line in raw.splitlines()
+                           if line.strip() and not line.lstrip().startswith("#")]
+            target_matches = actual_uris == target_uris
+            if mirror["destination_item_id"] is None:
+                # An unrecorded creation must also have the expected mirror title;
+                # an unrelated empty playlist must not be claimed by URI equality.
+                target_matches = target_matches and f"#PLAYLIST:{preview['name']}" in raw.splitlines()
+            previous_matches = bool(mirror["destination_item_id"] and
+                                    observed_digest == mirror["destination_content_digest"])
+            classification = ("matches_target" if target_matches else
+                              "unchanged_previous" if previous_matches else "mismatch")
+            result = {"subscription_id": subscription_id, "candidate_item_id": item_id,
+                      "target_version_id": mirror["target_version_id"],
+                      "target_digest": mirror["target_digest"], "revision": mirror["revision"],
+                      "observed_content_digest": observed_digest, "classification": classification,
+                      "observed_count": len(actual_uris), "target_count": len(target_uris)}
+            if apply:
+                if observed_digest != expected_observed_content_digest:
+                    raise InvalidDataError("Candidate playlist changed; inspect again")
+                if classification == "matches_target":
+                    result["mirror"] = await self._store_operation(
+                        self._store.reconcile_mirror_applied, subscription_id, mirror["revision"],
+                        mirror["target_digest"], item_id, builtin.instance_id, observed_digest,
+                    )
+                elif classification == "unchanged_previous":
+                    result["mirror"] = await self._store_operation(
+                        self._store.reconcile_mirror_unwritten, subscription_id, mirror["revision"],
+                        mirror["target_digest"], observed_digest,
+                    )
+                else:
+                    raise InvalidDataError("Candidate differs from both target and previous content; preserve it")
+            return result
 
     async def _advance_mirror(self, subscription_id: str, expected_version_id: str | None = None,
                               expected_digest: str | None = None) -> dict[str, Any]:
