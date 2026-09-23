@@ -101,8 +101,11 @@ Anchor patches:
 - `sendspin_cast_status.py`: publishes bounded Cast receiver state transitions
   (`connecting`, `connected`, `playing`, `stopped`, `error`, `disconnected`) on
   its derived Sendspin player's `extra_attributes.sendspin_cast_state` for
-  HTTP/ingress clients. It suppresses duplicate events and does not expose
-  receiver log text.
+  HTTP/ingress clients. On failure it adds a bounded
+  `sendspin_cast_failure` code (`device_unavailable`, `launch_timeout`,
+  `launch_failed`, `receiver_error`, or `audio_unsupported`) and resolves the
+  pending play request promptly. It suppresses duplicate events and does not
+  expose receiver log text.
 
 Plugin providers:
 

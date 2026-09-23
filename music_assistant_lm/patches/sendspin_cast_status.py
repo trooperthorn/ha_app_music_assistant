@@ -38,19 +38,38 @@ EDITS: list[tuple[str, str]] = [
         "            on_cast_connected=self._on_cast_connected,\n            on_cast_status=self._on_cast_receiver_status,\n        )\n",
     ),
     (
+        "        # Recorded on the Cast player, not on the bridge: the re-evaluation below takes\n",
+        '        self._publish_cast_receiver_status("error", "audio_unsupported")\n'
+        "        # Recorded on the Cast player, not on the bridge: the re-evaluation below takes\n",
+    ),
+    (
         '    def _on_cast_connected(self) -> None:\n        """Handle Cast app "connected" status (called from socket thread)."""\n',
         "    def _on_cast_receiver_status(self, state: str) -> None:\n"
         '        """Transfer a validated receiver state from the Cast socket thread."""\n'
         "        self.mass.loop.call_soon_threadsafe(self._publish_cast_receiver_status, state)\n"
         "\n"
-        "    def _publish_cast_receiver_status(self, state: str) -> None:\n"
+        "    def _publish_cast_receiver_status(self, state: str, reason: str | None = None) -> None:\n"
         '        """Send one state transition through the normal player event stream."""\n'
         "        player = self.mass.players.get_player(self._bridge_client_id)\n"
         "        if player is None:\n"
         "            return\n"
-        '        if player.extra_attributes.get("sendspin_cast_state") == state:\n'
+        '        if state == "error":\n'
+        "            reason = reason if reason in (\n"
+        '                "device_unavailable", "launch_timeout", "launch_failed",\n'
+        '                "receiver_error", "audio_unsupported",\n'
+        '            ) else "receiver_error"\n'
+        "        else:\n"
+        "            reason = None\n"
+        "        if (\n"
+        '            player.extra_attributes.get("sendspin_cast_state") == state\n'
+        '            and player.extra_attributes.get("sendspin_cast_failure") == reason\n'
+        "        ):\n"
         "            return\n"
         '        player.extra_attributes["sendspin_cast_state"] = state\n'
+        "        if reason is None:\n"
+        '            player.extra_attributes.pop("sendspin_cast_failure", None)\n'
+        "        else:\n"
+        '            player.extra_attributes["sendspin_cast_failure"] = reason\n'
         "        player.update_state()\n"
         "\n"
         "    def _on_cast_connected(self) -> None:\n"
@@ -64,13 +83,30 @@ EDITS: list[tuple[str, str]] = [
         "        self.logger.info(\n",
     ),
     (
+        "            self.logger.warning(\n"
+        '                "Cannot start Sendspin stream for %s: player not available",\n'
+        "                self.cast_player.display_name,\n"
+        "            )\n"
+        "            return\n",
+        "            self.logger.warning(\n"
+        '                "Cannot start Sendspin stream for %s: player not available",\n'
+        "                self.cast_player.display_name,\n"
+        "            )\n"
+        '            self._publish_cast_receiver_status("error", "device_unavailable")\n'
+        '            self._resolve_cast_app_ready(PlayerCommandFailed(f"{self.cast_player.display_name} is unavailable."))\n'
+        "            return\n",
+    ),
+    (
         "        self.cast_player.cancel_pending_app_quit()\n        try:\n",
         '        self._publish_cast_receiver_status("connecting")\n        self.cast_player.cancel_pending_app_quit()\n        try:\n',
     ),
     (
         '        except TimeoutError:\n            self.logger.warning(\n                "Timed out launching Sendspin Cast App on %s",\n',
         "        except TimeoutError:\n"
-        '            self._publish_cast_receiver_status("error")\n'
+        '            self._publish_cast_receiver_status("error", "launch_timeout")\n'
+        "            self._resolve_cast_app_ready(\n"
+        '                PlayerCommandFailed(f"Timed out launching Sendspin on {self.cast_player.display_name}.")\n'
+        "            )\n"
         "            self.logger.warning(\n"
         '                "Timed out launching Sendspin Cast App on %s",\n',
     ),
@@ -79,7 +115,8 @@ EDITS: list[tuple[str, str]] = [
         "            self.logger.error(\n"
         '                "Failed to launch Sendspin Cast App on %s: %s",\n',
         "        except Exception as err:\n"
-        '            self._publish_cast_receiver_status("error")\n'
+        '            self._publish_cast_receiver_status("error", "launch_failed")\n'
+        '            self._resolve_cast_app_ready(PlayerCommandFailed(f"Failed to launch Sendspin on {self.cast_player.display_name}."))\n'
         "            self.logger.error(\n"
         '                "Failed to launch Sendspin Cast App on %s: %s",\n',
     ),

@@ -79,9 +79,17 @@ def test_cast_receiver_states_reach_player_without_log_text() -> None:
     assert seen == ["connecting", "connected", "playing", "stopped", "error"]
 
     bridge = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinChromecastBridge")
-    method = next(node for node in bridge.body if isinstance(node, ast.FunctionDef) and node.name == "_publish_cast_receiver_status")
-    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
-    runtime = {}
+    methods = [
+        node
+        for node in bridge.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_publish_cast_receiver_status", "_on_stream_start"}
+    ]
+    method_source = "\n".join("\n".join(f"    {line}" for line in ast.unparse(method).splitlines()) for method in methods)
+
+    class PlayerCommandFailed(Exception):
+        pass
+
+    runtime = {"PlayerCommandFailed": PlayerCommandFailed}
     exec("from __future__ import annotations\nclass Bridge:\n" + method_source, runtime)  # noqa: S102
     player = type("Player", (), {"extra_attributes": {}, "update_state": lambda self: seen.append("event")})()
     bridge_instance = runtime["Bridge"]()
@@ -101,9 +109,37 @@ def test_cast_receiver_states_reach_player_without_log_text() -> None:
     )()
     bridge_instance._publish_cast_receiver_status("connecting")
     bridge_instance._publish_cast_receiver_status("connecting")
-    bridge_instance._publish_cast_receiver_status("error")
-    assert player.extra_attributes == {"sendspin_cast_state": "error"}
-    assert seen[-2:] == ["event", "event"]
+    bridge_instance._publish_cast_receiver_status("error", "launch_timeout")
+    bridge_instance._publish_cast_receiver_status("error", "private receiver diagnostic")
+    assert player.extra_attributes == {
+        "sendspin_cast_state": "error",
+        "sendspin_cast_failure": "receiver_error",
+    }
+    bridge_instance._publish_cast_receiver_status("connected")
+    assert player.extra_attributes == {"sendspin_cast_state": "connected"}
+    bridge_instance._publish_cast_receiver_status("error", "device_unavailable")
+    assert player.extra_attributes["sendspin_cast_failure"] == "device_unavailable"
+    assert 'self._resolve_cast_app_ready(PlayerCommandFailed(f"{self.cast_player.display_name} is unavailable."))' in patched
+    assert 'PlayerCommandFailed(f"Timed out launching Sendspin on {self.cast_player.display_name}.")' in patched
+    assert 'self._resolve_cast_app_ready(PlayerCommandFailed(f"Failed to launch Sendspin on {self.cast_player.display_name}."))' in patched
+    assert seen[-5:] == ["event"] * 5
+
+    class BridgeLogger:
+        def debug(self, *_args):
+            pass
+
+        def warning(self, *_args):
+            pass
+
+    failed: list[BaseException] = []
+    bridge_instance.logger = BridgeLogger()
+    bridge_instance.cast_player = type("CastPlayer", (), {"available": False, "display_name": "Kitchen TV"})()
+    bridge_instance.ensure_cast_app_ready = lambda: None
+    bridge_instance._resolve_cast_app_ready = failed.append
+    bridge_instance._on_stream_start(type("Request", (), {"connection_reason": "playback"})())
+    assert isinstance(failed[0], PlayerCommandFailed)
+    assert "unavailable" in str(failed[0])
+    assert player.extra_attributes["sendspin_cast_failure"] == "device_unavailable"
 
 
 @requires_py314
