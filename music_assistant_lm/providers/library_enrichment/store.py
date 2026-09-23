@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -2100,3 +2101,79 @@ class ArchiveStore:
             raise
         finally:
             temporary_manifest.unlink(missing_ok=True)
+
+    @staticmethod
+    def verify_backup(source: str | Path) -> dict:
+        """Verify a completed archive backup without opening the live store."""
+        source = Path(source)
+        manifest_path = source.with_suffix(source.suffix + ".manifest.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or (
+            not isinstance(manifest.get("store_uuid"), str)
+            or not manifest["store_uuid"]
+            or type(manifest.get("schema_version")) is not int
+            or type(manifest.get("size")) is not int
+            or not isinstance(manifest.get("sha256"), str)
+            or len(manifest["sha256"]) != 64
+        ):
+            raise ValueError("Invalid archive backup manifest")
+        if manifest["schema_version"] != SCHEMA_VERSION:
+            raise ValueError("Unsupported archive backup schema version")
+        ArchiveStore._verify_backup_file(source, manifest)
+        return manifest
+
+    @staticmethod
+    def stage_restore(source: str | Path, destination: str | Path) -> dict:
+        """Copy a verified backup into a new staging path without replacing live data."""
+        source = Path(source)
+        destination = Path(destination)
+        manifest = ArchiveStore.verify_backup(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        created = False
+        try:
+            with source.open("rb") as original, destination.open("xb") as staged:
+                created = True
+                shutil.copyfileobj(original, staged, length=1024 * 1024)
+                staged.flush()
+                os.fsync(staged.fileno())
+            ArchiveStore._verify_backup_file(destination, manifest)
+        except Exception:
+            if created:
+                destination.unlink(missing_ok=True)
+            raise
+        return manifest
+
+    @staticmethod
+    def _verify_backup_file(path: Path, manifest: dict) -> None:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        if size != manifest["size"] or digest.hexdigest() != manifest["sha256"]:
+            raise ValueError("Archive backup hash or size mismatch")
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError("Archive backup integrity check failed")
+                if db.execute("PRAGMA foreign_key_check").fetchone():
+                    raise ValueError("Archive backup foreign key check failed")
+                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise ValueError("Archive backup schema version mismatch")
+                metadata = dict(db.execute("SELECT key,value FROM metadata"))
+                schema_digest = _digest(
+                    [row[0] for row in db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")]
+                )
+                if metadata.get("store_uuid") != manifest["store_uuid"] or metadata.get("schema_digest") != schema_digest:
+                    raise ValueError("Archive backup identity or schema mismatch")
+                for version_id, total, expected in db.execute("SELECT id,total,content_digest FROM versions"):
+                    payloads = [
+                        row[0] for row in db.execute(
+                            "SELECT payload FROM occurrences WHERE version_id=? ORDER BY position", (version_id,)
+                        )
+                    ]
+                    if len(payloads) != total or _digest(payloads) != expected:
+                        raise ValueError("Archive backup version content digest mismatch")
+        except sqlite3.DatabaseError as error:
+            raise ValueError("Archive backup database is invalid") from error

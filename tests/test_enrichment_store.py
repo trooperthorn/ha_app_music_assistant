@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 import sqlite3
 from pathlib import Path
 
@@ -209,6 +210,59 @@ def test_backup_destination_verified_and_reopenable(tmp_path):
     with pytest.raises(FileExistsError):
         store.backup(dest)
     store.close()
+
+
+def test_large_archive_backup_can_be_verified_and_staged_without_replacing_live_data(tmp_path):
+    source = tmp_path / "archive.db"
+    store = ArchiveStore(source)
+    subscription = subscribe(store)
+    rows = [
+        {"position": position, "item": {"id": f"track-{position % 50}"}}
+        for position in range(10000)
+    ]
+    version = capture(store, subscription, rows=rows)
+    backup = tmp_path / "backup.db"
+    manifest = store.backup(backup)
+    store.close()
+
+    assert ArchiveStore.verify_backup(backup) == manifest
+    staged = tmp_path / "staging" / "archive.db"
+    assert ArchiveStore.stage_restore(backup, staged) == manifest
+    recovered = ArchiveStore(staged)
+    recovered_rows = recovered.get_version(version)["occurrences"]
+    assert len(recovered_rows) == 10000
+    assert recovered_rows[0] == rows[0]
+    assert recovered_rows[-1] == rows[-1]
+    recovered.close()
+    assert source.exists()
+
+    staged.write_bytes(b"existing destination")
+    with pytest.raises(FileExistsError):
+        ArchiveStore.stage_restore(backup, staged)
+    assert staged.read_bytes() == b"existing destination"
+
+
+def test_backup_staging_rejects_corrupt_or_unsupported_input(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    capture(store, subscribe(store))
+    backup = tmp_path / "backup.db"
+    store.backup(backup)
+    store.close()
+    manifest_path = backup.with_suffix(".db.manifest.json")
+    original = manifest_path.read_text(encoding="utf-8")
+
+    manifest = json.loads(original)
+    manifest["schema_version"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported"):
+        ArchiveStore.stage_restore(backup, tmp_path / "unsupported.db")
+    assert not (tmp_path / "unsupported.db").exists()
+
+    manifest_path.write_text(original, encoding="utf-8")
+    backup.write_bytes(backup.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="hash or size"):
+        ArchiveStore.stage_restore(backup, tmp_path / "corrupt.db")
+    assert not (tmp_path / "corrupt.db").exists()
 
 
 def test_progress_survives_restart(tmp_path):

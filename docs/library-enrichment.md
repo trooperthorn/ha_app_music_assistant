@@ -177,6 +177,13 @@ published atomically without overwriting an existing file; the current helper ne
 hard-link support on the backup filesystem and fails safely when unavailable.
 Tests reopen this copy and recover repeated/null
 occurrences. No live library restore or coordinated MA recovery has been attempted.
+`ArchiveStore.verify_backup(path)` checks the published manifest, byte hash,
+SQLite integrity, schema, identity and every immutable version without opening
+the live store. `ArchiveStore.stage_restore(source, new_path)` copies a verified
+backup into a new staging path and repeats those checks on the copied bytes;
+it refuses an existing path and never replaces the live database. A 10,000-item
+archive exercises this path in tests. Coordinated Music Assistant data/config
+restore still requires a separate cutover procedure and a live recovery test.
 
 ## Validation and promotion
 
