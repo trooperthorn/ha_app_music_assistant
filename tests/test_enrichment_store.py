@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 import sqlite3
 from pathlib import Path
 
@@ -95,11 +96,129 @@ def test_playback_policy_cas_and_projection_checkpoint_are_independent(tmp_path)
     )
     assert projection["state"] == "prepared"
     store.mark_playback_projection_writing(subscription)
-    committed = store.commit_playback_projection(subscription, "playback", "builtin", "a" * 64)
+    committed = store.commit_playback_projection(subscription, "playback", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="changed"):
+        store.detach_playback_projection(subscription, "another-playlist", "b" * 64)
+    assert store.get_playback_projection(subscription)["destination_item_id"] == "playback"
+    detached = store.detach_playback_projection(subscription, "playback", "b" * 64)
+    assert detached["destination_item_id"] == "playback"
+    assert store.get_playback_projection(subscription) is None
     assert committed["state"] == "applied"
     # The playback checkpoint does not advance the older archive-copy checkpoint.
     assert store.get_subscription(subscription)["applied_version_id"] is None
     store.close()
+
+
+def test_mirror_checkpoint_preserves_last_applied_version_and_requires_explicit_detach(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version_a = capture(store, sub)
+    version_b = capture(store, sub, snapshot="B")
+    mirror = store.configure_mirror(sub, True, False, 0)
+    assert mirror["state"] == "pending" and mirror["enabled"] == 1
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.configure_mirror(sub, True, False, 0)
+    store.prepare_mirror(sub, version_a, "a" * 64)
+    store.mark_mirror_writing(sub)
+    applied = store.commit_mirror(sub, "mirror-1", "builtin", "a" * 64, "b" * 64)
+    assert applied["applied_version_id"] == version_a
+    store.prepare_mirror(sub, version_b, "c" * 64)
+    failed = store.fail_mirror(sub, "Destination unavailable")
+    assert failed["state"] == "failed" and failed["applied_version_id"] == version_a
+    assert failed["destination_item_id"] == "mirror-1"
+    store.prepare_mirror(sub, version_b, "c" * 64)
+    store.mark_mirror_writing(sub)
+    uncertain = store.fail_mirror(sub, "Write outcome unknown", uncertain=True)
+    assert uncertain["state"] == "uncertain" and uncertain["applied_version_id"] == version_a
+    with pytest.raises(ValueError, match="reconciliation"):
+        store.configure_mirror(sub, False, False, uncertain["revision"])
+    with pytest.raises(ValueError, match="unresolved"):
+        store.detach_mirror(sub, "mirror-1", "b" * 64)
+    store.close()
+
+
+def test_mirror_detach_preserves_identity_until_explicit_new_destination(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.configure_mirror(sub, True, True, 0)
+    store.prepare_mirror(sub, version, "a" * 64)
+    store.mark_mirror_writing(sub)
+    store.commit_mirror(sub, "mirror-1", "builtin", "a" * 64, "b" * 64)
+    assert store.mirror_destination_claimed(sub, "mirror-1") is False
+    assert store.mirror_destination_claimed("another-subscription", "mirror-1") is True
+    with pytest.raises(ValueError, match="changed"):
+        store.detach_mirror(sub, "wrong", "b" * 64)
+    detached = store.detach_mirror(sub, "mirror-1", "b" * 64)
+    assert detached["state"] == "detached" and detached["destination_item_id"] == "mirror-1"
+    renewed = store.configure_mirror(sub, True, True, detached["revision"])
+    assert renewed["state"] == "pending" and renewed["destination_item_id"] is None
+    assert renewed["applied_version_id"] is None
+    store.close()
+
+
+def test_rebind_applied_mirror_requires_exact_checkpoint_and_unclaimed_destination(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.configure_mirror(sub, True, False, 0)
+    store.prepare_mirror(sub, version, "a" * 64)
+    store.mark_mirror_writing(sub)
+    original = store.commit_mirror(sub, "old-id", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="changed"):
+        store.rebind_destination("mirror", sub, "old-id", "new-id", "builtin", "c" * 64, original["revision"])
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.rebind_destination("mirror", sub, "old-id", "new-id", "builtin", "b" * 64, 99)
+    rebound = store.rebind_destination("mirror", sub, "old-id", "new-id", "builtin", "b" * 64,
+                                       original["revision"])
+    assert rebound["destination_item_id"] == "new-id"
+    assert rebound["revision"] == original["revision"] + 1
+    assert rebound["applied_version_id"] == version
+    with pytest.raises(ValueError, match="changed"):
+        store.rebind_destination("mirror", sub, "old-id", "another-id", "builtin", "b" * 64,
+                                 original["revision"])
+    other = subscribe(store, playlist="other")
+    other_version = capture(store, other)
+    store.configure_mirror(other, True, False, 0)
+    store.prepare_mirror(other, other_version, "a" * 64)
+    store.mark_mirror_writing(other)
+    store.commit_mirror(other, "claimed-id", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="claimed"):
+        store.rebind_destination("mirror", sub, "new-id", "claimed-id", "builtin", "b" * 64,
+                                 rebound["revision"])
+    store.close()
+
+
+def test_rebind_applied_playback_projection_preserves_policy_checkpoint(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.prepare_playback_projection(sub, version, 0, "a" * 64, 1, 0, "[]")
+    store.mark_playback_projection_writing(sub)
+    original = store.commit_playback_projection(sub, "old-id", "builtin", "a" * 64, "b" * 64)
+    rebound = store.rebind_destination("playback", sub, "old-id", "new-id", "builtin", "b" * 64, None)
+    assert rebound["destination_item_id"] == "new-id"
+    assert rebound["version_id"] == original["version_id"]
+    assert rebound["policy_revision"] == original["policy_revision"]
+    store.close()
+
+
+def test_mirror_restart_marks_external_write_uncertain_without_retry(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.configure_mirror(sub, True, False, 0)
+    store.prepare_mirror(sub, version, "a" * 64)
+    store.mark_mirror_writing(sub)
+    store.close()
+    reopened = ArchiveStore(path)
+    assert reopened.recover_mirror_pending() == (0, 1)
+    assert reopened.get_mirror(sub)["state"] == "uncertain"
+    with pytest.raises(ValueError, match="reconciliation"):
+        reopened.configure_mirror(sub, False, False, 1)
+    assert reopened.recover_mirror_pending() == (0, 0)
+    reopened.close()
 
 
 def test_faithful_occurrences_and_empty_playlist(tmp_path):
@@ -209,6 +328,61 @@ def test_backup_destination_verified_and_reopenable(tmp_path):
     with pytest.raises(FileExistsError):
         store.backup(dest)
     store.close()
+
+
+def test_large_archive_backup_can_be_verified_and_staged_without_replacing_live_data(tmp_path):
+    source = tmp_path / "archive.db"
+    store = ArchiveStore(source)
+    subscription = subscribe(store)
+    rows = [
+        {"position": position, "item": {"id": f"track-{position % 50}"}}
+        for position in range(10000)
+    ]
+    rows[5_000] = {"position": 5_000, "reason": "missing", "omitted": True, "fallback": None}
+    version = capture(store, subscription, rows=rows)
+    backup = tmp_path / "backup.db"
+    manifest = store.backup(backup)
+    store.close()
+
+    assert ArchiveStore.verify_backup(backup) == manifest
+    staged = tmp_path / "staging" / "archive.db"
+    assert ArchiveStore.stage_restore(backup, staged) == manifest
+    recovered = ArchiveStore(staged)
+    recovered_rows = recovered.get_version(version)["occurrences"]
+    assert len(recovered_rows) == 10000
+    assert recovered_rows[0] == rows[0]
+    assert recovered_rows[5_000] == rows[5_000]
+    assert recovered_rows[-1] == rows[-1]
+    recovered.close()
+    assert source.exists()
+
+    staged.write_bytes(b"existing destination")
+    with pytest.raises(FileExistsError):
+        ArchiveStore.stage_restore(backup, staged)
+    assert staged.read_bytes() == b"existing destination"
+
+
+def test_backup_staging_rejects_corrupt_or_unsupported_input(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    capture(store, subscribe(store))
+    backup = tmp_path / "backup.db"
+    store.backup(backup)
+    store.close()
+    manifest_path = backup.with_suffix(".db.manifest.json")
+    original = manifest_path.read_text(encoding="utf-8")
+
+    manifest = json.loads(original)
+    manifest["schema_version"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported"):
+        ArchiveStore.stage_restore(backup, tmp_path / "unsupported.db")
+    assert not (tmp_path / "unsupported.db").exists()
+
+    manifest_path.write_text(original, encoding="utf-8")
+    backup.write_bytes(backup.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="hash or size"):
+        ArchiveStore.stage_restore(backup, tmp_path / "corrupt.db")
+    assert not (tmp_path / "corrupt.db").exists()
 
 
 def test_progress_survives_restart(tmp_path):
@@ -612,6 +786,79 @@ def test_match_assets_candidates_decisions_and_version_overlay(tmp_path):
     assert version_overlay["occurrences"][1]["match"] is None
     assert version_overlay["occurrences"][2]["match"]["source"]["source_item_id"] == "spotify-track"
     assert len(store.list_match_overlays("spotify", "account-a", "track")) == 1
+    store.close()
+
+
+def test_reviewed_local_file_relocation_preserves_asset_and_decision(tmp_path):
+    path = tmp_path / "archive.db"
+    store = ArchiveStore(path)
+    asset = store.upsert_local_asset("track", "filesystem", "old/song.flac")
+    key = ("spotify", "account-a", "track", "source-track")
+    store.replace_match_candidates(
+        *key, [{"asset_id": asset["id"], "score": 0.5}], "v1"
+    )
+    store.set_match_decision(*key, "approve", asset["id"], 0, "admin")
+    other = store.upsert_local_asset("track", "filesystem", "other/song.flac")
+
+    with pytest.raises(ValueError, match="expected asset"):
+        store.relocate_local_asset_location(
+            other["id"], "filesystem", "old/song.flac", "new/song.flac"
+        )
+    with pytest.raises(ValueError, match="already bound"):
+        store.relocate_local_asset_location(
+            asset["id"], "filesystem", "old/song.flac", "other/song.flac"
+        )
+    assert store.get_local_asset(asset["id"])["locations"][0]["item_id"] == "old/song.flac"
+
+    moved = store.relocate_local_asset_location(
+        asset["id"], "filesystem", "old/song.flac", "new/song.flac",
+        {"kind": "reviewed_move", "actor": "admin"},
+    )
+    assert moved["asset_id"] == asset["id"]
+    assert moved["item_id"] == "new/song.flac"
+    assert moved["evidence"]["kind"] == "reviewed_move"
+    assert store.get_match_overlay(*key)["approved_asset_id"] == asset["id"]
+    with pytest.raises(ValueError, match="expected asset"):
+        store.relocate_local_asset_location(
+            asset["id"], "filesystem", "old/song.flac", "another/song.flac"
+        )
+    store.close()
+
+    reopened = ArchiveStore(path)
+    assert reopened.get_local_asset(asset["id"])["locations"][0]["item_id"] == "new/song.flac"
+    assert reopened.get_match_overlay(*key)["approved_asset_id"] == asset["id"]
+    reopened.close()
+
+
+def test_reviewed_move_requires_explicit_safe_provisional_merge(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    reviewed = store.upsert_local_asset("track", "filesystem", "old.flac")
+    provisional = store.upsert_local_asset("track", "filesystem", "new.flac")
+    key = ("spotify", "account-a", "track", "song")
+    store.replace_match_candidates(
+        *key, [{"asset_id": provisional["id"], "score": 0.5}], "v1"
+    )
+    with pytest.raises(ValueError, match="already bound"):
+        store.relocate_local_asset_location(
+            reviewed["id"], "filesystem", "old.flac", "new.flac"
+        )
+    with pytest.raises(ValueError, match="already bound"):
+        store.relocate_local_asset_location(
+            reviewed["id"], "filesystem", "old.flac", "new.flac",
+            expected_target_asset_id="wrong",
+        )
+    assert store.get_local_asset(reviewed["id"])["locations"][0]["item_id"] == "old.flac"
+
+    store.relocate_local_asset_location(
+        reviewed["id"], "filesystem", "old.flac", "new.flac",
+        {"kind": "reviewed_move"},
+        expected_target_asset_id=provisional["id"],
+    )
+    overlay = store.get_match_overlay(*key)
+    assert overlay["candidates"][0]["asset_id"] == reviewed["id"]
+    assert store.get_local_asset(reviewed["id"])["locations"][0]["item_id"] == "new.flac"
+    with pytest.raises(KeyError):
+        store.get_local_asset(provisional["id"])
     store.close()
 
 

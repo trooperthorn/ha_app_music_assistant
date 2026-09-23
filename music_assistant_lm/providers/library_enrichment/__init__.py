@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -44,6 +45,10 @@ MAX_ITUNES_ZIP_UPLOAD_BYTES = 15 * 1024 * 1024
 MAX_ITUNES_APPLY_OCCURRENCES = 10000
 
 
+class MirrorDestinationConflict(Exception):
+    """A user or another provider changed a mirror destination outside this provider."""
+
+
 async def setup(mass, manifest, config):
     """Construct the provider using the standard MA lifecycle."""
     return LibraryEnrichmentProvider(mass, manifest, config)
@@ -70,6 +75,7 @@ class LibraryEnrichmentProvider(PluginProvider):
         await asyncio.to_thread(self._store.recover_pending)
         await asyncio.to_thread(self._store.recover_sync_pending)
         await asyncio.to_thread(self._store.recover_itunes_apply_pending)
+        await asyncio.to_thread(self._store.recover_mirror_pending)
 
     async def loaded_in_mass(self) -> None:
         for command, handler in (
@@ -83,6 +89,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("version", self.archive_version),
             ("versions", self.archive_versions),
             ("provenance", self.provenance),
+            ("set_provenance_override", self.set_provenance_override),
+            ("clear_provenance_override", self.clear_provenance_override),
             ("item_provenance", self.item_provenance),
             ("itunes_inspect", self.itunes_inspect),
             ("itunes_preview", self.itunes_preview),
@@ -99,11 +107,23 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("match_review", self.match_review),
             ("set_match_decision", self.set_match_decision),
             ("approve_match_candidates", self.approve_match_candidates),
+            ("relocate_match_asset", self.relocate_match_asset),
             ("playback_policy", self.playback_policy),
             ("set_playback_policy", self.set_playback_policy),
             ("playback_preview", self.playback_preview),
             ("playback_apply", self.playback_apply),
             ("playback_status", self.playback_status),
+            ("playback_detach", self.playback_detach),
+            ("mirror_status", self.mirror_status),
+            ("mirror_preview", self.mirror_preview),
+            ("mirror_configure", self.mirror_configure),
+            ("mirror_apply", self.mirror_apply),
+            ("mirror_detach", self.mirror_detach),
+            ("mirror_reconcile_preview", self.mirror_reconcile_preview),
+            ("mirror_reconcile", self.mirror_reconcile),
+            ("mirror_abandon_uncertain", self.mirror_abandon_uncertain),
+            ("destination_rebind_inspect", self.destination_rebind_inspect),
+            ("destination_rebind_apply", self.destination_rebind_apply),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -170,7 +190,9 @@ class LibraryEnrichmentProvider(PluginProvider):
             "version_listing": True,
             "provenance_read": True,
             "provenance_api_version": 1,
+            "provenance_override_api_version": 1,
             "musicbrainz_identity_api_version": 1,
+            "local_catalog_api_version": 1,
             "max_provenance_page": 200,
             "raw_payload_inline": False,
             "item_provenance": True,
@@ -190,7 +212,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             "itunes_zip_directory": str(self._itunes_zip_root),
             "max_itunes_preview_page": 200,
             "inspection": "library_only_no_refresh",
-            "mirror_apply": False,
+            "mirror_apply": True,
+            "mirror_api_version": 2,
             "archive_apply": True,
             "apply_api_version": 1,
             "subscription_sync": True,
@@ -198,10 +221,13 @@ class LibraryEnrichmentProvider(PluginProvider):
             "interval_bounds": {"min": 3600, "max": 604800},
             "local_matching": True,
             "match_review_api_version": 2,
+            "match_relocation_api_version": 1,
             "max_match_review_page": 200,
             "max_match_approvals": 200,
             "playback_policy": True,
             "playback_policy_api_version": 1,
+            "playback_detach": True,
+            "destination_rebind_api_version": 1,
             "playback_policy_modes": ["prefer_local", "local_only", "prefer_spotify"],
             "playback_strict_signal": "#EXTPROV:local_only||<provider-instance>",
             "liked_songs": False,
@@ -1127,6 +1153,105 @@ class LibraryEnrichmentProvider(PluginProvider):
         return result
 
     @staticmethod
+    def _library_catalog_values(library_item: Any, fetched_at: str) -> list[dict[str, Any]]:
+        """Snapshot safe catalog and format details from an already loaded MA track."""
+        fields = ("ma_label", "ma_album_barcode", "ma_artwork_sources", "ma_audio_formats")
+
+        def entry(name: str, state: str, value: Any = None) -> dict[str, Any]:
+            result = {
+                "field_name": name, "state": state, "source": "music_assistant.library",
+                "fetched_at": fetched_at, "parser_version": "ma-library-catalog-v1",
+            }
+            if state == "value":
+                result["value"] = value
+            return result
+
+        if library_item is None:
+            return [entry(name, "not_loaded") for name in fields]
+        try:
+            item = library_item.to_dict()
+        except Exception:
+            return [entry(name, "inaccessible") for name in fields]
+        if not isinstance(item, dict):
+            return [entry(name, "inaccessible") for name in fields]
+
+        metadata = item.get("metadata")
+        album = item.get("album")
+        album_metadata = album.get("metadata") if isinstance(album, dict) else None
+        label_container = metadata if isinstance(metadata, dict) and "label" in metadata else album_metadata
+        if label_container is None:
+            label = entry("ma_label", "not_loaded" if metadata is None else "missing")
+        elif not isinstance(label_container, dict):
+            label = entry("ma_label", "inaccessible")
+        elif "label" not in label_container:
+            label = entry("ma_label", "missing")
+        else:
+            raw_label = label_container["label"]
+            label = entry("ma_label", "not_loaded" if raw_label is None else "empty" if raw_label == ""
+                          else "value" if isinstance(raw_label, str) else "inaccessible", raw_label)
+
+        if album is None:
+            barcode = entry("ma_album_barcode", "not_loaded")
+        elif not isinstance(album, dict):
+            barcode = entry("ma_album_barcode", "inaccessible")
+        elif "external_ids" not in album:
+            barcode = entry("ma_album_barcode", "missing")
+        else:
+            raw_ids = album["external_ids"]
+            if raw_ids is None:
+                barcode = entry("ma_album_barcode", "not_loaded")
+            elif not isinstance(raw_ids, (list, tuple)):
+                barcode = entry("ma_album_barcode", "inaccessible")
+            else:
+                values = [pair[1] for pair in raw_ids
+                          if isinstance(pair, (list, tuple)) and len(pair) == 2
+                          and getattr(pair[0], "value", pair[0]) == "barcode"
+                          and isinstance(pair[1], str) and pair[1]]
+                barcode = entry("ma_album_barcode", "value" if values else "missing", values[0] if values else None)
+
+        if metadata is None:
+            artwork = entry("ma_artwork_sources", "not_loaded")
+        elif not isinstance(metadata, dict):
+            artwork = entry("ma_artwork_sources", "inaccessible")
+        elif "images" not in metadata:
+            artwork = entry("ma_artwork_sources", "missing")
+        else:
+            raw_images = metadata["images"]
+            if raw_images is None:
+                artwork = entry("ma_artwork_sources", "not_loaded")
+            elif not isinstance(raw_images, list) or any(not isinstance(image, dict) for image in raw_images):
+                artwork = entry("ma_artwork_sources", "inaccessible")
+            else:
+                safe_images = [{"type": getattr(image.get("type"), "value", image.get("type")),
+                                "provider": image["provider"],
+                                "proxy_id": image.get("proxy_id") if isinstance(image.get("proxy_id"), str) else None}
+                               for image in raw_images[:4]
+                               if isinstance(getattr(image.get("type"), "value", image.get("type")), str)
+                               and isinstance(image.get("provider"), str)]
+                artwork = entry("ma_artwork_sources", "value" if safe_images else "empty", safe_images)
+
+        mappings = item.get("provider_mappings")
+        if mappings is None:
+            formats = entry("ma_audio_formats", "not_loaded")
+        elif not isinstance(mappings, list) or any(not isinstance(mapping, dict) for mapping in mappings):
+            formats = entry("ma_audio_formats", "inaccessible")
+        else:
+            safe_formats = []
+            for mapping in mappings[:16]:
+                audio = mapping.get("audio_format")
+                if not isinstance(audio, dict) or not isinstance(mapping.get("provider_domain"), str):
+                    continue
+                detail = {
+                    "provider_domain": mapping["provider_domain"],
+                }
+                for name in ("content_type", "sample_rate", "bit_depth", "channels", "bit_rate"):
+                    raw = getattr(audio.get(name), "value", audio.get(name))
+                    detail[name] = raw if isinstance(raw, (str, int)) or (type(raw) is float and math.isfinite(raw)) else None
+                safe_formats.append(detail)
+            formats = entry("ma_audio_formats", "value" if safe_formats else "empty", safe_formats)
+        return [label, barcode, artwork, formats]
+
+    @staticmethod
     def _stale_musicbrainz_identity_values(
         prior_overlay: dict[str, Any], fetched_at: str
     ) -> list[dict[str, Any]]:
@@ -1156,6 +1281,23 @@ class LibraryEnrichmentProvider(PluginProvider):
             result.append(observation)
         return result
 
+    @staticmethod
+    def _stale_library_catalog_values(prior_overlay: dict[str, Any], fetched_at: str) -> list[dict[str, Any]]:
+        """Keep prior catalog evidence visible when the local library read fails."""
+        result = []
+        for field_name in ("ma_label", "ma_album_barcode", "ma_artwork_sources", "ma_audio_formats"):
+            observation = {
+                "field_name": field_name, "state": "inaccessible",
+                "source": "music_assistant.library", "fetched_at": fetched_at,
+                "parser_version": "ma-library-catalog-read-error-v1",
+            }
+            prior = prior_overlay.get("fields", {}).get(field_name, {}).get("observation")
+            if isinstance(prior, dict) and prior.get("state") in ("value", "stale") and prior.get("value") is not None:
+                observation["state"] = "stale"
+                observation["value"] = prior["value"]
+            result.append(observation)
+        return result
+
     async def provenance(self, version_id: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Return persisted typed provenance derived only from immutable archive JSON."""
         self._authorize()
@@ -1175,6 +1317,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "musicbrainz_recording_id", "musicbrainz_release_track_id", "musicbrainz_release_id",
             "musicbrainz_release_group_id", "musicbrainz_artist_credits",
         }
+        catalog_fields = {"ma_label", "ma_album_barcode", "ma_artwork_sources", "ma_audio_formats"}
         for occurrence in requested_occurrences:
             source_id = occurrence.get("source_item_id")
             if not isinstance(source_id, str) or not source_id:
@@ -1194,26 +1337,40 @@ class LibraryEnrichmentProvider(PluginProvider):
                     == "ma-library-identity-v1"
                     for field_name in identity_fields
                 )
-                if not identity_complete:
+                catalog_complete = catalog_fields.issubset(scoped_fields) and all(
+                    scoped_fields[field_name].get("observation", {}).get("parser_version")
+                    == "ma-library-catalog-v1"
+                    for field_name in catalog_fields
+                )
+                if not identity_complete or not catalog_complete:
                     fetched_at = datetime.now(UTC).isoformat()
                     try:
                         library_item = await self.mass.music.tracks.get_library_item_by_prov_id(
                             source_id, subscription["provider_instance_id"]
                         )
                         identity_values = self._musicbrainz_identity_values(library_item, fetched_at)
+                        catalog_values = self._library_catalog_values(library_item, fetched_at)
                     except Exception:
                         prior = await self._read_store(
                             self._store.get_provenance_overlay,
                             "spotify", subscription["account_id"], "track", source_id,
                         )
                         identity_values = self._stale_musicbrainz_identity_values(prior, fetched_at)
-                    for identity_value in identity_values:
+                        catalog_values = self._stale_library_catalog_values(prior, fetched_at)
+                    for identity_value in [
+                        *(identity_values if not identity_complete else []),
+                        *(catalog_values if not catalog_complete else []),
+                    ]:
                         identity_value["raw_reference"] = {
                             "version_id": version_id, "position": occurrence["position"], "json_pointer": None,
                         }
+                    values = [
+                        *(identity_values if not identity_complete else []),
+                        *(catalog_values if not catalog_complete else []),
+                    ]
                     await self._store_operation(
                         self._store.upsert_provenance_values,
-                        "spotify", subscription["account_id"], "track", source_id, identity_values,
+                        "spotify", subscription["account_id"], "track", source_id, values,
                     )
                 persisted[source_id] = await self._read_store(
                     self._store.get_provenance_overlay,
@@ -1240,6 +1397,87 @@ class LibraryEnrichmentProvider(PluginProvider):
             "raw_payload_inline": False,
         }
 
+    async def _change_provenance_override(
+        self, version_id: str, source_item_id: str, field_name: str,
+        expected_revision: int, *, clear: bool, value: Any = None,
+    ) -> dict[str, Any]:
+        """Apply one reviewed field correction to a source in this archive version."""
+        user = self._authorize()
+        if (
+            not isinstance(version_id, str) or not version_id
+            or not isinstance(source_item_id, str) or not source_item_id
+            or not isinstance(field_name, str) or not field_name
+            or type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise InvalidDataError("A version, source, field, and expected revision are required")
+        try:
+            version = await self._read_store(self._store.get_version, version_id)
+            subscription = await self._read_store(
+                self._store.get_subscription, version["subscription_id"]
+            )
+        except KeyError:
+            raise InvalidDataError("Archive version was not found") from None
+        if not any(
+            item.get("source_item_id") == source_item_id for item in version["occurrences"]
+        ):
+            raise InvalidDataError("Source is not in the selected archive version")
+        account_id = subscription["account_id"]
+        overlay = await self._read_store(
+            self._store.get_provenance_overlay,
+            "spotify", account_id, "track", source_item_id, version_id,
+        )
+        field = overlay["fields"].get(field_name)
+        if field is None or field.get("observation") is None:
+            raise InvalidDataError("Read provenance before correcting an observed field")
+        if not clear:
+            try:
+                encoded_value = json.dumps(value, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError):
+                raise InvalidDataError("Correction must be a JSON value") from None
+            if len(encoded_value.encode("utf-8")) > 4096:
+                raise InvalidDataError("Correction exceeds 4096 bytes")
+        try:
+            operation = (
+                self._store.clear_provenance_override if clear
+                else self._store.set_provenance_override
+            )
+            arguments = (
+                "spotify", account_id, "track", source_item_id, field_name,
+                expected_revision, user.user_id,
+            )
+            if clear:
+                await self._store_operation(operation, *arguments)
+            else:
+                await self._store_operation(
+                    operation, "spotify", account_id, "track", source_item_id,
+                    field_name, value, expected_revision, user.user_id,
+                )
+        except (TypeError, ValueError) as err:
+            raise InvalidDataError(str(err)) from None
+        return await self._read_store(
+            self._store.get_provenance_overlay,
+            "spotify", account_id, "track", source_item_id, version_id,
+        )
+
+    async def set_provenance_override(
+        self, version_id: str, source_item_id: str, field_name: str,
+        value: Any, expected_revision: int,
+    ) -> dict[str, Any]:
+        """Set an administrator correction without altering source evidence."""
+        return await self._change_provenance_override(
+            version_id, source_item_id, field_name, expected_revision,
+            clear=False, value=value,
+        )
+
+    async def clear_provenance_override(
+        self, version_id: str, source_item_id: str, field_name: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Clear a correction, exposing the original observation again."""
+        return await self._change_provenance_override(
+            version_id, source_item_id, field_name, expected_revision, clear=True,
+        )
+
     async def item_provenance(self, media_type: str = "playlist", library_item_id: str = "") -> dict[str, Any]:
         """Link one builtin playlist destination to its durable archive checkpoints."""
         self._authorize()
@@ -1254,7 +1492,8 @@ class LibraryEnrichmentProvider(PluginProvider):
                     else None
                 )
                 playback = self._store.get_playback_projection(subscription["id"])
-                for kind, destination in (("archive", archive), ("playback", playback)):
+                mirror = self._store.get_mirror(subscription["id"])
+                for kind, destination in (("archive", archive), ("playback", playback), ("mirror", mirror)):
                     if destination and str(destination.get("destination_item_id")) == library_item_id:
                         capture_jobs = [
                             job for job in self._store.list_jobs() if job["subscription_id"] == subscription["id"]
@@ -1276,6 +1515,15 @@ class LibraryEnrichmentProvider(PluginProvider):
             capture_jobs and capture_jobs[-1]["state"] == "failed"
         ):
             state = "capture_failed"
+        elif kind == "mirror" and destination.get("state") == "conflict":
+            state = "mirror_conflict"
+        elif kind == "mirror" and destination.get("state") in ("writing", "uncertain"):
+            state = "mirror_uncertain"
+        elif kind == "mirror" and destination.get("state") in ("detached", "disabled"):
+            state = "mirror_detached"
+        elif kind == "mirror" and (destination.get("state") != "applied" or
+                                   destination.get("applied_version_id") != subscription.get("committed_version_id")):
+            state = "source_changed"
         elif subscription.get("observed_snapshot") and subscription.get("observed_snapshot") != subscription.get("committed_snapshot"):
             state = "source_changed"
         elif subscription.get("committed_version_id"):
@@ -1289,7 +1537,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             "state": state,
             "destination": {"kind": kind, "item_id": library_item_id,
                             "provider_instance_id": destination.get("destination_provider_instance"),
-                            "version_id": destination.get("version_id"), "updated_at": destination.get("updated_at")},
+                            "version_id": destination.get("version_id") or destination.get("applied_version_id"),
+                            "updated_at": destination.get("updated_at")},
             "subscription": {key: subscription.get(key) for key in
                              ("id", "provider_domain", "account_id", "source_playlist_id", "name")},
             "snapshots": {
@@ -1438,6 +1687,94 @@ class LibraryEnrichmentProvider(PluginProvider):
             "candidate_freshness": candidate_freshness,
             "candidate_error": candidate_error,
             "items": items,
+        }
+
+    async def relocate_match_asset(
+        self,
+        version_id: str,
+        source_item_id: str,
+        asset_id: str,
+        provider_instance_id: str,
+        old_item_id: str,
+        new_item_id: str,
+        expected_revision: int,
+        provisional_asset_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Confirm a reviewed file move against current MA mappings, then retain its decision."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Match corrections require library write permission")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise InvalidDataError("Expected match revision required")
+        version = await self._read_store(self._store.get_version, version_id)
+        subscription = await self._read_store(
+            self._store.get_subscription, version["subscription_id"]
+        )
+        if not any(
+            row.get("state") == "track" and row.get("source_item_id") == source_item_id
+            for row in version["occurrences"]
+        ):
+            raise InvalidDataError("Source item is not a reviewable occurrence in this archive version")
+        source_key = (
+            subscription["provider_domain"], subscription["account_id"], "track", source_item_id
+        )
+        overlay = await self._read_store(self._store.get_match_overlay, *source_key)
+        if overlay["revision"] != expected_revision or overlay["approved_asset_id"] != asset_id:
+            raise InvalidDataError("Approved match changed during relocation")
+        try:
+            asset = await self._read_store(self._store.get_local_asset, asset_id)
+        except KeyError:
+            raise InvalidDataError("Approved local asset is missing") from None
+        if not any(
+            location["provider_instance_id"] == provider_instance_id
+            and location["item_id"] == old_item_id
+            for location in asset["locations"]
+        ):
+            raise InvalidDataError("Old location does not belong to the approved asset")
+        if provisional_asset_id is not None and provisional_asset_id not in {
+            candidate["asset_id"] for candidate in overlay["candidates"]
+        }:
+            raise InvalidDataError("Provisional asset is not a current candidate")
+        controller = self.mass.music.get_controller(MediaType.TRACK)
+        try:
+            item = await controller.get_library_item_by_prov_id(
+                source_item_id, subscription["provider_instance_id"]
+            )
+        except Exception:
+            raise InvalidDataError("Current library mapping could not be verified") from None
+        if item is None:
+            raise InvalidDataError("Current library track is unavailable")
+        same_instance = [
+            mapping for mapping in item.provider_mappings
+            if mapping.provider_instance == provider_instance_id
+        ]
+        if any(str(mapping.item_id) == old_item_id for mapping in same_instance):
+            raise InvalidDataError("Old location is still in the current library mapping")
+        current = [
+            mapping for mapping in same_instance
+            if self._local_mapping_candidate(mapping) is not None
+        ]
+        if not any(str(mapping.item_id) == new_item_id for mapping in current):
+            raise InvalidDataError("New location is not in the current local library mapping")
+        evidence = {
+            "kind": "reviewed_local_file_move",
+            "actor_id": user.user_id,
+            "version_id": version_id,
+            "source_item_id": source_item_id,
+            "library_item_id": str(item.item_id),
+            "old_item_id": old_item_id,
+        }
+        try:
+            location = await self._read_store(
+                self._store.relocate_local_asset_location,
+                asset_id, provider_instance_id, old_item_id, new_item_id,
+                evidence, provisional_asset_id, source_key, expected_revision,
+            )
+        except ValueError as err:
+            raise InvalidDataError(str(err)) from None
+        return {
+            "location": location,
+            "match": await self._read_store(self._store.get_match_overlay, *source_key),
         }
 
     async def set_match_decision(
@@ -1687,6 +2024,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             await self._store_operation(self._store.observe_sync, job["id"], preview["snapshot_id"])
             if preview["snapshot_id"] == subscription["committed_snapshot"]:
                 await self._store_operation(self._store.succeed_sync, job["id"], subscription["committed_version_id"])
+                await self._advance_enabled_mirror(subscription["id"])
                 return
             preparation = asyncio.create_task(asyncio.to_thread(
                 self._store.begin_capture, subscription["id"], preview["snapshot_id"], job["id"]
@@ -1712,6 +2050,7 @@ class LibraryEnrichmentProvider(PluginProvider):
                     snapshot_after=result["snapshot_after"], total=result["total"], occurrences=result["occurrences"])
             )
             await self._store_operation(self._store.succeed_sync, job["id"], version_id)
+            await self._advance_enabled_mirror(subscription["id"])
         except BaseException as err:
             if capture_id:
                 try:
@@ -1746,6 +2085,24 @@ class LibraryEnrichmentProvider(PluginProvider):
             task_id = self._sync_jobs.pop(job["id"], None)
             if task_id:
                 self._sync_stopping.discard(task_id)
+
+    async def _advance_enabled_mirror(self, subscription_id: str) -> None:
+        """A destination failure never invalidates the successful immutable source capture."""
+        try:
+            mirror = await self._store_operation(self._store.get_mirror, subscription_id)
+            if mirror is None or not mirror["enabled"]:
+                return
+            user = get_current_user()
+            if user is None or not has_scope(user, Scope.LIBRARY_WRITE):
+                await self._store_operation(self._store.fail_mirror, subscription_id,
+                                            "Mirror owner no longer has library write permission")
+                return
+            async with self._write_lock:
+                await self._advance_mirror(subscription_id)
+        except Exception:
+            # _advance_mirror records the specific destination failure. The source
+            # sync has already committed and is independently successful.
+            return
 
     @staticmethod
     def _projection(version):
@@ -1784,6 +2141,346 @@ class LibraryEnrichmentProvider(PluginProvider):
                                      "uri": f"library://playlist/{job['destination_item_id']}", "name": job["requested_name"],
                                      "builtin_provider_instance": job.get("destination_provider_instance")}
         return result
+
+    @staticmethod
+    def _mirror_projection(version: dict, subscription: dict) -> tuple[dict, str, list[str]]:
+        """A stable Spotify-reference mirror, separate from archive copies and playback policy."""
+        ids, omitted = [], []
+        for occurrence in version["occurrences"]:
+            source_id = occurrence.get("source_item_id")
+            if occurrence.get("state") == "track" and isinstance(source_id, str) \
+                    and re.fullmatch(r"[A-Za-z0-9]{22}", source_id):
+                ids.append(source_id)
+            else:
+                omitted.append({"position": occurrence["position"], "state": occurrence.get("state", "invalid")})
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", subscription.get("name") or "Spotify playlist").strip()
+        name = f"{name[:120] or 'Spotify playlist'} - mirror"
+        document = {"name": name, "ids": ids, "omitted": omitted}
+        digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        uris = [f"spotify://track/{item}" for item in ids]
+        m3u = "#EXTM3U\n#PLAYLIST:" + name + "\n" + "".join(f"{uri}\n" for uri in uris)
+        preview = {"subscription_id": subscription["id"], "version_id": version["id"], "name": name,
+                   "source_count": version["total"], "projected_count": len(ids), "omitted_count": len(omitted),
+                   "omitted": omitted, "projection_digest": digest, "requires_partial_consent": bool(omitted)}
+        return preview, m3u, uris
+
+    async def mirror_status(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        mirror = await self._read_store(self._store.get_mirror, subscription_id)
+        return mirror or {"subscription_id": subscription_id, "revision": 0, "enabled": 0,
+                          "allow_partial": 0, "state": "disabled", "destination_item_id": None}
+
+    async def mirror_preview(self, subscription_id: str) -> dict[str, Any]:
+        self._authorize()
+        subscription = await self._read_store(self._store.get_subscription, subscription_id)
+        if not subscription["committed_version_id"]:
+            raise InvalidDataError("Capture this source before creating a maintained mirror")
+        version = await self._read_store(self._store.get_version, subscription["committed_version_id"])
+        preview, _, _ = self._mirror_projection(version, subscription)
+        return preview
+
+    async def mirror_configure(self, subscription_id: str, enabled: bool, allow_partial: bool,
+                               expected_revision: int) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Configuring a maintained mirror requires library write permission")
+        async with self._write_lock:
+            try:
+                return await self._store_operation(
+                    self._store.configure_mirror, subscription_id, enabled, allow_partial, expected_revision,
+                )
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+
+    async def mirror_apply(self, subscription_id: str, expected_version_id: str,
+                           expected_digest: str) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Applying a maintained mirror requires library write permission")
+        async with self._write_lock:
+            return await self._advance_mirror(subscription_id, expected_version_id, expected_digest)
+
+    async def mirror_detach(self, subscription_id: str, expected_destination_item_id: str,
+                            expected_content_digest: str | None = None) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Detaching a maintained mirror requires library write permission")
+        async with self._write_lock:
+            try:
+                return await self._store_operation(
+                    self._store.detach_mirror, subscription_id, expected_destination_item_id,
+                    expected_content_digest,
+                )
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+
+    async def _destination_rebind(
+        self, kind: str, subscription_id: str, candidate_item_id: str, *,
+        apply: bool = False, expected_old_item_id: str | None = None,
+        expected_content_digest: str | None = None,
+        expected_observed_digest: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        user = self._authorize()
+        if apply and not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Rebinding a playlist requires library write permission")
+        if kind not in ("mirror", "playback") or not isinstance(candidate_item_id, str) \
+                or not 1 <= len(candidate_item_id) <= 128:
+            raise InvalidDataError("Select a mirror or playback destination and exact playlist ID")
+        read = self._store_operation if apply else self._read_store
+        row = await read(
+            self._store.get_mirror if kind == "mirror" else self._store.get_playback_projection,
+            subscription_id,
+        )
+        if row is None or row["state"] != "applied" or not row.get("destination_item_id") \
+                or not row.get("destination_content_digest"):
+            raise InvalidDataError("Only an applied destination with verified content can be rebound")
+        old_item_id = row["destination_item_id"]
+        if candidate_item_id == old_item_id:
+            raise InvalidDataError("Choose a different playlist ID")
+        if await read(self._store.mirror_destination_claimed, subscription_id, candidate_item_id):
+            raise InvalidDataError("Replacement playlist is claimed by another operation")
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)) \
+                or not callable(getattr(builtin, "_get_playlist_lock", None)):
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        try:
+            destination = await self.mass.music.playlists.get_library_item(candidate_item_id)
+        except Exception:
+            raise InvalidDataError("Candidate playlist is unavailable") from None
+        if str(destination.item_id) != candidate_item_id:
+            raise InvalidDataError("Candidate playlist identity changed")
+        mapping = next((m for m in destination.provider_mappings
+                        if m.provider_instance == builtin.instance_id), None)
+        if mapping is None:
+            raise InvalidDataError("Candidate is not a playlist of the configured builtin provider")
+        async with builtin._get_playlist_lock(mapping.item_id):
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            observed_digest = hashlib.sha256(raw.encode()).hexdigest()
+            matches = observed_digest == row["destination_content_digest"]
+            result = {
+                "kind": kind, "subscription_id": subscription_id,
+                "old_item_id": old_item_id, "candidate_item_id": candidate_item_id,
+                "expected_content_digest": row["destination_content_digest"],
+                "observed_content_digest": observed_digest,
+                "revision": row.get("revision") if kind == "mirror" else None,
+                "classification": "exact_content" if matches else "mismatch",
+            }
+            if apply:
+                if expected_old_item_id != old_item_id or expected_content_digest != row["destination_content_digest"] \
+                        or expected_observed_digest != observed_digest or not matches \
+                        or (kind == "mirror" and expected_revision != row["revision"]):
+                    raise InvalidDataError("Destination changed or contents differ; inspect again")
+                try:
+                    result["destination"] = await self._store_operation(
+                        self._store.rebind_destination, kind, subscription_id,
+                        old_item_id, candidate_item_id, builtin.instance_id,
+                        observed_digest, expected_revision,
+                    )
+                except ValueError as err:
+                    raise InvalidDataError(str(err)) from None
+            return result
+
+    async def destination_rebind_inspect(
+        self, kind: str, subscription_id: str, candidate_item_id: str,
+    ) -> dict[str, Any]:
+        """Compare one replacement playlist against the saved destination bytes."""
+        return await self._destination_rebind(kind, subscription_id, candidate_item_id)
+
+    async def destination_rebind_apply(
+        self, kind: str, subscription_id: str, candidate_item_id: str,
+        expected_old_item_id: str, expected_content_digest: str,
+        expected_observed_digest: str, expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly rebind an exact replacement after previewing its content."""
+        async with self._write_lock:
+            return await self._destination_rebind(
+                kind, subscription_id, candidate_item_id, apply=True,
+                expected_old_item_id=expected_old_item_id,
+                expected_content_digest=expected_content_digest,
+                expected_observed_digest=expected_observed_digest,
+                expected_revision=expected_revision,
+            )
+
+    async def mirror_reconcile_preview(self, subscription_id: str,
+                                       candidate_item_id: str | None = None) -> dict[str, Any]:
+        self._authorize()
+        async with self._write_lock:
+            return await self._inspect_mirror_recovery(subscription_id, candidate_item_id)
+
+    async def mirror_reconcile(self, subscription_id: str, candidate_item_id: str,
+                               expected_revision: int, expected_target_digest: str,
+                               expected_observed_content_digest: str) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Reconciling a mirror requires library write permission")
+        async with self._write_lock:
+            result = await self._inspect_mirror_recovery(
+                subscription_id, candidate_item_id, expected_revision,
+                expected_target_digest, expected_observed_content_digest, apply=True,
+            )
+            return result["mirror"]
+
+    async def mirror_abandon_uncertain(self, subscription_id: str, expected_revision: int,
+                                      expected_target_digest: str) -> dict[str, Any]:
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Abandoning an uncertain mirror requires library write permission")
+        async with self._write_lock:
+            try:
+                return await self._store_operation(self._store.abandon_uncertain_mirror,
+                                                   subscription_id, expected_revision, expected_target_digest)
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+
+    async def _inspect_mirror_recovery(
+        self, subscription_id: str, candidate_item_id: str | None,
+        expected_revision: int | None = None, expected_target_digest: str | None = None,
+        expected_observed_content_digest: str | None = None, apply: bool = False,
+    ) -> dict[str, Any]:
+        mirror = await self._store_operation(self._store.get_mirror, subscription_id)
+        if mirror is None or mirror["state"] != "uncertain" or not mirror["target_version_id"]:
+            raise InvalidDataError("No uncertain mirror write is awaiting reconciliation")
+        if apply and (mirror["revision"] != expected_revision or mirror["target_digest"] != expected_target_digest):
+            raise InvalidDataError("Mirror reconciliation checkpoint changed; inspect again")
+        item_id = candidate_item_id or mirror["destination_item_id"]
+        if not isinstance(item_id, str) or not 1 <= len(item_id) <= 128:
+            raise InvalidDataError("Select the exact Music Assistant playlist ID to inspect")
+        if mirror["destination_item_id"] and item_id != mirror["destination_item_id"]:
+            raise InvalidDataError("The uncertain write has a different recorded destination")
+        if await self._store_operation(self._store.mirror_destination_claimed, subscription_id, item_id):
+            raise InvalidDataError("This playlist is already managed by another operation")
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)) \
+                or not callable(getattr(builtin, "_get_playlist_lock", None)):
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        destination = await self.mass.music.playlists.get_library_item(item_id)
+        if str(destination.item_id) != item_id:
+            raise InvalidDataError("Candidate playlist identity changed")
+        mapping = next((m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None)
+        if mapping is None:
+            raise InvalidDataError("Candidate is not a playlist of the configured builtin provider")
+        subscription = await self._store_operation(self._store.get_subscription, subscription_id)
+        version = await self._store_operation(self._store.get_version, mirror["target_version_id"])
+        preview, _, target_uris = self._mirror_projection(version, subscription)
+        async with builtin._get_playlist_lock(mapping.item_id):
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            observed_digest = hashlib.sha256(raw.encode()).hexdigest()
+            actual_uris = [line.strip() for line in raw.splitlines()
+                           if line.strip() and not line.lstrip().startswith("#")]
+            target_matches = actual_uris == target_uris
+            if mirror["destination_item_id"] is None:
+                # An unrecorded creation must also have the expected mirror title;
+                # an unrelated empty playlist must not be claimed by URI equality.
+                target_matches = target_matches and f"#PLAYLIST:{preview['name']}" in raw.splitlines()
+            previous_matches = bool(mirror["destination_item_id"] and
+                                    observed_digest == mirror["destination_content_digest"])
+            classification = ("matches_target" if target_matches else
+                              "unchanged_previous" if previous_matches else "mismatch")
+            result = {"subscription_id": subscription_id, "candidate_item_id": item_id,
+                      "target_version_id": mirror["target_version_id"],
+                      "target_digest": mirror["target_digest"], "revision": mirror["revision"],
+                      "observed_content_digest": observed_digest, "classification": classification,
+                      "observed_count": len(actual_uris), "target_count": len(target_uris)}
+            if apply:
+                if observed_digest != expected_observed_content_digest:
+                    raise InvalidDataError("Candidate playlist changed; inspect again")
+                if classification == "matches_target":
+                    result["mirror"] = await self._store_operation(
+                        self._store.reconcile_mirror_applied, subscription_id, mirror["revision"],
+                        mirror["target_digest"], item_id, builtin.instance_id, observed_digest,
+                    )
+                elif classification == "unchanged_previous":
+                    result["mirror"] = await self._store_operation(
+                        self._store.reconcile_mirror_unwritten, subscription_id, mirror["revision"],
+                        mirror["target_digest"], observed_digest,
+                    )
+                else:
+                    raise InvalidDataError("Candidate differs from both target and previous content; preserve it")
+            return result
+
+    async def _advance_mirror(self, subscription_id: str, expected_version_id: str | None = None,
+                              expected_digest: str | None = None) -> dict[str, Any]:
+        """Advance a committed source mirror; never make archive sync depend on destination writes."""
+        subscription = await self._store_operation(self._store.get_subscription, subscription_id)
+        version_id = subscription["committed_version_id"]
+        if not version_id or (expected_version_id is not None and version_id != expected_version_id):
+            raise InvalidDataError("Committed source changed; preview the mirror again")
+        mirror = await self._store_operation(self._store.get_mirror, subscription_id)
+        if mirror is None or not mirror["enabled"] or mirror["state"] in ("uncertain", "conflict", "writing"):
+            raise InvalidDataError("Mirror is disabled or requires reconciliation")
+        version = await self._store_operation(self._store.get_version, version_id)
+        preview, m3u, uris = self._mirror_projection(version, subscription)
+        digest = preview["projection_digest"]
+        if expected_digest is not None and expected_digest != digest:
+            raise InvalidDataError("Mirror preview changed; review it again")
+        if preview["requires_partial_consent"] and not mirror["allow_partial"]:
+            await self._store_operation(self._store.fail_mirror, subscription_id,
+                                        "Source contains unsupported occurrences; approve a partial mirror")
+            raise InvalidDataError("Source contains unsupported occurrences; approve a partial mirror")
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not all(callable(getattr(builtin, name, None)) for name in
+                                      ("_read_m3u_file", "_write_m3u_file", "_get_playlist_lock")):
+            await self._store_operation(self._store.fail_mirror, subscription_id, "Builtin playlist provider unavailable")
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        started = False
+        try:
+            if mirror["destination_item_id"]:
+                destination = await self.mass.music.playlists.get_library_item(mirror["destination_item_id"])
+                mapping = next((m for m in destination.provider_mappings
+                                if m.provider_instance == builtin.instance_id), None)
+                if mapping is None:
+                    raise MirrorDestinationConflict("Mirror destination lost its builtin mapping")
+                async with builtin._get_playlist_lock(mapping.item_id):
+                    current_raw = await builtin._read_m3u_file(mapping.item_id)
+                    if hashlib.sha256(current_raw.encode()).hexdigest() != mirror["destination_content_digest"]:
+                        raise MirrorDestinationConflict("Mirror destination was edited; detach it before creating another")
+                    if mirror["state"] == "applied" and mirror["applied_digest"] == digest:
+                        return await self._store_operation(
+                            self._store.advance_mirror_unchanged, subscription_id, version_id, digest,
+                        )
+                    await self._store_operation(self._store.prepare_mirror, subscription_id, version_id, digest)
+                    playlist_helpers = importlib.import_module("music_assistant.helpers.playlists")
+                    await self._store_operation(self._store.mark_mirror_writing, subscription_id)
+                    started = True
+                    await builtin._write_m3u_file(mapping.item_id, preview["name"], playlist_helpers.parse_m3u(m3u))
+                    raw = await builtin._read_m3u_file(mapping.item_id)
+                    self._verify_mirror_contents(raw, uris)
+                    return await self._store_operation(self._store.commit_mirror, subscription_id,
+                                                       str(destination.item_id), builtin.instance_id, digest,
+                                                       hashlib.sha256(raw.encode()).hexdigest())
+            await self._store_operation(self._store.prepare_mirror, subscription_id, version_id, digest)
+            await self._store_operation(self._store.mark_mirror_writing, subscription_id)
+            started = True
+            destination = await self.mass.music.playlists.import_playlist(m3u, library_matching=False)
+            mapping = next((m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None)
+            if mapping is None:
+                raise InvalidDataError("Created mirror has no expected builtin mapping")
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            self._verify_mirror_contents(raw, uris)
+            return await self._store_operation(self._store.commit_mirror, subscription_id,
+                                               str(destination.item_id), builtin.instance_id, digest,
+                                               hashlib.sha256(raw.encode()).hexdigest())
+        except BaseException as err:
+            await self._store_operation(
+                self._store.fail_mirror, subscription_id,
+                str(err) if isinstance(err, MirrorDestinationConflict) else
+                "Mirror write outcome uncertain" if started else "Mirror update failed before writing",
+                started, isinstance(err, MirrorDestinationConflict),
+            )
+            if isinstance(err, asyncio.CancelledError):
+                raise
+            if isinstance(err, MirrorDestinationConflict):
+                raise InvalidDataError(str(err)) from None
+            if started:
+                raise InvalidDataError("Mirror write outcome uncertain; inspect builtin playlists") from None
+            raise InvalidDataError("Mirror update failed before writing") from None
+
+    @staticmethod
+    def _verify_mirror_contents(raw: str, expected_uris: list[str]) -> None:
+        actual = [line.strip() for line in raw.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        if actual != expected_uris:
+            raise InvalidDataError("Mirror destination differs from the committed source projection")
 
     async def playback_policy(self, subscription_id: str) -> dict[str, Any]:
         """Return the explicit source-selection policy for one subscription."""
@@ -1900,6 +2597,23 @@ class LibraryEnrichmentProvider(PluginProvider):
         )
         return {"policy": policy, "projection": self._playback_result(projection, subscription_id)}
 
+    async def playback_detach(self, subscription_id: str, expected_destination_item_id: str,
+                              expected_content_digest: str | None = None) -> dict[str, Any]:
+        """Explicitly release an edited destination, leaving its playlist untouched."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Detaching a playback projection requires library write permission")
+        async with self._write_lock:
+            try:
+                old = await self._store_operation(
+                    self._store.detach_playback_projection, subscription_id,
+                    expected_destination_item_id, expected_content_digest,
+                )
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+            return {"subscription_id": subscription_id, "state": "not_applied",
+                    "detached_destination": self._playback_result(old, subscription_id)["destination"]}
+
     async def playback_apply(self, version_id: str, expected_digest: str, expected_policy_revision: int,
                              allow_partial: bool = False) -> dict[str, Any]:
         user = self._authorize()
@@ -1921,20 +2635,37 @@ class LibraryEnrichmentProvider(PluginProvider):
             builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
             if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)):
                 raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+            previous = await self._store_operation(self._store.get_playback_projection, version["subscription_id"])
+            if previous and previous.get("destination_item_id") and (
+                previous["state"] != "applied" or not previous.get("destination_content_digest")
+            ):
+                raise InvalidDataError("Playback destination needs reconciliation before it can be rewritten")
             row = await self._store_operation(
                 self._store.prepare_playback_projection, version["subscription_id"], version_id, policy["revision"],
                 expected_digest, preview["source_count"], preview["projected_count"], json.dumps(preview["gaps"])
             )
             started = False
             try:
-                await self._store_operation(self._store.mark_playback_projection_writing, version["subscription_id"])
-                started = True
                 m3u_rows = []
                 for projected, uri in zip(preview["rows"], uris, strict=True):
                     if projected["strict_provider"]:
                         m3u_rows.append(f"#EXTPROV:local_only||{projected['strict_provider']}\n")
                     m3u_rows.append(f"{uri}\n")
                 m3u = "#EXTM3U\n#PLAYLIST:" + preview["name"] + "\n" + "".join(m3u_rows)
+                expected = [(uri, projected["strict_provider"]) for projected, uri in zip(preview["rows"], uris, strict=True)]
+
+                def verify_contents(raw: str) -> None:
+                    persisted, pending_strict = [], None
+                    for raw_line in raw.splitlines():
+                        line = raw_line.strip()
+                        if line.startswith("#EXTPROV:local_only||"):
+                            pending_strict = line.removeprefix("#EXTPROV:local_only||")
+                        elif line and not line.startswith("#"):
+                            persisted.append((line, pending_strict))
+                            pending_strict = None
+                    if pending_strict is not None or persisted != expected:
+                        raise InvalidDataError("Playback playlist contents differ from the approved ordered projection")
+
                 if row.get("destination_item_id"):
                     destination = await self.mass.music.playlists.get_library_item(row["destination_item_id"])
                     mapping = next(
@@ -1942,34 +2673,46 @@ class LibraryEnrichmentProvider(PluginProvider):
                     )
                     if mapping is None:
                         raise InvalidDataError("Playback destination lost its builtin mapping")
-                    playlist_helpers = importlib.import_module("music_assistant.helpers.playlists")
-                    await builtin._write_m3u_file(mapping.item_id, preview["name"], playlist_helpers.parse_m3u(m3u))
+                    async with builtin._get_playlist_lock(mapping.item_id):
+                        current_raw = await builtin._read_m3u_file(mapping.item_id)
+                        if hashlib.sha256(current_raw.encode()).hexdigest() != previous["destination_content_digest"]:
+                            raise InvalidDataError("Playback destination was edited; preserve it and reconcile")
+                        playlist_helpers = importlib.import_module("music_assistant.helpers.playlists")
+                        await self._store_operation(self._store.mark_playback_projection_writing, version["subscription_id"])
+                        started = True
+                        await builtin._write_m3u_file(mapping.item_id, preview["name"], playlist_helpers.parse_m3u(m3u))
+                        raw = await builtin._read_m3u_file(mapping.item_id)
+                        verify_contents(raw)
+                        row = await self._store_operation(
+                            self._store.commit_playback_projection, version["subscription_id"],
+                            str(destination.item_id), builtin.instance_id, expected_digest,
+                            hashlib.sha256(raw.encode()).hexdigest(),
+                        )
                 else:
+                    await self._store_operation(self._store.mark_playback_projection_writing, version["subscription_id"])
+                    started = True
                     destination = await self.mass.music.playlists.import_playlist(m3u, library_matching=False)
                     mapping = next(
                         (m for m in destination.provider_mappings if m.provider_instance == builtin.instance_id), None
                     )
-                if mapping is None:
-                    raise InvalidDataError("Created playback playlist has no expected builtin mapping")
-                raw = await builtin._read_m3u_file(mapping.item_id)
-                persisted, pending_strict = [], None
-                for raw_line in raw.splitlines():
-                    line = raw_line.strip()
-                    if line.startswith("#EXTPROV:local_only||"):
-                        pending_strict = line.removeprefix("#EXTPROV:local_only||")
-                    elif line and not line.startswith("#"):
-                        persisted.append((line, pending_strict))
-                        pending_strict = None
-                expected = [(uri, row["strict_provider"]) for row, uri in zip(preview["rows"], uris, strict=True)]
-                if pending_strict is not None or persisted != expected:
-                    raise InvalidDataError("Playback playlist contents differ from the approved ordered projection")
-                row = await self._store_operation(self._store.commit_playback_projection, version["subscription_id"],
-                                                  str(destination.item_id), builtin.instance_id, expected_digest)
+                    if mapping is None:
+                        raise InvalidDataError("Created playback playlist has no expected builtin mapping")
+                    raw = await builtin._read_m3u_file(mapping.item_id)
+                    verify_contents(raw)
+                    row = await self._store_operation(
+                        self._store.commit_playback_projection, version["subscription_id"],
+                        str(destination.item_id), builtin.instance_id, expected_digest,
+                        hashlib.sha256(raw.encode()).hexdigest(),
+                    )
             except BaseException as err:
                 await self._store_operation(self._store.fail_playback_projection, version["subscription_id"],
-                                            "Playback projection outcome uncertain" if started else "Unable to prepare playback projection",
+                                            "Playback projection outcome uncertain" if started else
+                                            str(err) if isinstance(err, InvalidDataError) else
+                                            "Unable to prepare playback projection",
                                             started)
                 if isinstance(err, asyncio.CancelledError):
+                    raise
+                if not started and isinstance(err, InvalidDataError):
                     raise
                 raise InvalidDataError("Playback projection outcome uncertain; inspect builtin playlists") from None
             return self._playback_result(row, version["subscription_id"])

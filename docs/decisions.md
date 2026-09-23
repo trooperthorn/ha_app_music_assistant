@@ -39,16 +39,12 @@ failure was actually caused by the version bump; the other six were a
 latent gap in test coverage that the bump happened to surface at the same
 time.
 
-**Gap in the automation.** `scripts/sync_upstream.py` resolves and writes
-`SERVER_VERSION`/`SERVER_DIGEST` and the upstream app config, but it does not
-run `pytest tests/test_patches.py` (or any test) against the new pin before
-`sync-upstream.yml` opens its auto-merging PR, and it never touches
-`tests/fixtures/`. A pin bump that breaks a patch anchor, or that ships with
-a fixture that was already broken, merges to main unnoticed until someone
-runs the suite by hand. This is a documentation-only observation: the sync
-workflow and script are left as they are; whether to add a fixture-refresh
-and `pytest tests/test_patches.py` step to `sync-upstream.yml` (failing the
-auto-merge, or opening a draft PR instead) is for a human to decide.
+**Compatibility gate.** `scripts/sync_upstream.py` resolves and writes
+`SERVER_VERSION`/`SERVER_DIGEST` and the upstream app config, but does not
+refresh `tests/fixtures/`. The sync workflow now runs the patch fixture suite
+after updating pins and before publishing its auto-merging PR. A server bump
+must wait for reviewed fixtures and patch anchors when that suite fails;
+frontend-only or digest-only changes continue if the current fixtures pass.
 
 ## Build on the host, no registry image (2026-09-12)
 

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import os
 import re
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -18,7 +22,16 @@ import hass_source_select as patch  # noqa: E402
 import library_trash as trash  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
+import sendspin_availability as availability  # noqa: E402
+import sendspin_cast_delay as cast_delay  # noqa: E402
+import sendspin_cast_status as cast_status  # noqa: E402
+import sendspin_controller_switch as switch  # noqa: E402
+import sendspin_discovery_status as discovery  # noqa: E402
+import sendspin_non_audio_clients as non_audio  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
+import sendspin_output_delay_compat as output_delay  # noqa: E402
+import sendspin_source_status as source_status  # noqa: E402
+import sendspin_timing_status as timing  # noqa: E402
 
 # streams_audio_2_10_4.py and sendspin_player_2_10_4.py are verbatim pinned
 # copies of upstream, which deliberately uses PEP 758
@@ -38,7 +51,642 @@ STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_4.py"
 # aiosendspin as server 2.10.4 pins it (aiosendspin[server]==9.1.1)
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
+AIOSENDSPIN_TYPES = ROOT / "tests" / "fixtures" / "aiosendspin_types_9_1_1.py"
+AIOSENDSPIN_PLAYER_MODEL = ROOT / "tests" / "fixtures" / "aiosendspin_player_model_9_1_1.py"
+AIOSENDSPIN_CLIENT = ROOT / "tests" / "fixtures" / "aiosendspin_client_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
+CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
+SENDSPIN_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_provider_2_10_4.py"
+SENDSPIN_SOURCE_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_source_provider_2_10_4.py"
+
+
+@requires_py314
+def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() -> None:
+    sources = {
+        output_delay.TYPES: AIOSENDSPIN_TYPES.read_text(encoding="utf-8"),
+        output_delay.MODEL: AIOSENDSPIN_PLAYER_MODEL.read_text(encoding="utf-8"),
+        output_delay.ROLE: opus.apply(
+            AIOSENDSPIN_PLAYER_V1.read_text(encoding="utf-8"), opus.EDITS[opus.PLAYER_ROLE]
+        ),
+        output_delay.PROVIDER: timing.apply(cast_delay.apply(opus.apply(
+            SENDSPIN_PLAYER.read_text(encoding="utf-8"), opus.EDITS[opus.PROVIDER]
+        ))),
+    }
+    patched = {module: output_delay.apply(source, module) for module, source in sources.items()}
+    assert all(output_delay.apply(source, module) == source for module, source in patched.items())
+    assert 'SET_OUTPUT_DELAY = "set_output_delay"' in patched[output_delay.TYPES]
+    assert 'output_delay_ms: int | None = None' in patched[output_delay.MODEL]
+    assert 'format: SupportedAudioFormat | None = None' in patched[output_delay.MODEL]
+    assert 'supported_commands: list[PlayerCommand] = field(default_factory=list)' in patched[output_delay.MODEL]
+    assert 'PlayerCommand.VOLUME, PlayerCommand.MUTE' in patched[output_delay.MODEL]
+    assert 'command = PlayerCommand.SET_OUTPUT_DELAY' in patched[output_delay.ROLE]
+    assert 'command = PlayerCommand.SET_STATIC_DELAY' in patched[output_delay.ROLE]
+    assert 'PlayerCommand.SET_OUTPUT_DELAY}' in patched[output_delay.PROVIDER]
+    assert ("self._client_format_override_active = False\n"
+            "        self._ensure_preferred_format()") in patched[output_delay.ROLE]
+    assert "sendspin_output_delay_compat.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="anchor found 0 times"):
+        output_delay.apply("class PlayerStatePayload: pass", output_delay.MODEL)
+
+    role_tree = ast.parse(patched[output_delay.ROLE])
+    role_class = next(node for node in role_tree.body if isinstance(node, ast.ClassDef) and node.name == "PlayerV1Role")
+    methods = [node for node in role_class.body if isinstance(node, ast.FunctionDef)
+               and node.name in ("set_volume", "set_mute", "set_static_delay")]
+    class_source = "class Role:\n" + "\n".join(
+        "\n".join("    " + line for line in ast.unparse(method).splitlines()) for method in methods
+    )
+    commands = SimpleNamespace(
+        VOLUME="volume", MUTE="mute", SET_STATIC_DELAY="set_static_delay", SET_OUTPUT_DELAY="set_output_delay"
+    )
+    namespace = {
+        "PlayerCommand": commands,
+        "ServerCommandMessage": lambda payload: payload,
+        "ServerCommandPayload": lambda player: player,
+        "PlayerCommandPayload": lambda **kwargs: kwargs,
+    }
+    exec(class_source, namespace)  # noqa: S102
+    role = namespace["Role"]()
+    sent = []
+    role._client = SimpleNamespace(
+        info=SimpleNamespace(player_support=SimpleNamespace(supported_commands=[])), send_message=sent.append
+    )
+    role.state_supported_commands = ["volume", "mute", "set_output_delay"]
+    role.set_volume(42)
+    role.set_mute(True)
+    role.set_static_delay(250)
+    assert sent == [
+        {"command": "volume", "volume": 42},
+        {"command": "mute", "mute": True},
+        {"command": "set_output_delay", "output_delay_ms": 250},
+    ]
+    sent.clear()
+    role.state_supported_commands = ["set_static_delay"]
+    role.set_static_delay(250)
+    assert sent == [{"command": "set_static_delay", "static_delay_ms": 250}]
+    sent.clear()
+    role.state_supported_commands = []
+    role.set_static_delay(250)
+    assert sent == []
+
+    state_method = next(node for node in role_class.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "on_client_state")
+    format_branch = next(node for node in state_method.body if isinstance(node, ast.If)
+                         and ast.unparse(node.test) == "state.format is not None")
+    format_source = "def apply_format(self, state):\n" + "\n".join(
+        "    " + line for line in ast.unparse(format_branch).splitlines()
+    )
+    namespace.update({
+        "StreamRequestFormatPlayer": lambda **kwargs: SimpleNamespace(**kwargs),
+        "StreamRequestFormatPayload": lambda player: SimpleNamespace(player=player),
+    })
+    exec(format_source, namespace)  # noqa: S102
+    requested = []
+    format_role = SimpleNamespace(on_stream_request_format=requested.append,
+                                  _client_format_override_active=False)
+    format_state = SimpleNamespace(format=SimpleNamespace(codec="pcm", sample_rate=48000, channels=2, bit_depth=16))
+    namespace["apply_format"](format_role, format_state)
+    assert vars(requested[0].player) == {"codec": "pcm", "sample_rate": 48000, "channels": 2, "bit_depth": 16}
+    assert format_role._client_format_override_active is True
+
+    transitions = []
+    active_format = ["pcm"]
+    format_role._effective_format = lambda: active_format[0]
+    def restore_format() -> None:
+        transitions.append("restore")
+        active_format[0] = "flac"
+    format_role._ensure_preferred_format = restore_format
+    format_role._ensure_audio_requirements = lambda **kwargs: transitions.append("requirements")
+    format_role._begin_format_transition = lambda: transitions.append("transition")
+    format_role._client = SimpleNamespace(group=SimpleNamespace(has_active_stream=True))
+    namespace["apply_format"](format_role, SimpleNamespace(format=None))
+    assert format_role._client_format_override_active is False
+    assert transitions == ["restore", "requirements", "transition"]
+
+    provider_tree = ast.parse(patched[output_delay.PROVIDER])
+    player_class = next(node for node in provider_tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "SendspinPlayer")
+    event_method = next(node for node in player_class.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "event_cb")
+    event_match = next(node for node in event_method.body if isinstance(node, ast.Match))
+    volume_case = event_match.cases[0]
+    body = "\n".join("    " + line for statement in volume_case.body
+                     for line in ast.unparse(statement).splitlines())
+    namespace.update({"PlayerFeature": SimpleNamespace(VOLUME_SET="set", VOLUME_MUTE="mute")})
+    exec("def update(self, volume, muted):\n" + body, namespace)  # noqa: S102
+    player = SimpleNamespace(
+        _attr_supported_features=set(),
+        _player_role=SimpleNamespace(state_supported_commands=["volume", "mute"]),
+        api=SimpleNamespace(info=SimpleNamespace(player_support=SimpleNamespace(supported_commands=[]))),
+        update_state=lambda: None,
+    )
+    namespace["update"](player, 35, False)
+    assert player._attr_supported_features == {"set", "mute"}
+    player._player_role.state_supported_commands = []
+    namespace["update"](player, 35, False)
+    assert player._attr_supported_features == set()
+
+
+@requires_py314
+def test_sendspin_occupied_client_updates_music_assistant_availability() -> None:
+    client_source = AIOSENDSPIN_CLIENT.read_text(encoding="utf-8")
+    player_source = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    client_patched = availability.apply(client_source, availability.CLIENT_MODULE)
+    player_patched = availability.apply(player_source, availability.PLAYER_MODULE)
+    assert availability.apply(client_patched, availability.CLIENT_MODULE) == client_patched
+    assert availability.apply(player_patched, availability.PLAYER_MODULE) == player_patched
+    assert "sendspin_availability.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    assert "self._attr_available = sendspin_client.available" in player_patched
+    with pytest.raises(SystemExit, match="anchor found 0 times"):
+        availability.apply("class SendspinClient: pass", availability.CLIENT_MODULE)
+
+    tree = ast.parse(client_patched)
+    client_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinClient")
+    method = next(
+        node for node in client_class.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_availability_change"
+    )
+    runtime = {}
+    method_source = "\n".join(
+        f"    {line}" for line in ast.unparse(method).splitlines()
+    )
+    exec("from __future__ import annotations\nclass TestClient:\n" + method_source, runtime)  # noqa: S102
+    updates = []
+    transitions = []
+    test_client = runtime["TestClient"]()
+    test_client._available = True
+    test_client._roles = {}
+    test_client._client_id = "occupied-speaker"
+    test_client._server = type("Server", (), {
+        "_signal_client_updated": lambda self, client_id: updates.append(client_id),
+    })()
+
+    async def transition():
+        transitions.append("solo-stopped")
+
+    test_client._handle_external_source_transition = transition
+    asyncio.run(test_client.handle_availability_change(False))
+    assert test_client._available is False
+    assert updates == ["occupied-speaker"]
+    assert transitions == ["solo-stopped"]
+    asyncio.run(test_client.handle_availability_change(True))
+    assert test_client._available is True
+    assert updates == ["occupied-speaker", "occupied-speaker"]
+    assert transitions == ["solo-stopped"]  # returning available never auto-rejoins
+
+
+@requires_py314
+def test_sendspin_source_status_and_guarded_stop() -> None:
+    original = SENDSPIN_SOURCE_PROVIDER.read_text(encoding="utf-8")
+    patched = source_status.apply(original)
+    assert source_status.apply(patched) == patched
+    assert '"sendspin_source/status"' in patched
+    assert "required_scope=Scope.CONFIG_PROVIDERS_READ" in patched
+    assert "self._status_unsubscribe()" in patched
+    assert "sendspin_source_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin source status anchor found 0 times"):
+        source_status.apply("class SendspinSourceProvider: pass")
+
+    tree = ast.parse(patched)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinSourceProvider")
+    method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "source_status")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+    runtime = {
+        "cast": cast,
+        "time": time,
+        "CONF_TARGET_LATENCY": "latency",
+        "DEFAULT_TARGET_LATENCY_MS": 100,
+        "create_uri": lambda media_type, instance, item: f"{instance}://{media_type}/{item}",
+        "MediaType": type("MediaType", (), {"AUDIO_SOURCE": "audio_source"}),
+        "PlayerCommandFailed": RuntimeError,
+    }
+    exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
+
+    client = type("Client", (), {"client_id": "source-a", "info_or_none": type("Info", (), {"name": "Turntable"})()})()
+    session = type(
+        "Session",
+        (),
+        {
+            "player_id": "living-room",
+            "owner_player_id": "living-room",
+            "playback_session_id": "session-1",
+            "bridge": type("Bridge", (), {"occupancy_us": 72_600})(),
+            "ingest_task": type("Task", (), {"done": lambda self: False})(),
+            "pcm_received": type("Event", (), {"is_set": lambda self: True})(),
+            "last_pcm_monotonic": time.monotonic() - 0.05,
+        },
+    )()
+    state = type("State", (), {"session": session, "signal": type("Signal", (), {"value": "present"})()})()
+    instance = runtime["Provider"]()
+    instance._clients = {"source-a": state}
+    instance._sendspin_provider = type("Sendspin", (), {"server_api": type("Server", (), {"connected_clients": [client]})()})()
+    instance._get_source_role = lambda _: object()
+    instance.instance_id = "sendspin_source--1"
+    instance.config = type("Config", (), {"get_value": lambda self, _: 80})()
+    result = asyncio.run(instance.source_status())
+    assert result["api_version"] == 1
+    assert result["target_latency_ms"] == 80
+    assert result["sources"][0]["signal"] == "present"
+    assert result["sources"][0]["selected_player_id"] == "living-room"
+    assert result["sources"][0]["source_uri"] == "sendspin_source--1://audio_source/source-a"
+    assert result["sources"][0]["playback_session_id"] == "session-1"
+    assert result["sources"][0]["receiving_pcm"] is True
+    assert 0 <= result["sources"][0]["last_pcm_age_ms"] < 1000
+    assert result["sources"][0]["bridge_buffer_ms"] == 73
+    assert "measured_latency_ms" not in result
+    session.last_pcm_monotonic = time.monotonic() - 3
+    stale = asyncio.run(instance.source_status())
+    assert stale["sources"][0]["receiving_pcm"] is False
+    assert stale["sources"][0]["last_pcm_age_ms"] >= 2000
+    assert stale["sources"][0]["bridge_buffer_ms"] is None
+
+    stop_method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "stop_source")
+    stop_source = "\n".join(f"    {line}" for line in ast.unparse(stop_method).splitlines())
+    exec("from __future__ import annotations\nclass StopProvider:\n" + stop_source, runtime)  # noqa: S102
+    stops = []
+    checks = []
+
+    async def deselect_source(player_id, **kwargs):
+        stops.append((player_id, kwargs))
+
+    stopper = runtime["StopProvider"]()
+    stopper._clients = instance._clients
+    stopper.instance_id = instance.instance_id
+    stopper.mass = type("Mass", (), {
+        "player_queues": type("Queues", (), {"_check_player_permission": lambda self, player: checks.append(player)})(),
+        "players": type("Players", (), {"deselect_source": staticmethod(deselect_source)})(),
+    })()
+    with pytest.raises(RuntimeError, match="selection changed"):
+        asyncio.run(stopper.stop_source("source-a", "stale-session"))
+    assert not stops
+    asyncio.run(stopper.stop_source("source-a", "session-1"))
+    assert checks == ["living-room"]
+    assert stops == [("living-room", {
+        "provider_instance_id": "sendspin_source--1",
+        "source_id": "source-a",
+        "playback_session_id": "session-1",
+    })]
+
+
+@requires_py314
+def test_sendspin_non_audio_roles_never_create_audio_player() -> None:
+    original = SENDSPIN_PROVIDER.read_text(encoding="utf-8")
+    patched = non_audio.apply(discovery.apply(original))
+    assert non_audio.apply(patched) == patched
+    assert "sendspin_non_audio_clients.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin non-audio anchor found 0 times"):
+        non_audio.apply("class SendspinProvider: pass")
+
+    tree = ast.parse(patched)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinProvider")
+    method = next(node for node in provider.body if isinstance(node, ast.FunctionDef) and node.name == "_create_player")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+
+    class Audio:
+        def __init__(self, *_: object, **__: object) -> None:
+            self.static_delay_default_ms = None
+
+    class Display:
+        is_web_player = False
+
+        def __init__(self, *_: object, **__: object) -> None:
+            self._attr_supported_features = {"set_members"}
+
+    class Source:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+    kinds = type("Kinds", (), {"DISPLAY": "display", "VISUALIZER": "visualizer"})
+    runtime = {
+        "SendspinPlayer": Audio,
+        "SendspinVisualizerPlayer": Display,
+        "SendspinSourcePlayer": Source,
+        "PlayerType": kinds,
+        "role_family": lambda role: role.split("@", 1)[0],
+    }
+    exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
+    instance = runtime["Provider"]()
+    for attr in ("_bridge_identifiers", "_bridge_player_types", "_bridge_underlying_players", "_bridge_static_delay_defaults"):
+        setattr(instance, attr, {})
+
+    def create(*roles: str, product_name: str | None = None) -> object:
+        device_info = type("DeviceInfo", (), {"product_name": product_name})() if product_name else None
+        info = type("Info", (), {"device_info": device_info})()
+        client = type("Client", (), {"negotiated_role_ids": roles, "info": info})()
+        return instance._create_player("test-client", client, None)
+
+    assert isinstance(create("player@v1"), Audio)
+    assert isinstance(create("source@v1"), Source)
+    for role in ("metadata@v1", "artwork@v1", "color@v1", "visualizer@v1", "controller@v1"):
+        result = create(role)
+        assert isinstance(result, Display), role
+        assert result._attr_type in {"display", "visualizer"}
+        if role == "controller@v1":
+            assert result._attr_supported_features == set()
+        assert result.is_web_player is False
+    browser_display = create("metadata@v1", product_name="Music Assistant Display")
+    assert isinstance(browser_display, Display)
+    assert browser_display.is_web_player is True
+    assert browser_display._attr_private is True
+
+
+@requires_py314
+def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
+    patched = discovery.apply(SENDSPIN_PROVIDER.read_text(encoding="utf-8"))
+    assert discovery.apply(patched) == patched
+    assert "sendspin_discovery_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    assert '"sendspin/discovery_status"' in patched
+    assert '"sendspin/display_capabilities"' in patched
+    assert "required_scope=Scope.CONFIG_PROVIDERS_READ" in patched
+    assert "required_scope=Scope.PLAYERS_CONTROL" in patched
+    with pytest.raises(SystemExit, match="Sendspin discovery anchor found 0 times"):
+        discovery.apply("class SendspinProvider: pass")
+
+    tree = ast.parse(patched)
+    provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinProvider")
+    capabilities_method = next(
+        node for node in provider.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "display_capabilities"
+    )
+    capabilities_source = "\n".join(f"    {line}" for line in ast.unparse(capabilities_method).splitlines())
+    capabilities_runtime: dict[str, object] = {}
+    exec("from __future__ import annotations\nclass Provider:\n" + capabilities_source, capabilities_runtime)  # noqa: S102
+    assert asyncio.run(capabilities_runtime["Provider"]().display_capabilities()) == {
+        "api_version": 1, "browser_display_pairing": True,
+    }
+    method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "discovery_status")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+
+    def manual_url(address: str) -> str:
+        if address == "bad":
+            raise ValueError("invalid address")
+        if "://" in address:
+            return address
+        return f"ws://{address}/sendspin"
+
+    runtime = {
+        "_manual_client_url": manual_url,
+        "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
+        "SENDSPIN_SERVER_PORT": 8927,
+        "CONF_ALLOW_LEGACY_CLIENTS": "allow_legacy_clients",
+    }
+    exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
+    instance = runtime["Provider"]()
+    instance._manual_ip_config = (
+        "192.168.1.10", "bad", "ws://user:pass@192.168.1.11:8927/secret?token=abc",
+    )
+    instance.server_api = type(
+        "Server",
+        (),
+        {
+            "_tcp_site": object(),
+            "_mdns_service": object(),
+            "_mdns_browser": None,
+            "_mdns_client_urls": {"Living Room._sendspin._tcp.local.": "ws://192.168.1.20:8927/sendspin?token=hidden"},
+            "clients": [object(), object()],
+            "connected_clients": [object()],
+        },
+    )()
+    instance.mass = type("Mass", (), {"streams": type("Streams", (), {"bind_ip": "127.0.0.1", "publish_ip": "192.168.1.2"})()})()
+    instance.config = type("Config", (), {"get_value": lambda self, *_: False})()
+    status = asyncio.run(instance.discovery_status())
+    assert status["api_version"] == 1
+    assert status["listener_active"] is True
+    assert status["advertising_active"] is True
+    assert status["client_discovery_active"] is False
+    assert status["connected_clients"] == 1
+    assert status["manual_addresses"] == [
+        {"address": "ws://192.168.1.10", "valid": True},
+        {"address": "[invalid address]", "valid": False},
+        {"address": "ws://192.168.1.11:8927", "valid": True},
+    ]
+    assert status["discovered_services"] == [
+        {"name": "Living Room._sendspin._tcp.local.", "url": "ws://192.168.1.20:8927"},
+    ]
+    assert not any(secret in str(status) for secret in ("user", "pass", "secret", "token", "hidden"))
+    assert status["legacy_clients_allowed"] is False
+    assert "pairing" not in str(status).lower()
+
+
+@requires_py314
+def test_sendspin_timing_reports_are_observed_not_inferred_from_config() -> None:
+    original = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    patched = timing.apply(cast_delay.apply(opus.apply(original, opus.EDITS[opus.PROVIDER])))
+    assert timing.apply(patched) == patched
+    assert "sendspin_timing_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin timing anchor found 0 times"):
+        timing.apply("class SendspinPlayer: pass")
+    assert "self.extra_attributes.pop(key, None)" in patched
+
+    tree = ast.parse(patched)
+    player = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinPlayer")
+    method = next(node for node in player.body if isinstance(node, ast.FunctionDef) and node.name == "event_cb")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+
+    class Event:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class VolumeChangedEvent(Event):
+        pass
+
+    class StaticDelayChangedEvent(Event):
+        pass
+
+    class RequiredLeadTimeChangedEvent(Event):
+        pass
+
+    class MinBufferChangedEvent(Event):
+        pass
+
+    namespace = {
+        "VolumeChangedEvent": VolumeChangedEvent,
+        "StaticDelayChangedEvent": StaticDelayChangedEvent,
+        "RequiredLeadTimeChangedEvent": RequiredLeadTimeChangedEvent,
+        "MinBufferChangedEvent": MinBufferChangedEvent,
+        "time": __import__("time"),
+        "CONF_SENDSPIN_STATIC_DELAY": "sendspin_static_delay",
+    }
+    exec("from __future__ import annotations\nclass Player:\n" + method_source, namespace)  # noqa: S102
+    instance = namespace["Player"]()
+    instance.extra_attributes = {}
+    instance.logger = type("Logger", (), {"debug": lambda self, *_: None})()
+    instance.config = type("Config", (), {"get_value": lambda self, *_: 260})()
+    instance.static_delay_default_ms = 0
+    changes: list[str] = []
+    instance.update_state = lambda: changes.append("event")
+    instance.event_cb(None, StaticDelayChangedEvent(static_delay_ms=260))
+    instance.event_cb(None, RequiredLeadTimeChangedEvent(required_lead_time_ms=125))
+    instance.event_cb(None, MinBufferChangedEvent(min_buffer_ms=80))
+    assert instance.extra_attributes["sendspin_output_delay_ms"] == 260
+    assert instance.extra_attributes["sendspin_startup_lead_ms"] == 125
+    assert instance.extra_attributes["sendspin_min_buffer_ms"] == 80
+    assert instance.extra_attributes["sendspin_timing_reported_at"] > 0
+    assert changes == ["event", "event", "event"]
+
+
+@requires_py314
+def test_sendspin_switch_is_advertised_with_pinned_server_handler() -> None:
+    original = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    patched = switch.apply(timing.apply(cast_delay.apply(opus.apply(original, opus.EDITS[opus.PROVIDER]))))
+    assert switch.apply(patched) == patched
+    assert "sendspin_controller_switch.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin switch anchor found 0 times"):
+        switch.apply("SUPPORTED_GROUP_COMMANDS = []")
+
+    tree = ast.parse(patched)
+    commands = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "SUPPORTED_GROUP_COMMANDS" for target in node.targets)
+    )
+    names = [ast.unparse(item) for item in commands.value.elts]
+    assert names[-1] == "MediaCommand.SWITCH"
+    assert names.count("MediaCommand.SWITCH") == 1
+
+    controller = ROOT / "tests" / "fixtures" / "aiosendspin_controller_v1_9_1_1.py"
+    assert "handle_switch_command()" in controller.read_text(encoding="utf-8")
+
+
+@requires_py314
+def test_cast_receiver_states_reach_player_without_log_text() -> None:
+    original = CHROMECAST_SENDSPIN_BRIDGE.read_text(encoding="utf-8")
+    patched = cast_status.apply(original)
+    assert cast_status.apply(patched) == patched
+    assert "sendspin_cast_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Cast status anchor found 0 times"):
+        cast_status.apply("class SendspinCastController: pass")
+
+    tree = ast.parse(patched)
+    controller = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinCastController")
+
+    class BaseController:
+        def __init__(self, namespace):
+            self.namespace = namespace
+
+    class Logger:
+        def error(self, *_args):
+            pass
+
+    namespace = {
+        "BaseController": BaseController,
+        "SENDSPIN_CAST_NAMESPACE": "cast",
+        "_CAST_LOG_LEVEL_MAP": {},
+        "logging": __import__("logging"),
+    }
+    exec("from __future__ import annotations\n" + ast.unparse(controller), namespace)  # noqa: S102
+    seen: list[str] = []
+    receiver = namespace["SendspinCastController"](Logger(), on_cast_status=seen.append)
+    for state in ("connecting", "connected", "playing", "stopped", "error", "unknown"):
+        receiver._handle_status({"state": state, "message": "private receiver diagnostic"})
+    assert seen == ["connecting", "connected", "playing", "stopped", "error"]
+
+    bridge = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinChromecastBridge")
+    methods = [
+        node
+        for node in bridge.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_publish_cast_receiver_status", "_on_stream_start"}
+    ]
+    method_source = "\n".join("\n".join(f"    {line}" for line in ast.unparse(method).splitlines()) for method in methods)
+
+    class PlayerCommandFailed(Exception):
+        pass
+
+    runtime = {"PlayerCommandFailed": PlayerCommandFailed}
+    exec("from __future__ import annotations\nclass Bridge:\n" + method_source, runtime)  # noqa: S102
+    player = type("Player", (), {"extra_attributes": {}, "update_state": lambda self: seen.append("event")})()
+    bridge_instance = runtime["Bridge"]()
+    bridge_instance._bridge_client_id = "cast-id"
+    bridge_instance.mass = type(
+        "Mass",
+        (),
+        {
+            "players": type(
+                "Players",
+                (),
+                {
+                    "get_player": lambda self, _: player,
+                },
+            )()
+        },
+    )()
+    bridge_instance._publish_cast_receiver_status("connecting")
+    bridge_instance._publish_cast_receiver_status("connecting")
+    bridge_instance._publish_cast_receiver_status("error", "launch_timeout")
+    bridge_instance._publish_cast_receiver_status("error", "private receiver diagnostic")
+    assert player.extra_attributes == {
+        "sendspin_cast_state": "error",
+        "sendspin_cast_failure": "receiver_error",
+    }
+    bridge_instance._publish_cast_receiver_status("connected")
+    assert player.extra_attributes == {"sendspin_cast_state": "connected"}
+    bridge_instance._publish_cast_receiver_status("error", "device_unavailable")
+    assert player.extra_attributes["sendspin_cast_failure"] == "device_unavailable"
+    assert 'self._resolve_cast_app_ready(PlayerCommandFailed(f"{self.cast_player.display_name} is unavailable."))' in patched
+    assert 'PlayerCommandFailed(f"Timed out launching Sendspin on {self.cast_player.display_name}.")' in patched
+    assert 'self._resolve_cast_app_ready(PlayerCommandFailed(f"Failed to launch Sendspin on {self.cast_player.display_name}."))' in patched
+    assert seen[-5:] == ["event"] * 5
+
+    class BridgeLogger:
+        def debug(self, *_args):
+            pass
+
+        def warning(self, *_args):
+            pass
+
+    failed: list[BaseException] = []
+    bridge_instance.logger = BridgeLogger()
+    bridge_instance.cast_player = type("CastPlayer", (), {"available": False, "display_name": "Kitchen TV"})()
+    bridge_instance.ensure_cast_app_ready = lambda: None
+    bridge_instance._resolve_cast_app_ready = failed.append
+    bridge_instance._on_stream_start(type("Request", (), {"connection_reason": "playback"})())
+    assert isinstance(failed[0], PlayerCommandFailed)
+    assert "unavailable" in str(failed[0])
+    assert player.extra_attributes["sendspin_cast_failure"] == "device_unavailable"
+
+
+@requires_py314
+def test_cast_bridge_delay_is_configurable_before_receiver_connects() -> None:
+    source = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    patched = cast_delay.apply(source)
+    assert cast_delay.apply(patched) == patched
+    assert 'underlying.provider.domain == "chromecast"' in patched
+    assert "PlayerCommand.SET_STATIC_DELAY in player_role.state_supported_commands" in patched
+    assert "range=(0, 5000)" in patched
+    assert "sendspin_cast_delay.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Cast delay anchor found 0 times"):
+        cast_delay.apply("class SendspinPlayer: pass")
+
+    tree = ast.parse(patched)
+    player = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinPlayer")
+    method = next(node for node in player.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_config_entries")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+    namespace = {
+        "ConfigEntry": lambda **kwargs: kwargs,
+        "ConfigEntryType": type("ConfigEntryType", (), {"INTEGER": "integer"}),
+        "CONF_SENDSPIN_STATIC_DELAY": "sendspin_static_delay",
+        "PlayerCommand": type("PlayerCommand", (), {"SET_STATIC_DELAY": "set_static_delay"}),
+        "HIDDEN_ANNOUNCE_VOLUME_CONFIG_ENTRIES": [],
+    }
+    class_source = "class Base:\n    async def get_config_entries(self): return []\nclass Player(Base):\n" + method_source
+    exec(class_source, namespace)  # noqa: S102
+    instance = namespace["Player"]()
+    instance.static_delay_default_ms = 330
+    instance._hass_announce_entity_id = None
+    instance._player_role = None
+    for domain, expected in (("chromecast", 1), ("airplay", 0)):
+        underlying = type("Underlying", (), {"provider": type("Provider", (), {"domain": domain})()})()
+        players = type("Players", (), {"get_player": lambda self, _, u=underlying: u})()
+        instance.mass = type("Mass", (), {"players": players})()
+        instance.underlying_player_id = "base-id"
+        entries = asyncio.run(instance.get_config_entries())
+        assert len(entries) == expected
+        if expected:
+            assert entries[0]["key"] == "sendspin_static_delay"
+            assert entries[0]["default_value"] == 330
+            assert entries[0]["range"] == (0, 5000)
+    instance._player_role = type("Role", (), {"get_supported_formats": lambda self: [], "state_supported_commands": {"set_static_delay"}})()
+    assert len(asyncio.run(instance.get_config_entries())) == 1
 
 
 def test_the_fixture_matches_the_pinned_server_release() -> None:
@@ -58,7 +706,7 @@ def _parse_server_version(dockerfile_text: str) -> tuple[int, ...]:
     unit tested against synthetic input without touching the real Dockerfile.
     """
     match = re.search(r'ARG SERVER_VERSION="(\d+)\.(\d+)\.(\d+)', dockerfile_text)
-    assert match, "could not find ARG SERVER_VERSION=\"MAJOR.MINOR.PATCH...\" in the Dockerfile"
+    assert match, 'could not find ARG SERVER_VERSION="MAJOR.MINOR.PATCH..." in the Dockerfile'
     return tuple(int(part) for part in match.groups())
 
 
@@ -142,6 +790,98 @@ def test_steer_marks_queue_items_and_prefers_their_provider() -> None:
     assert "if not provider.is_streaming_provider" in audio
     assert "not strict_provider  # trooperthorn: play_source_steer" in audio
     assert "Local-only provider {strict_provider!r} cannot serve" in audio
+    assert "or not cached_provider.available" in audio
+
+
+@requires_py314
+def test_strict_steer_discards_cross_provider_buffer_before_acquisition() -> None:
+    audio = steer.apply(STREAMS_AUDIO.read_text(encoding="utf-8"), steer.EDITS[steer.STREAMS_AUDIO])
+    tree = ast.parse(audio)
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_get_audio_buffer"
+    )
+    source = "from __future__ import annotations\nclass Controller:\n" + "\n".join(
+        f"    {line}" if line else "" for line in ast.unparse(method).splitlines()
+    )
+
+    class AudioError(Exception):
+        pass
+
+    class MediaNotFoundError(Exception):
+        pass
+
+    class ProviderStreamLimitError(AudioError):
+        provider_instance = "filesystem_local--one"
+
+    class Track:
+        pass
+
+    class AudioBuffer:
+        calls: list[str] = []
+        fail_once = False
+
+        @staticmethod
+        async def get_buffer(**kwargs):
+            AudioBuffer.calls.append(kwargs["streamdetails"].provider)
+            if AudioBuffer.fail_once:
+                AudioBuffer.fail_once = False
+                raise ProviderStreamLimitError()
+            return object()
+
+    namespace = {
+        "asyncio": asyncio,
+        "AudioError": AudioError,
+        "AudioBuffer": AudioBuffer,
+        "MediaNotFoundError": MediaNotFoundError,
+        "ProviderStreamLimitError": ProviderStreamLimitError,
+        "Track": Track,
+    }
+    exec(source, namespace)  # noqa: S102
+    ctl = namespace["Controller"]()
+    local = SimpleNamespace(
+        instance_id="filesystem_local--one", domain="filesystem_local",
+        available=True, is_streaming_provider=False,
+    )
+    spotify = SimpleNamespace(
+        instance_id="spotify--one", domain="spotify",
+        available=True, is_streaming_provider=True,
+    )
+    providers = {local.instance_id: local, spotify.instance_id: spotify}
+    ctl.mass = SimpleNamespace(
+        get_provider=lambda key, return_unavailable=False: providers.get(key),
+        player_queues=SimpleNamespace(queue_data_or_none=lambda queue_id: None),
+    )
+    ctl._get_mapping_providers = lambda mapping: (local,)
+    ctl._has_alternative_match_providers = lambda item: False
+
+    def details(provider):
+        return SimpleNamespace(
+            provider=provider, seek_position=0, fade_in=False,
+            prefer_album_loudness=False, queue_session_id=None,
+        )
+
+    async def get_stream_details(*args, **kwargs):
+        return details(local.instance_id)
+
+    ctl.get_stream_details = get_stream_details
+    item = SimpleNamespace(
+        extra_attributes={"strict_provider": local.instance_id},
+        streamdetails=details(spotify.instance_id),
+        media_item=SimpleNamespace(provider_mappings=[
+            SimpleNamespace(available=True)
+        ]),
+        queue_id="queue", name="Song",
+    )
+    asyncio.run(ctl._get_audio_buffer(item, 0, "test", 0, True))
+    assert AudioBuffer.calls == [local.instance_id]
+    assert item.streamdetails.provider == local.instance_id
+
+    # A saturated local source may be retried, but cannot trigger a Spotify match.
+    AudioBuffer.calls.clear()
+    AudioBuffer.fail_once = True
+    asyncio.run(ctl._get_audio_buffer(item, 0, "capacity retry", 1, True))
+    assert AudioBuffer.calls == [local.instance_id, local.instance_id]
 
 
 @requires_py314
@@ -151,8 +891,7 @@ def test_strict_steer_contract_rejects_bad_targets_and_consumes_m3u_marker() -> 
     methods = {
         node.name: node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name in {"_play_source_steer", "_play_source_provider"}
+        if isinstance(node, ast.FunctionDef) and node.name in {"_play_source_steer", "_play_source_provider"}
     }
     source = "from __future__ import annotations\nclass Ctl:\n" + "\n".join(
         "\n".join(f"    {line}" if line else "" for line in ast.unparse(methods[name]).splitlines())
@@ -178,9 +917,7 @@ def test_strict_steer_contract_rejects_bad_targets_and_consumes_m3u_marker() -> 
     unavailable = Provider("filesystem_local--gone", "filesystem_local", available=False)
     providers = {item.instance_id: item for item in (local, spotify, unavailable)}
     providers["filesystem_local"] = local
-    ctl.mass = type(
-        "Mass", (), {"get_provider": lambda self, key, return_unavailable=False: providers.get(key)}
-    )()
+    ctl.mass = type("Mass", (), {"get_provider": lambda self, key, return_unavailable=False: providers.get(key)})()
 
     uri = "filesystem_local--abc://track/Music/example.flac"
     assert ctl._play_source_steer(f"local-only:{uri}") == (uri, "filesystem_local--abc")
@@ -531,9 +1268,7 @@ def test_playlist_bridge_manifest_and_module_are_valid() -> None:
     assert '"playlist_bridge/archive_playlists"' in bridge.INIT_PY
     assert bridge.INIT_PY.count("required_scope=Scope.LIBRARY_WRITE") == 2
     # a long bulk archive job must never jump ahead of interactive tasks
-    assert "priority=True" not in bridge.INIT_PY.split("async def archive_playlists")[1].split(
-        "async def _archive_playlists"
-    )[0]
+    assert "priority=True" not in bridge.INIT_PY.split("async def archive_playlists")[1].split("async def _archive_playlists")[0]
     # the throwaway builtin copy created during a migration must always be
     # cleaned up, success or failure
     assert "await builtin.library_remove(matched_playlist.item_id, MediaType.PLAYLIST)" in bridge.INIT_PY

@@ -47,6 +47,12 @@ jobs:
           pip install -r requirements-test.txt
           python scripts/sync_upstream.py
 
+      # A server bump changes the bytes the anchored patches will edit. The
+      # fixture/version check fails until those anchors are reviewed.
+      - name: Verify pinned server patch compatibility
+        if: steps.sync.outputs.changed == 'true'
+        run: pytest -q tests/test_patches.py
+
       - name: Verify release-automation credentials are configured
         if: steps.sync.outputs.changed == 'true'
         env:

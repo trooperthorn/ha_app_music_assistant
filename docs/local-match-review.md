@@ -34,5 +34,19 @@ algorithm version and are isolated by Spotify account.
 
 Both commands require an authenticated user with `config.providers.write`.
 Changing a decision additionally requires `library.write`. Neither command
-changes provider mappings or promises any playback behavior. Playback policies
-and final stream enforcement remain a later Phase 4 deliverable.
+changes provider mappings. A separate explicit playback projection can use an
+approved local asset; `local_only` requests are enforced in the final stream
+selector and buffer acquisition, including cached details and capacity retries.
+These code paths have fixture tests against the pinned server but have not yet
+been acoustically validated on the installed players.
+
+The store can relocate an existing asset's provider location atomically after a
+reviewed move, retaining its asset ID and decision history while rejecting a
+stale old path or a destination already bound to another asset. This is a
+provider command `library_enrichment/relocate_match_asset` performs a direct
+Music Assistant library mapping check, requires the approved match revision, and
+rejects a still-listed old location. If a refreshed review has already created
+an unreviewed provisional asset at the new path, the caller must name its ID;
+the store refuses to merge a provisional asset with decisions or other
+locations. The capability-gated review UI displays the exact old and new paths
+before sending the correction. A live file-move exercise remains outstanding.

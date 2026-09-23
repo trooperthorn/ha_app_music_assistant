@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -16,7 +17,7 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 ACCESS_STATES = {"unknown", "accessible", "authentication_required", "access_denied", "temporarily_unavailable", "provider_offline"}
 PROVENANCE_STATES = {"value", "stale", "missing", "empty", "not_loaded", "inaccessible"}
 PROVENANCE_TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
@@ -55,7 +56,7 @@ class ArchiveStore:
                 if version == 0 and not tables:
                     self._initialize()
                     version = 1
-                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION):
+                elif version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION):
                     raise ValueError(f"Unsupported enrichment schema {version}; database untouched")
                 required = {"metadata", "subscriptions", "jobs", "versions", "occurrences"}
                 if version >= 2:
@@ -74,10 +75,13 @@ class ArchiveStore:
                     required.add("itunes_apply_jobs")
                 if version >= 9:
                     required.add("bulk_match_operations")
+                if version >= 11:
+                    required.add("maintained_mirrors")
                 actual = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 later_tables = {
                     "itunes_import_documents", "itunes_import_batches",
                     "itunes_apply_jobs", "bulk_match_operations",
+                    "maintained_mirrors",
                 }
                 if actual != required and not (
                     version < 9 and required <= actual <= required | later_tables
@@ -109,6 +113,10 @@ class ArchiveStore:
                     self._migrate_v8()
                 if version <= 8:
                     self._migrate_v9()
+                if version <= 9:
+                    self._migrate_v10()
+                if version <= 10:
+                    self._migrate_v11()
         except Exception:
             self._db.close()
             raise
@@ -381,6 +389,36 @@ class ArchiveStore:
         self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
         self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v9_migrated_at',?)", (_now(),))
         self._db.execute("PRAGMA user_version=9")
+
+    def _migrate_v10(self) -> None:
+        """Remember the exact verified destination before any later rewrite."""
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(playback_projections)")}
+        if "destination_content_digest" not in columns:
+            self._db.execute("ALTER TABLE playback_projections ADD COLUMN destination_content_digest TEXT")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v10_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=10")
+
+    def _migrate_v11(self) -> None:
+        """Keep opt-in current mirrors separate from immutable captures and playback projections."""
+        self._db.execute("""CREATE TABLE IF NOT EXISTS maintained_mirrors (
+            subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+            revision INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+            allow_partial INTEGER NOT NULL DEFAULT 0 CHECK(allow_partial IN (0,1)),
+            state TEXT NOT NULL CHECK(state IN
+              ('pending','prepared','writing','applied','failed','uncertain','conflict','detached','disabled')),
+            applied_version_id TEXT REFERENCES versions(id),
+            applied_digest TEXT,
+            target_version_id TEXT REFERENCES versions(id),
+            target_digest TEXT,
+            destination_item_id TEXT,
+            destination_provider_instance TEXT,
+            destination_content_digest TEXT,
+            error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        self._db.execute("UPDATE metadata SET value=? WHERE key='schema_digest'", (self._schema_digest(),))
+        self._db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_v11_migrated_at',?)", (_now(),))
+        self._db.execute("PRAGMA user_version=11")
 
     @staticmethod
     def _bounded_json(value, label: str, expected_type: type, limit: int = 65536) -> str:
@@ -1051,6 +1089,116 @@ class ArchiveStore:
             result["evidence"] = json.loads(result.pop("evidence_json"))
             return result
 
+    def relocate_local_asset_location(
+        self,
+        asset_id: str,
+        provider_instance_id: str,
+        old_item_id: str,
+        new_item_id: str,
+        evidence: dict | None = None,
+        expected_target_asset_id: str | None = None,
+        source_key: tuple[str, str, str, str] | None = None,
+        expected_revision: int | None = None,
+    ) -> dict:
+        """Move one reviewed location while retaining its stable asset and match decisions."""
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (asset_id, provider_instance_id, old_item_id, new_item_id)
+        ) or old_item_id == new_item_id:
+            raise ValueError("Distinct old and new local track locations are required")
+        evidence_json = self._json_object(evidence, "Relocation evidence")
+        if source_key is not None and (
+            not isinstance(source_key, tuple)
+            or len(source_key) != 4
+            or type(expected_revision) is not int
+            or expected_revision < 0
+        ):
+            raise ValueError("A source and expected match revision are required")
+        with self._transaction():
+            if source_key is not None:
+                source = self._db.execute(
+                    """SELECT revision,approved_asset_id FROM match_sources
+                    WHERE provider_domain=? AND account_id=? AND media_type=? AND source_item_id=?""",
+                    source_key,
+                ).fetchone()
+                if (
+                    source is None
+                    or source["revision"] != expected_revision
+                    or source["approved_asset_id"] != asset_id
+                ):
+                    raise ValueError("Approved match changed during relocation")
+            old = self._db.execute(
+                """SELECT id,asset_id FROM local_asset_locations
+                WHERE provider_instance_id=? AND item_id=?""",
+                (provider_instance_id, old_item_id),
+            ).fetchone()
+            if old is None or old["asset_id"] != asset_id:
+                raise ValueError("Old location no longer belongs to the expected asset")
+            target = self._db.execute(
+                """SELECT id,asset_id FROM local_asset_locations
+                WHERE provider_instance_id=? AND item_id=?""",
+                (provider_instance_id, new_item_id),
+            ).fetchone()
+            if target is not None:
+                # A fresh review may already have registered the moved path as a
+                # provisional asset. Merge only when the caller names it and it
+                # has no decision or other location of its own.
+                provisional_id = target["asset_id"]
+                if (
+                    provisional_id == asset_id
+                    or provisional_id != expected_target_asset_id
+                    or self._db.execute(
+                        "SELECT COUNT(*) FROM local_asset_locations WHERE asset_id=?",
+                        (provisional_id,),
+                    ).fetchone()[0] != 1
+                    or self._db.execute(
+                        "SELECT 1 FROM match_decisions WHERE asset_id=?",
+                        (provisional_id,),
+                    ).fetchone()
+                    or self._db.execute(
+                        "SELECT 1 FROM match_sources WHERE approved_asset_id=?",
+                        (provisional_id,),
+                    ).fetchone()
+                ):
+                    raise ValueError("New location is already bound to a reviewed asset")
+                for candidate in self._db.execute(
+                    "SELECT * FROM match_candidates WHERE asset_id=?",
+                    (provisional_id,),
+                ).fetchall():
+                    existing = self._db.execute(
+                        "SELECT id FROM match_candidates WHERE source_id=? AND asset_id=?",
+                        (candidate["source_id"], asset_id),
+                    ).fetchone()
+                    if existing is not None:
+                        self._db.execute(
+                            """UPDATE match_candidates SET score=?,evidence_json=?,
+                            algorithm_version=?,observed_at=?,active=?
+                            WHERE id=?""",
+                            (
+                                candidate["score"], candidate["evidence_json"],
+                                candidate["algorithm_version"], candidate["observed_at"],
+                                candidate["active"], existing["id"],
+                            ),
+                        )
+                        self._db.execute("DELETE FROM match_candidates WHERE id=?", (candidate["id"],))
+                    else:
+                        self._db.execute(
+                            "UPDATE match_candidates SET asset_id=? WHERE id=?",
+                            (asset_id, candidate["id"]),
+                        )
+                self._db.execute("DELETE FROM local_asset_locations WHERE id=?", (target["id"],))
+                self._db.execute("DELETE FROM local_assets WHERE id=?", (provisional_id,))
+            self._db.execute(
+                """UPDATE local_asset_locations SET item_id=?,evidence_json=?,updated_at=?
+                WHERE id=?""",
+                (new_item_id, evidence_json, _now(), old["id"]),
+            )
+            result = dict(
+                self._db.execute("SELECT * FROM local_asset_locations WHERE id=?", (old["id"],)).fetchone()
+            )
+            result["evidence"] = json.loads(result.pop("evidence_json"))
+            return result
+
     def get_local_asset(self, asset_id: str) -> dict:
         with self._lock:
             row = self._db.execute("SELECT * FROM local_assets WHERE id=?", (asset_id,)).fetchone()
@@ -1130,6 +1278,7 @@ class ArchiveStore:
                     "decision": None,
                     "decision_history": [],
                     "approved_asset_id": None,
+                    "approved_asset": None,
                     "candidates": [],
                 }
             source = dict(source_row)
@@ -1160,6 +1309,10 @@ class ArchiveStore:
                 "decision": decisions[-1] if decisions else None,
                 "decision_history": decisions,
                 "approved_asset_id": source["approved_asset_id"],
+                "approved_asset": (
+                    self.get_local_asset(source["approved_asset_id"])
+                    if source["approved_asset_id"] else None
+                ),
                 "candidates": candidates,
             }
 
@@ -1767,7 +1920,9 @@ class ArchiveStore:
                              (_now(), subscription_id))
 
     def commit_playback_projection(self, subscription_id: str, destination_item_id: str,
-                                   destination_provider_instance: str, verified_digest: str) -> dict:
+                                   destination_provider_instance: str, verified_digest: str,
+                                   destination_content_digest: str) -> dict:
+        destination_content_digest = self._sha256(destination_content_digest, "destination_content_digest")
         with self._transaction():
             row = self.get_playback_projection(subscription_id)
             if row is None or row["state"] not in ("writing", "uncertain"):
@@ -1775,8 +1930,9 @@ class ArchiveStore:
             if verified_digest != row["projection_digest"]:
                 raise ValueError("Playback destination digest does not match preview")
             self._db.execute("""UPDATE playback_projections SET state='applied',destination_item_id=?,
-                destination_provider_instance=?,updated_at=?,error=NULL WHERE subscription_id=?""",
-                (destination_item_id, destination_provider_instance, _now(), subscription_id))
+                destination_provider_instance=?,destination_content_digest=?,updated_at=?,error=NULL
+                WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, destination_content_digest, _now(), subscription_id))
             return self.get_playback_projection(subscription_id)
 
     def fail_playback_projection(self, subscription_id: str, error: str, uncertain: bool = False) -> None:
@@ -1787,6 +1943,265 @@ class ArchiveStore:
             state = "uncertain" if uncertain or row["state"] in ("writing", "uncertain") else "failed"
             self._db.execute("UPDATE playback_projections SET state=?,updated_at=?,error=? WHERE subscription_id=?",
                              (state, _now(), error, subscription_id))
+
+    def detach_playback_projection(self, subscription_id: str, expected_destination_item_id: str,
+                                   expected_content_digest: str | None) -> dict:
+        """Forget ownership of a destination without deleting the user's playlist."""
+        if not isinstance(expected_destination_item_id, str) or not expected_destination_item_id:
+            raise ValueError("Expected destination item ID is required")
+        if expected_content_digest is not None:
+            expected_content_digest = self._sha256(expected_content_digest, "expected_content_digest")
+        with self._transaction():
+            row = self.get_playback_projection(subscription_id)
+            if row is None or row["state"] in ("prepared", "writing", "uncertain"):
+                raise ValueError("Playback destination cannot be detached while its outcome is unresolved")
+            if (row["destination_item_id"] != expected_destination_item_id
+                    or row["destination_content_digest"] != expected_content_digest):
+                raise ValueError("Playback destination changed; refresh before detaching")
+            self._db.execute("DELETE FROM playback_projections WHERE subscription_id=?", (subscription_id,))
+            return row
+
+    def get_mirror(self, subscription_id: str) -> dict | None:
+        with self._lock:
+            self.get_subscription(subscription_id)
+            row = self._db.execute(
+                "SELECT * FROM maintained_mirrors WHERE subscription_id=?", (subscription_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recover_mirror_pending(self) -> tuple[int, int]:
+        """After restart, never retry a mirror write whose external outcome is unknown."""
+        with self._transaction():
+            now = _now()
+            prepared = self._db.execute("""UPDATE maintained_mirrors SET state='failed',
+                error='Mirror update interrupted before writing',updated_at=?
+                WHERE state='prepared'""", (now,)).rowcount
+            writing = self._db.execute("""UPDATE maintained_mirrors SET state='uncertain',
+                error='Mirror write interrupted; inspect destination before retrying',updated_at=?
+                WHERE state='writing'""", (now,)).rowcount
+            return prepared, writing
+
+    def configure_mirror(self, subscription_id: str, enabled: bool, allow_partial: bool,
+                         expected_revision: int) -> dict:
+        if type(enabled) is not bool or type(allow_partial) is not bool:
+            raise ValueError("Mirror settings must be boolean")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("Expected mirror revision must be a nonnegative integer")
+        with self._transaction():
+            current = self.get_mirror(subscription_id)
+            if (current["revision"] if current else 0) != expected_revision:
+                raise ValueError("Mirror configuration revision conflict")
+            if current and current["state"] in ("writing", "uncertain"):
+                raise ValueError("Mirror write outcome requires reconciliation")
+            if current and current["state"] == "conflict" and enabled:
+                raise ValueError("Detach the edited mirror destination before enabling a new one")
+            now = _now()
+            if current is None:
+                self._db.execute("""INSERT INTO maintained_mirrors
+                    (subscription_id,revision,enabled,allow_partial,state,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?)""",
+                    (subscription_id, 1, int(enabled), int(allow_partial),
+                     "pending" if enabled else "disabled", now, now),
+                )
+            else:
+                reset = current["state"] == "detached" and enabled
+                self._db.execute("""UPDATE maintained_mirrors SET revision=revision+1,enabled=?,allow_partial=?,
+                    state=?,applied_version_id=CASE WHEN ? THEN NULL ELSE applied_version_id END,
+                    applied_digest=CASE WHEN ? THEN NULL ELSE applied_digest END,
+                    destination_item_id=CASE WHEN ? THEN NULL ELSE destination_item_id END,
+                    destination_provider_instance=CASE WHEN ? THEN NULL ELSE destination_provider_instance END,
+                    destination_content_digest=CASE WHEN ? THEN NULL ELSE destination_content_digest END,
+                    target_version_id=NULL,target_digest=NULL,error=NULL,updated_at=? WHERE subscription_id=?""",
+                    (int(enabled), int(allow_partial), "pending" if enabled else "disabled",
+                     *([int(reset)] * 5), now, subscription_id),
+                )
+            return self.get_mirror(subscription_id)
+
+    def prepare_mirror(self, subscription_id: str, version_id: str, target_digest: str) -> dict:
+        target_digest = self._sha256(target_digest, "target_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            version = self.get_version(version_id)
+            if version["subscription_id"] != subscription_id:
+                raise ValueError("Mirror version belongs to another source")
+            if mirror is None or not mirror["enabled"] or mirror["state"] in ("writing", "uncertain", "conflict"):
+                raise ValueError("Mirror is not enabled or needs reconciliation")
+            self._db.execute("""UPDATE maintained_mirrors SET state='prepared',target_version_id=?,
+                target_digest=?,error=NULL,updated_at=? WHERE subscription_id=?""",
+                (version_id, target_digest, _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def mark_mirror_writing(self, subscription_id: str) -> None:
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None or mirror["state"] != "prepared" or not mirror["enabled"]:
+                raise ValueError("Mirror is not prepared")
+            self._db.execute("UPDATE maintained_mirrors SET state='writing',updated_at=? WHERE subscription_id=?",
+                             (_now(), subscription_id))
+
+    def commit_mirror(self, subscription_id: str, destination_item_id: str,
+                      destination_provider_instance: str, target_digest: str,
+                      destination_content_digest: str) -> dict:
+        target_digest = self._sha256(target_digest, "target_digest")
+        destination_content_digest = self._sha256(destination_content_digest, "destination_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None or mirror["state"] != "writing" or mirror["target_digest"] != target_digest:
+                raise ValueError("Mirror write does not match its prepared target")
+            self._db.execute("""UPDATE maintained_mirrors SET state='applied',
+                applied_version_id=target_version_id,applied_digest=target_digest,
+                target_version_id=NULL,target_digest=NULL,destination_item_id=?,
+                destination_provider_instance=?,destination_content_digest=?,error=NULL,updated_at=?
+                WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, destination_content_digest,
+                 _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def advance_mirror_unchanged(self, subscription_id: str, version_id: str, target_digest: str) -> dict:
+        target_digest = self._sha256(target_digest, "target_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            version = self.get_version(version_id)
+            if (mirror is None or not mirror["enabled"] or mirror["state"] != "applied"
+                    or mirror["applied_digest"] != target_digest or version["subscription_id"] != subscription_id):
+                raise ValueError("Mirror content or source changed")
+            self._db.execute("UPDATE maintained_mirrors SET applied_version_id=?,updated_at=? WHERE subscription_id=?",
+                             (version_id, _now(), subscription_id))
+            return self.get_mirror(subscription_id)
+
+    def fail_mirror(self, subscription_id: str, error: str, uncertain: bool = False,
+                    conflict: bool = False) -> dict:
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None:
+                raise ValueError("Mirror is missing")
+            state = "conflict" if conflict else "uncertain" if uncertain or mirror["state"] == "writing" else "failed"
+            self._db.execute("""UPDATE maintained_mirrors SET state=?,enabled=CASE WHEN ? THEN 0 ELSE enabled END,
+                error=?,updated_at=? WHERE subscription_id=?""",
+                (state, int(conflict), error[:500], _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def detach_mirror(self, subscription_id: str, expected_destination_item_id: str,
+                      expected_content_digest: str | None) -> dict:
+        if expected_content_digest is not None:
+            expected_content_digest = self._sha256(expected_content_digest, "expected_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if mirror is None or mirror["state"] in ("writing", "uncertain", "prepared"):
+                raise ValueError("Mirror destination has an unresolved write")
+            if (not expected_destination_item_id or mirror["destination_item_id"] != expected_destination_item_id
+                    or mirror["destination_content_digest"] != expected_content_digest):
+                raise ValueError("Mirror destination changed; refresh before detaching")
+            self._db.execute("""UPDATE maintained_mirrors SET enabled=0,state='detached',revision=revision+1,
+                target_version_id=NULL,target_digest=NULL,error=NULL,updated_at=? WHERE subscription_id=?""",
+                (_now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def mirror_destination_claimed(self, subscription_id: str, destination_item_id: str) -> bool:
+        """Prevent a reconciliation from taking ownership of another managed playlist."""
+        with self._lock:
+            queries = (
+                ("SELECT 1 FROM maintained_mirrors WHERE destination_item_id=? AND subscription_id<>?", True),
+                ("SELECT 1 FROM playback_projections WHERE destination_item_id=?", False),
+                ("SELECT 1 FROM apply_jobs WHERE destination_item_id=?", False),
+                ("SELECT 1 FROM itunes_apply_jobs WHERE destination_item_id=?", False),
+            )
+            for query, scoped in queries:
+                args = (destination_item_id, subscription_id) if scoped else (destination_item_id,)
+                if self._db.execute(query, args).fetchone():
+                    return True
+            return False
+
+    def rebind_destination(
+        self, kind: str, subscription_id: str, old_item_id: str, new_item_id: str,
+        provider_instance: str, expected_content_digest: str, expected_revision: int | None,
+    ) -> dict:
+        """Repoint an applied destination after exact content has been verified externally."""
+        if kind not in ("mirror", "playback"):
+            raise ValueError("Unsupported destination kind")
+        if not all(isinstance(value, str) and value.strip() for value in
+                   (subscription_id, old_item_id, new_item_id, provider_instance)) or old_item_id == new_item_id:
+            raise ValueError("Distinct old and new destination IDs are required")
+        digest = self._sha256(expected_content_digest, "expected_content_digest")
+        if kind == "mirror" and (type(expected_revision) is not int or expected_revision < 0):
+            raise ValueError("Mirror revision is required")
+        with self._transaction():
+            row = (self.get_mirror(subscription_id) if kind == "mirror"
+                   else self.get_playback_projection(subscription_id))
+            if row is None or row["state"] != "applied":
+                raise ValueError("Only an applied destination can be rebound")
+            if row["destination_item_id"] != old_item_id or row["destination_content_digest"] != digest:
+                raise ValueError("Destination changed; inspect again")
+            if kind == "mirror" and row["revision"] != expected_revision:
+                raise ValueError("Mirror revision conflict")
+            if self.mirror_destination_claimed(subscription_id, new_item_id):
+                raise ValueError("Replacement playlist is claimed by another operation")
+            table = "maintained_mirrors" if kind == "mirror" else "playback_projections"
+            revision_update = ",revision=revision+1" if kind == "mirror" else ""
+            self._db.execute(
+                f"UPDATE {table} SET destination_item_id=?,destination_provider_instance=?,"  # noqa: S608
+                f"updated_at=?{revision_update} WHERE subscription_id=?",
+                (new_item_id, provider_instance, _now(), subscription_id),
+            )
+            return (self.get_mirror(subscription_id) if kind == "mirror"
+                    else self.get_playback_projection(subscription_id))
+
+    def reconcile_mirror_applied(self, subscription_id: str, expected_revision: int,
+                                 expected_target_digest: str, destination_item_id: str,
+                                 destination_provider_instance: str, observed_content_digest: str) -> dict:
+        expected_target_digest = self._sha256(expected_target_digest, "expected_target_digest")
+        observed_content_digest = self._sha256(observed_content_digest, "observed_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if (mirror is None or mirror["state"] != "uncertain" or mirror["revision"] != expected_revision
+                    or mirror["target_digest"] != expected_target_digest or not mirror["target_version_id"]):
+                raise ValueError("Mirror reconciliation checkpoint changed")
+            if mirror["destination_item_id"] and mirror["destination_item_id"] != destination_item_id:
+                raise ValueError("Mirror has a different recorded destination")
+            if self.mirror_destination_claimed(subscription_id, destination_item_id):
+                raise ValueError("Playlist is already managed by another operation")
+            self._db.execute("""UPDATE maintained_mirrors SET state='applied',
+                applied_version_id=target_version_id,applied_digest=target_digest,
+                target_version_id=NULL,target_digest=NULL,destination_item_id=?,
+                destination_provider_instance=?,destination_content_digest=?,error=NULL,updated_at=?
+                WHERE subscription_id=?""",
+                (destination_item_id, destination_provider_instance, observed_content_digest,
+                 _now(), subscription_id),
+            )
+            return self.get_mirror(subscription_id)
+
+    def reconcile_mirror_unwritten(self, subscription_id: str, expected_revision: int,
+                                   expected_target_digest: str, observed_content_digest: str) -> dict:
+        expected_target_digest = self._sha256(expected_target_digest, "expected_target_digest")
+        observed_content_digest = self._sha256(observed_content_digest, "observed_content_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if (mirror is None or mirror["state"] != "uncertain" or mirror["revision"] != expected_revision
+                    or mirror["target_digest"] != expected_target_digest or not mirror["destination_item_id"]
+                    or mirror["destination_content_digest"] != observed_content_digest):
+                raise ValueError("Mirror's previous verified destination changed")
+            self._db.execute("""UPDATE maintained_mirrors SET state='failed',target_version_id=NULL,
+                target_digest=NULL,error='Previous destination content verified; update may be retried',updated_at=?
+                WHERE subscription_id=?""", (_now(), subscription_id))
+            return self.get_mirror(subscription_id)
+
+    def abandon_uncertain_mirror(self, subscription_id: str, expected_revision: int,
+                                 expected_target_digest: str) -> dict:
+        expected_target_digest = self._sha256(expected_target_digest, "expected_target_digest")
+        with self._transaction():
+            mirror = self.get_mirror(subscription_id)
+            if (mirror is None or mirror["state"] != "uncertain" or mirror["revision"] != expected_revision
+                    or mirror["target_digest"] != expected_target_digest):
+                raise ValueError("Mirror uncertain checkpoint changed")
+            self._db.execute("""UPDATE maintained_mirrors SET state='detached',enabled=0,
+                revision=revision+1,target_version_id=NULL,target_digest=NULL,
+                error='Uncertain destination was explicitly abandoned; inspect for an orphan playlist',
+                updated_at=? WHERE subscription_id=?""", (_now(), subscription_id))
+            return self.get_mirror(subscription_id)
 
     def close(self) -> None:
         with self._lock:
@@ -2100,3 +2515,79 @@ class ArchiveStore:
             raise
         finally:
             temporary_manifest.unlink(missing_ok=True)
+
+    @staticmethod
+    def verify_backup(source: str | Path) -> dict:
+        """Verify a completed archive backup without opening the live store."""
+        source = Path(source)
+        manifest_path = source.with_suffix(source.suffix + ".manifest.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or (
+            not isinstance(manifest.get("store_uuid"), str)
+            or not manifest["store_uuid"]
+            or type(manifest.get("schema_version")) is not int
+            or type(manifest.get("size")) is not int
+            or not isinstance(manifest.get("sha256"), str)
+            or len(manifest["sha256"]) != 64
+        ):
+            raise ValueError("Invalid archive backup manifest")
+        if manifest["schema_version"] != SCHEMA_VERSION:
+            raise ValueError("Unsupported archive backup schema version")
+        ArchiveStore._verify_backup_file(source, manifest)
+        return manifest
+
+    @staticmethod
+    def stage_restore(source: str | Path, destination: str | Path) -> dict:
+        """Copy a verified backup into a new staging path without replacing live data."""
+        source = Path(source)
+        destination = Path(destination)
+        manifest = ArchiveStore.verify_backup(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        created = False
+        try:
+            with source.open("rb") as original, destination.open("xb") as staged:
+                created = True
+                shutil.copyfileobj(original, staged, length=1024 * 1024)
+                staged.flush()
+                os.fsync(staged.fileno())
+            ArchiveStore._verify_backup_file(destination, manifest)
+        except Exception:
+            if created:
+                destination.unlink(missing_ok=True)
+            raise
+        return manifest
+
+    @staticmethod
+    def _verify_backup_file(path: Path, manifest: dict) -> None:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        if size != manifest["size"] or digest.hexdigest() != manifest["sha256"]:
+            raise ValueError("Archive backup hash or size mismatch")
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError("Archive backup integrity check failed")
+                if db.execute("PRAGMA foreign_key_check").fetchone():
+                    raise ValueError("Archive backup foreign key check failed")
+                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise ValueError("Archive backup schema version mismatch")
+                metadata = dict(db.execute("SELECT key,value FROM metadata"))
+                schema_digest = _digest(
+                    [row[0] for row in db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")]
+                )
+                if metadata.get("store_uuid") != manifest["store_uuid"] or metadata.get("schema_digest") != schema_digest:
+                    raise ValueError("Archive backup identity or schema mismatch")
+                for version_id, total, expected in db.execute("SELECT id,total,content_digest FROM versions"):
+                    payloads = [
+                        row[0] for row in db.execute(
+                            "SELECT payload FROM occurrences WHERE version_id=? ORDER BY position", (version_id,)
+                        )
+                    ]
+                    if len(payloads) != total or _digest(payloads) != expected:
+                        raise ValueError("Archive backup version content digest mismatch")
+        except sqlite3.DatabaseError as error:
+            raise ValueError("Archive backup database is invalid") from error

@@ -49,8 +49,8 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are six: three anchor patches that rewrite exact lines in an
-already-installed file, and three plugin providers that add a self-contained
+Today there are fourteen: ten anchor patches that rewrite exact lines in an
+already-installed file, and four plugin providers that add a self-contained
 new provider directory instead (see `docs/extension-points.md` for the
 distinction).
 
@@ -92,6 +92,45 @@ Anchor patches:
   web player uses it as the lower rungs of its adaptive mode and from the
   phone layout's menu. Its fixtures are pinned to the aiosendspin release
   the server pins (9.1.1 for 2.10.3).
+- `sendspin_cast_delay.py`: exposes the Cast receiver's 0–5000 ms
+  `sendspin_static_delay` setting on its derived Sendspin player before the
+  receiver connects. The pinned Cast bridge already sends the saved value as
+  `syncDelay` at launch and after configuration changes, but its provisional
+  role does not advertise the generic delay command, hiding the setting while
+  idle. Other bridges retain capability-gated delay controls.
+- `sendspin_cast_status.py`: publishes bounded Cast receiver state transitions
+  (`connecting`, `connected`, `playing`, `stopped`, `error`, `disconnected`) on
+  its derived Sendspin player's `extra_attributes.sendspin_cast_state` for
+  HTTP/ingress clients. On failure it adds a bounded
+  `sendspin_cast_failure` code (`device_unavailable`, `launch_timeout`,
+  `launch_failed`, `receiver_error`, or `audio_unsupported`) and resolves the
+  pending play request promptly. It suppresses duplicate events and does not
+  expose receiver log text.
+- `sendspin_timing_status.py`: copies only client-reported output delay,
+  startup lead, and minimum buffer values to the Sendspin player's event state.
+  Missing reports remain unknown, and a replacement connection clears old
+  reports rather than treating a saved configuration value as an acknowledgement.
+- `sendspin_controller_switch.py`: advertises the controller `switch` command
+  already handled by the pinned aiosendspin server. It cycles playing groups
+  and prioritizes rejoining the client's previous group after a leave; the
+  browser SDK still sends it only when advertised by the server.
+- `sendspin_discovery_status.py`: adds an admin-scoped, read-only
+  `sendspin/discovery_status` command. It reports listener, advertising,
+  client-discovery, manual-address validity, and connected-client status
+  without returning pairing credentials or altering connections. Its
+  `api_version: 1` advertises the response shape to newer frontend wheels.
+  The same patch provides `sendspin/display_capabilities` at player-control
+  scope; the frontend checks its `browser_display_pairing` flag before opening
+  a display connection during a frontend-first release.
+- `sendspin_non_audio_clients.py`: classifies artwork, color and controller-only
+  clients as non-audio devices, so they cannot be selected as speakers.
+  A browser `Music Assistant Display` client is account-paired through the
+  existing web pairing command and kept private to its authenticated session.
+- `sendspin_source_status.py`: adds an admin-scoped, read-only status command
+  for connected source clients, reported signal, selected destination, PCM
+  activity, and the configured latency target. Its `api_version: 1` gates the
+  frontend source controls during frontend-first releases. It does not claim an acoustic
+  end-to-end latency measurement.
 
 Plugin providers:
 
@@ -136,6 +175,10 @@ Plugin providers:
   `self.logger` and `self.mass.get_provider`, both available on the base
   `Provider` class (see `docs/decisions.md`). This retires the last anchor
   patch on `controllers/music/controller.py`.
+- `library_enrichment.py`: installs the archive and enrichment provider with
+  versioned captures, iTunes import, match review, playback policy, and
+  recovery commands. Its data store and operations remain separate from the
+  bulk playlist migration/export plugin.
 
 `tests/test_patches.py` applies each script to a copy of the upstream modules
 kept under `tests/fixtures/` and pins the copies to the server version in the
