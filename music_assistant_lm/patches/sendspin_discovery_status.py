@@ -29,6 +29,7 @@ EDITS: list[tuple[str, str]] = [
         "                valid = True\n"
         '            manual.append({"address": address, "valid": valid})\n'
         "        return {\n"
+        '            "api_version": 1,\n'
         '            "listener_active": server._tcp_site is not None,\n'
         '            "listen_address": self.mass.streams.bind_ip,\n'
         '            "port": SENDSPIN_SERVER_PORT,\n'

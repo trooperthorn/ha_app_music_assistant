@@ -283,6 +283,7 @@ def test_sendspin_source_status_and_guarded_stop() -> None:
     instance.instance_id = "sendspin_source--1"
     instance.config = type("Config", (), {"get_value": lambda self, _: 80})()
     result = asyncio.run(instance.source_status())
+    assert result["api_version"] == 1
     assert result["target_latency_ms"] == 80
     assert result["sources"][0]["signal"] == "present"
     assert result["sources"][0]["selected_player_id"] == "living-room"
@@ -431,6 +432,7 @@ def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
     instance.mass = type("Mass", (), {"streams": type("Streams", (), {"bind_ip": "127.0.0.1", "publish_ip": "192.168.1.2"})()})()
     instance.config = type("Config", (), {"get_value": lambda self, *_: False})()
     status = asyncio.run(instance.discovery_status())
+    assert status["api_version"] == 1
     assert status["listener_active"] is True
     assert status["advertising_active"] is True
     assert status["client_discovery_active"] is False

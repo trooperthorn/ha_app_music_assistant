@@ -117,14 +117,16 @@ Anchor patches:
 - `sendspin_discovery_status.py`: adds an admin-scoped, read-only
   `sendspin/discovery_status` command. It reports listener, advertising,
   client-discovery, manual-address validity, and connected-client status
-  without returning pairing credentials or altering connections.
+  without returning pairing credentials or altering connections. Its
+  `api_version: 1` advertises the response shape to newer frontend wheels.
 - `sendspin_non_audio_clients.py`: classifies artwork, color and controller-only
   clients as non-audio devices, so they cannot be selected as speakers.
   A browser `Music Assistant Display` client is account-paired through the
   existing web pairing command and kept private to its authenticated session.
 - `sendspin_source_status.py`: adds an admin-scoped, read-only status command
   for connected source clients, reported signal, selected destination, PCM
-  activity, and the configured latency target. It does not claim an acoustic
+  activity, and the configured latency target. Its `api_version: 1` gates the
+  frontend source controls during frontend-first releases. It does not claim an acoustic
   end-to-end latency measurement.
 
 Plugin providers:

@@ -93,7 +93,7 @@ EDITS: list[tuple[str, str]] = [
         '                        ),\n'
         "                    }\n"
         "                )\n"
-        '        return {"target_latency_ms": target_latency_ms, "sources": sources}\n'
+        '        return {"api_version": 1, "target_latency_ms": target_latency_ms, "sources": sources}\n'
         "\n"
         "    async def stop_source(self, client_id: str, playback_session_id: str) -> None:\n"
         '        """Stop only the exact Sendspin source selection the caller observed."""\n'
