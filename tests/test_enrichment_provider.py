@@ -512,7 +512,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 31
+    assert len(plugin.registered) == 32
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -1545,6 +1545,7 @@ def test_local_only_apply_rejects_destination_that_drops_strict_sentinels(plugin
 def test_playback_projection_preserves_edited_destination(plugin):
     version_id = _match_fixture(plugin)
     preview = asyncio.run(plugin.provider.playback_preview(version_id))
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
     builtin = types.SimpleNamespace(
         instance_id="builtin", domain="builtin", available=True,
         _read_m3u_file=AsyncMock(), _write_m3u_file=AsyncMock(),
@@ -1571,6 +1572,14 @@ def test_playback_projection_preserves_edited_destination(plugin):
             version_id, preview["projection_digest"], preview["policy_revision"], allow_partial=True,
         ))
     builtin._write_m3u_file.assert_not_awaited()
+    assert builtin._read_m3u_file.return_value.endswith("spotify://track/user-added\n")
+    failed = asyncio.run(plugin.provider.playback_status(subscription_id))["projection"]
+    assert failed["state"] == "failed"
+    detached = asyncio.run(plugin.provider.playback_detach(
+        subscription_id, "playback-1", failed["destination_content_digest"],
+    ))
+    assert detached["detached_destination"]["item_id"] == "playback-1"
+    assert asyncio.run(plugin.provider.playback_status(subscription_id))["projection"]["state"] == "not_applied"
     assert builtin._read_m3u_file.return_value.endswith("spotify://track/user-added\n")
 
 

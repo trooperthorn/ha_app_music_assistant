@@ -97,6 +97,12 @@ def test_playback_policy_cas_and_projection_checkpoint_are_independent(tmp_path)
     assert projection["state"] == "prepared"
     store.mark_playback_projection_writing(subscription)
     committed = store.commit_playback_projection(subscription, "playback", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="changed"):
+        store.detach_playback_projection(subscription, "another-playlist", "b" * 64)
+    assert store.get_playback_projection(subscription)["destination_item_id"] == "playback"
+    detached = store.detach_playback_projection(subscription, "playback", "b" * 64)
+    assert detached["destination_item_id"] == "playback"
+    assert store.get_playback_projection(subscription) is None
     assert committed["state"] == "applied"
     # The playback checkpoint does not advance the older archive-copy checkpoint.
     assert store.get_subscription(subscription)["applied_version_id"] is None

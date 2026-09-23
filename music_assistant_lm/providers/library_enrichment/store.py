@@ -1803,6 +1803,23 @@ class ArchiveStore:
             self._db.execute("UPDATE playback_projections SET state=?,updated_at=?,error=? WHERE subscription_id=?",
                              (state, _now(), error, subscription_id))
 
+    def detach_playback_projection(self, subscription_id: str, expected_destination_item_id: str,
+                                   expected_content_digest: str | None) -> dict:
+        """Forget ownership of a destination without deleting the user's playlist."""
+        if not isinstance(expected_destination_item_id, str) or not expected_destination_item_id:
+            raise ValueError("Expected destination item ID is required")
+        if expected_content_digest is not None:
+            expected_content_digest = self._sha256(expected_content_digest, "expected_content_digest")
+        with self._transaction():
+            row = self.get_playback_projection(subscription_id)
+            if row is None or row["state"] in ("prepared", "writing", "uncertain"):
+                raise ValueError("Playback destination cannot be detached while its outcome is unresolved")
+            if (row["destination_item_id"] != expected_destination_item_id
+                    or row["destination_content_digest"] != expected_content_digest):
+                raise ValueError("Playback destination changed; refresh before detaching")
+            self._db.execute("DELETE FROM playback_projections WHERE subscription_id=?", (subscription_id,))
+            return row
+
     def close(self) -> None:
         with self._lock:
             self._db.close()

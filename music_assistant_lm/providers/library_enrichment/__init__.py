@@ -104,6 +104,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("playback_preview", self.playback_preview),
             ("playback_apply", self.playback_apply),
             ("playback_status", self.playback_status),
+            ("playback_detach", self.playback_detach),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -202,6 +203,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "max_match_approvals": 200,
             "playback_policy": True,
             "playback_policy_api_version": 1,
+            "playback_detach": True,
             "playback_policy_modes": ["prefer_local", "local_only", "prefer_spotify"],
             "playback_strict_signal": "#EXTPROV:local_only||<provider-instance>",
             "liked_songs": False,
@@ -1900,6 +1902,23 @@ class LibraryEnrichmentProvider(PluginProvider):
         )
         return {"policy": policy, "projection": self._playback_result(projection, subscription_id)}
 
+    async def playback_detach(self, subscription_id: str, expected_destination_item_id: str,
+                              expected_content_digest: str | None = None) -> dict[str, Any]:
+        """Explicitly release an edited destination, leaving its playlist untouched."""
+        user = self._authorize()
+        if not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Detaching a playback projection requires library write permission")
+        async with self._write_lock:
+            try:
+                old = await self._store_operation(
+                    self._store.detach_playback_projection, subscription_id,
+                    expected_destination_item_id, expected_content_digest,
+                )
+            except ValueError as err:
+                raise InvalidDataError(str(err)) from None
+            return {"subscription_id": subscription_id, "state": "not_applied",
+                    "detached_destination": self._playback_result(old, subscription_id)["destination"]}
+
     async def playback_apply(self, version_id: str, expected_digest: str, expected_policy_revision: int,
                              allow_partial: bool = False) -> dict[str, Any]:
         user = self._authorize()
@@ -1992,7 +2011,9 @@ class LibraryEnrichmentProvider(PluginProvider):
                     )
             except BaseException as err:
                 await self._store_operation(self._store.fail_playback_projection, version["subscription_id"],
-                                            "Playback projection outcome uncertain" if started else "Unable to prepare playback projection",
+                                            "Playback projection outcome uncertain" if started else
+                                            str(err) if isinstance(err, InvalidDataError) else
+                                            "Unable to prepare playback projection",
                                             started)
                 if isinstance(err, asyncio.CancelledError):
                     raise
