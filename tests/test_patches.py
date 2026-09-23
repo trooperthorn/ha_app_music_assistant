@@ -9,6 +9,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -625,6 +626,98 @@ def test_steer_marks_queue_items_and_prefers_their_provider() -> None:
     assert "if not provider.is_streaming_provider" in audio
     assert "not strict_provider  # trooperthorn: play_source_steer" in audio
     assert "Local-only provider {strict_provider!r} cannot serve" in audio
+    assert "or not cached_provider.available" in audio
+
+
+@requires_py314
+def test_strict_steer_discards_cross_provider_buffer_before_acquisition() -> None:
+    audio = steer.apply(STREAMS_AUDIO.read_text(encoding="utf-8"), steer.EDITS[steer.STREAMS_AUDIO])
+    tree = ast.parse(audio)
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_get_audio_buffer"
+    )
+    source = "from __future__ import annotations\nclass Controller:\n" + "\n".join(
+        f"    {line}" if line else "" for line in ast.unparse(method).splitlines()
+    )
+
+    class AudioError(Exception):
+        pass
+
+    class MediaNotFoundError(Exception):
+        pass
+
+    class ProviderStreamLimitError(AudioError):
+        provider_instance = "filesystem_local--one"
+
+    class Track:
+        pass
+
+    class AudioBuffer:
+        calls: list[str] = []
+        fail_once = False
+
+        @staticmethod
+        async def get_buffer(**kwargs):
+            AudioBuffer.calls.append(kwargs["streamdetails"].provider)
+            if AudioBuffer.fail_once:
+                AudioBuffer.fail_once = False
+                raise ProviderStreamLimitError()
+            return object()
+
+    namespace = {
+        "asyncio": asyncio,
+        "AudioError": AudioError,
+        "AudioBuffer": AudioBuffer,
+        "MediaNotFoundError": MediaNotFoundError,
+        "ProviderStreamLimitError": ProviderStreamLimitError,
+        "Track": Track,
+    }
+    exec(source, namespace)  # noqa: S102
+    ctl = namespace["Controller"]()
+    local = SimpleNamespace(
+        instance_id="filesystem_local--one", domain="filesystem_local",
+        available=True, is_streaming_provider=False,
+    )
+    spotify = SimpleNamespace(
+        instance_id="spotify--one", domain="spotify",
+        available=True, is_streaming_provider=True,
+    )
+    providers = {local.instance_id: local, spotify.instance_id: spotify}
+    ctl.mass = SimpleNamespace(
+        get_provider=lambda key, return_unavailable=False: providers.get(key),
+        player_queues=SimpleNamespace(queue_data_or_none=lambda queue_id: None),
+    )
+    ctl._get_mapping_providers = lambda mapping: (local,)
+    ctl._has_alternative_match_providers = lambda item: False
+
+    def details(provider):
+        return SimpleNamespace(
+            provider=provider, seek_position=0, fade_in=False,
+            prefer_album_loudness=False, queue_session_id=None,
+        )
+
+    async def get_stream_details(*args, **kwargs):
+        return details(local.instance_id)
+
+    ctl.get_stream_details = get_stream_details
+    item = SimpleNamespace(
+        extra_attributes={"strict_provider": local.instance_id},
+        streamdetails=details(spotify.instance_id),
+        media_item=SimpleNamespace(provider_mappings=[
+            SimpleNamespace(available=True)
+        ]),
+        queue_id="queue", name="Song",
+    )
+    asyncio.run(ctl._get_audio_buffer(item, 0, "test", 0, True))
+    assert AudioBuffer.calls == [local.instance_id]
+    assert item.streamdetails.provider == local.instance_id
+
+    # A saturated local source may be retried, but cannot trigger a Spotify match.
+    AudioBuffer.calls.clear()
+    AudioBuffer.fail_once = True
+    asyncio.run(ctl._get_audio_buffer(item, 0, "capacity retry", 1, True))
+    assert AudioBuffer.calls == [local.instance_id, local.instance_id]
 
 
 @requires_py314

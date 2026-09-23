@@ -164,6 +164,24 @@ EDITS: dict[str, list[tuple[str, str]]] = {
     ],
     STREAMS_AUDIO: [
         (
+            "        loop = asyncio.get_running_loop()\n"
+            "        # the playback intent lives on the details we start from; keep it across a reselection\n",
+            "        loop = asyncio.get_running_loop()\n"
+            f'        strict_provider = queue_item.extra_attributes.get("strict_provider")  {MARKER}\n'
+            "        if strict_provider and queue_item.streamdetails is not None:\n"
+            "            cached_provider = self.mass.get_provider(\n"
+            "                queue_item.streamdetails.provider, return_unavailable=True\n"
+            "            )\n"
+            "            if (\n"
+            "                cached_provider is None\n"
+            "                or not cached_provider.available\n"
+            "                or cached_provider.is_streaming_provider\n"
+            "                or strict_provider not in (cached_provider.instance_id, cached_provider.domain)\n"
+            "            ):\n"
+            "                queue_item.streamdetails = None\n"
+            "        # the playback intent lives on the details we start from; keep it across a reselection\n",
+        ),
+        (
             "        time_start = time.time()\n"
             '        self.logger.debug("Getting streamdetails for %s", queue_item.uri)\n',
             "        time_start = time.time()\n"
@@ -180,6 +198,7 @@ EDITS: dict[str, list[tuple[str, str]]] = {
             "                or (strict_stream_provider := mass.get_provider(\n"
             "                    queue_item.streamdetails.provider, return_unavailable=True\n"
             "                ))\n"
+            "                and strict_stream_provider.available\n"
             "                and not strict_stream_provider.is_streaming_provider\n"
             "                and strict_provider in (\n"
             "                    strict_stream_provider.instance_id, strict_stream_provider.domain\n"
