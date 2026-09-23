@@ -21,6 +21,7 @@ import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
 import sendspin_cast_delay as cast_delay  # noqa: E402
 import sendspin_cast_status as cast_status  # noqa: E402
+import sendspin_controller_switch as switch  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 import sendspin_timing_status as timing  # noqa: E402
 
@@ -101,6 +102,30 @@ def test_sendspin_timing_reports_are_observed_not_inferred_from_config() -> None
     assert instance.extra_attributes["sendspin_min_buffer_ms"] == 80
     assert instance.extra_attributes["sendspin_timing_reported_at"] > 0
     assert changes == ["event", "event", "event"]
+
+
+@requires_py314
+def test_sendspin_switch_is_advertised_with_pinned_server_handler() -> None:
+    original = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    patched = switch.apply(timing.apply(cast_delay.apply(opus.apply(original, opus.EDITS[opus.PROVIDER]))))
+    assert switch.apply(patched) == patched
+    assert "sendspin_controller_switch.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin switch anchor found 0 times"):
+        switch.apply("SUPPORTED_GROUP_COMMANDS = []")
+
+    tree = ast.parse(patched)
+    commands = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "SUPPORTED_GROUP_COMMANDS" for target in node.targets)
+    )
+    names = [ast.unparse(item) for item in commands.value.elts]
+    assert names[-1] == "MediaCommand.SWITCH"
+    assert names.count("MediaCommand.SWITCH") == 1
+
+    controller = ROOT / "tests" / "fixtures" / "aiosendspin_controller_v1_9_1_1.py"
+    assert "handle_switch_command()" in controller.read_text(encoding="utf-8")
 
 
 @requires_py314
