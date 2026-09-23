@@ -419,16 +419,21 @@ def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
     def manual_url(address: str) -> str:
         if address == "bad":
             raise ValueError("invalid address")
+        if "://" in address:
+            return address
         return f"ws://{address}/sendspin"
 
     runtime = {
         "_manual_client_url": manual_url,
+        "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
         "SENDSPIN_SERVER_PORT": 8927,
         "CONF_ALLOW_LEGACY_CLIENTS": "allow_legacy_clients",
     }
     exec("from __future__ import annotations\nclass Provider:\n" + method_source, runtime)  # noqa: S102
     instance = runtime["Provider"]()
-    instance._manual_ip_config = ("192.168.1.10", "bad")
+    instance._manual_ip_config = (
+        "192.168.1.10", "bad", "ws://user:pass@192.168.1.11:8927/secret?token=abc",
+    )
     instance.server_api = type(
         "Server",
         (),
@@ -436,7 +441,7 @@ def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
             "_tcp_site": object(),
             "_mdns_service": object(),
             "_mdns_browser": None,
-            "_mdns_client_urls": {"Living Room._sendspin._tcp.local.": "ws://192.168.1.20:8927/sendspin"},
+            "_mdns_client_urls": {"Living Room._sendspin._tcp.local.": "ws://192.168.1.20:8927/sendspin?token=hidden"},
             "clients": [object(), object()],
             "connected_clients": [object()],
         },
@@ -450,9 +455,14 @@ def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
     assert status["client_discovery_active"] is False
     assert status["connected_clients"] == 1
     assert status["manual_addresses"] == [
-        {"address": "192.168.1.10", "valid": True},
-        {"address": "bad", "valid": False},
+        {"address": "ws://192.168.1.10", "valid": True},
+        {"address": "[invalid address]", "valid": False},
+        {"address": "ws://192.168.1.11:8927", "valid": True},
     ]
+    assert status["discovered_services"] == [
+        {"name": "Living Room._sendspin._tcp.local.", "url": "ws://192.168.1.20:8927"},
+    ]
+    assert not any(secret in str(status) for secret in ("user", "pass", "secret", "token", "hidden"))
     assert status["legacy_clients_allowed"] is False
     assert "pairing" not in str(status).lower()
 

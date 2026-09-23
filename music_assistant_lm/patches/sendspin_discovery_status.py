@@ -22,16 +22,33 @@ EDITS: list[tuple[str, str]] = [
         "\n"
         "    async def discovery_status(self) -> dict[str, Any]:\n"
         '        """Report listener, both mDNS directions, manual addresses and client counts."""\n'
+        "        def safe_endpoint(address: str) -> str:\n"
+        '            """Expose only host and port from URLs; paths and user info may be secrets."""\n'
+        "            try:\n"
+        '                parsed = urlsplit(address if "://" in address else f"//{address}")\n'
+        "                host = parsed.hostname\n"
+        "                port = parsed.port\n"
+        "            except ValueError:\n"
+        '                return "[redacted address]"\n'
+        "            if host is None:\n"
+        '                return "[redacted address]"\n'
+        '            host = f"[{host}]" if ":" in host else host\n'
+        '            scheme = f"{parsed.scheme}://" if parsed.scheme in ("ws", "wss") else ""\n'
+        '            port_text = f":{port}" if port is not None else ""\n'
+        '            return f"{scheme}{host}{port_text}"\n'
+        "\n"
         "        server = self.server_api\n"
         "        manual = []\n"
         "        for address in self._manual_ip_config:\n"
         "            try:\n"
-        "                _manual_client_url(address)\n"
+        "                url = _manual_client_url(address)\n"
         "            except ValueError:\n"
         "                valid = False\n"
+        '                display_address = "[invalid address]"\n'
         "            else:\n"
         "                valid = True\n"
-        '            manual.append({"address": address, "valid": valid})\n'
+        "                display_address = safe_endpoint(url)\n"
+        '            manual.append({"address": display_address, "valid": valid})\n'
         "        return {\n"
         '            "api_version": 1,\n'
         '            "listener_active": server._tcp_site is not None,\n'
@@ -41,7 +58,7 @@ EDITS: list[tuple[str, str]] = [
         '            "advertise_address": self.mass.streams.publish_ip,\n'
         '            "client_discovery_active": server._mdns_browser is not None,\n'
         '            "discovered_services": [\n'
-        '                {"name": name, "url": url}\n'
+        '                {"name": name, "url": safe_endpoint(url)}\n'
         "                for name, url in sorted(server._mdns_client_urls.items())\n"
         "            ],\n"
         '            "manual_addresses": manual,\n'

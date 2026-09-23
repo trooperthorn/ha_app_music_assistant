@@ -38,3 +38,8 @@ device test rather than a conclusion from wire compatibility alone.
 Source input has a separate latency boundary. See
 [Sendspin source-to-output latency](sendspin-source-latency.md) for the
 reported bridge diagnostics and the acoustic measurement procedure.
+
+The read-only discovery endpoint reports manual and mDNS client hosts and
+ports for troubleshooting. It strips URL user information, paths, queries,
+and fragments, and replaces malformed manual entries with a placeholder so
+configured tokens are not copied into diagnostics.
