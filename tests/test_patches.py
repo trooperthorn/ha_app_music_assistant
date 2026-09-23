@@ -21,6 +21,7 @@ import hass_source_select as patch  # noqa: E402
 import library_trash as trash  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
+import sendspin_availability as availability  # noqa: E402
 import sendspin_cast_delay as cast_delay  # noqa: E402
 import sendspin_cast_status as cast_status  # noqa: E402
 import sendspin_controller_switch as switch  # noqa: E402
@@ -48,10 +49,59 @@ STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_4.py"
 # aiosendspin as server 2.10.4 pins it (aiosendspin[server]==9.1.1)
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
+AIOSENDSPIN_CLIENT = ROOT / "tests" / "fixtures" / "aiosendspin_client_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
 SENDSPIN_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_provider_2_10_4.py"
 SENDSPIN_SOURCE_PROVIDER = ROOT / "tests" / "fixtures" / "sendspin_source_provider_2_10_4.py"
+
+
+@requires_py314
+def test_sendspin_occupied_client_updates_music_assistant_availability() -> None:
+    client_source = AIOSENDSPIN_CLIENT.read_text(encoding="utf-8")
+    player_source = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    client_patched = availability.apply(client_source, availability.CLIENT_MODULE)
+    player_patched = availability.apply(player_source, availability.PLAYER_MODULE)
+    assert availability.apply(client_patched, availability.CLIENT_MODULE) == client_patched
+    assert availability.apply(player_patched, availability.PLAYER_MODULE) == player_patched
+    assert "sendspin_availability.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    assert "self._attr_available = sendspin_client.available" in player_patched
+    with pytest.raises(SystemExit, match="anchor found 0 times"):
+        availability.apply("class SendspinClient: pass", availability.CLIENT_MODULE)
+
+    tree = ast.parse(client_patched)
+    client_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinClient")
+    method = next(
+        node for node in client_class.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_availability_change"
+    )
+    runtime = {}
+    method_source = "\n".join(
+        f"    {line}" for line in ast.unparse(method).splitlines()
+    )
+    exec("from __future__ import annotations\nclass TestClient:\n" + method_source, runtime)  # noqa: S102
+    updates = []
+    transitions = []
+    test_client = runtime["TestClient"]()
+    test_client._available = True
+    test_client._roles = {}
+    test_client._client_id = "occupied-speaker"
+    test_client._server = type("Server", (), {
+        "_signal_client_updated": lambda self, client_id: updates.append(client_id),
+    })()
+
+    async def transition():
+        transitions.append("solo-stopped")
+
+    test_client._handle_external_source_transition = transition
+    asyncio.run(test_client.handle_availability_change(False))
+    assert test_client._available is False
+    assert updates == ["occupied-speaker"]
+    assert transitions == ["solo-stopped"]
+    asyncio.run(test_client.handle_availability_change(True))
+    assert test_client._available is True
+    assert updates == ["occupied-speaker", "occupied-speaker"]
+    assert transitions == ["solo-stopped"]  # returning available never auto-rejoins
 
 
 @requires_py314
