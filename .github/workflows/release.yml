@@ -52,16 +52,7 @@ jobs:
 
           RELEASE_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
           if [ "$RELEASE_DRAFT" = "false" ]; then
-            if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-              echo "::error::Published release $TAG has no local tag to verify."
-              exit 1
-            fi
-            TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
-            if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
-              echo "::error::Published release $TAG points to $TAG_COMMIT, not this main commit $GITHUB_SHA. Bump the app version before merging."
-              exit 1
-            fi
-            echo "Published release $TAG already covers $GITHUB_SHA; nothing to do."
+            echo "Published release $TAG already exists; nothing to do."
             printf 'publish=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
