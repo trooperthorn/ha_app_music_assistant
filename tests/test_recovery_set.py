@@ -1,5 +1,6 @@
 """Offline, coordinated recovery packaging never replaces a healthy installation."""
 
+import base64
 import importlib.util
 import json
 import sqlite3
@@ -28,7 +29,11 @@ VERSIONS = {"app": "2026.09.22.2", "server": "2.10.4", "frontend": "2026.9.22.1"
 
 def _data(root: Path) -> Path:
     root.mkdir()
-    (root / "settings.json").write_text('{"example":true}', encoding="utf-8")
+    settings = {
+        "server_id": "test-server",
+        "encryption_key": base64.urlsafe_b64encode(bytes(range(32))).decode(),
+    }
+    (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     for name in ("library.db", "auth.db"):
         with closing(sqlite3.connect(root / name)) as db:
             db.execute("CREATE TABLE marker (value TEXT)")
@@ -126,6 +131,29 @@ def test_malformed_settings_never_publish(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="settings cannot be parsed"):
         recovery.create(source, tmp_path / "bad-settings-set", VERSIONS)
     assert not (tmp_path / "bad-settings-set").exists()
+
+
+@pytest.mark.parametrize("missing", ["server_id", "encryption_key"])
+def test_missing_credential_identity_never_publishes(tmp_path: Path, missing: str) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    settings_path = source / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    del settings[missing]
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing"):
+        recovery.create(source, tmp_path / "invalid-set", VERSIONS)
+    assert not (tmp_path / "invalid-set").exists()
+
+
+def test_invalid_encryption_key_never_publishes(tmp_path: Path) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    settings_path = source / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings["encryption_key"] = "not-a-fernet-key"
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    with pytest.raises(ValueError, match="key is invalid"):
+        recovery.create(source, tmp_path / "invalid-set", VERSIONS)
+    assert not (tmp_path / "invalid-set").exists()
 
 
 def test_archive_semantic_corruption_never_publishes(tmp_path: Path) -> None:

@@ -25,6 +25,13 @@ database checks. Staging refuses an existing destination, a version mismatch,
 an older or unsupported archive schema, corruption, missing files, symlinks,
 and an incomplete marker. The tool **never replaces the live directory**.
 
+Music Assistant 2.10.4 stores its server ID and Fernet encryption key in
+`settings.json`. This verifier requires both the ID and a structurally valid
+key, and keeps `settings.json` and `auth.db` together with the library. Restore
+those files as a unit; removing or regenerating the key can make saved provider
+credentials unreadable. This check does not prove that remote service tokens
+will still be accepted after a restore.
+
 The contents may include account tokens, credentials, playback preferences,
 user information, and paths. Keep the recovery set in private protected
 storage. Its SHA-256 hashes detect accidental change; they are not a signature
@@ -33,6 +40,6 @@ separately reviewed cutover, check account reauthentication, local root
 mappings, player groups, source preferences, and measured delay settings.
 
 This is the offline staging and verification part of Phase 8. A coordinated
-live snapshot/cutover, credential portability decision, migration for older
+live snapshot/cutover, live credential validation, migration for older
 schemas, and restoration on test hardware still require implementation and
 validation. The separate music-drive backup does not replace this set.

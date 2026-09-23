@@ -7,6 +7,8 @@ backup), never the running server directory. No command replaces live data.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -115,6 +117,18 @@ def _verify_core(root: Path) -> None:
         settings = json.loads((root / "settings.json").read_text(encoding="utf-8"))
         if not isinstance(settings, dict):
             raise ValueError("Music Assistant settings must be a JSON object")
+        server_id = settings.get("server_id")
+        encryption_key = settings.get("encryption_key")
+        if not isinstance(server_id, str) or not server_id.strip():
+            raise ValueError("Music Assistant server identity is missing")
+        if not isinstance(encryption_key, str):
+            raise ValueError("Music Assistant encryption key is missing")
+        try:
+            key_bytes = base64.b64decode(encryption_key, altchars=b"-_", validate=True)
+        except (ValueError, binascii.Error) as err:
+            raise ValueError("Music Assistant encryption key is invalid") from err
+        if len(key_bytes) != 32:
+            raise ValueError("Music Assistant encryption key is invalid")
     except (UnicodeError, json.JSONDecodeError) as err:
         raise ValueError("Music Assistant settings cannot be parsed") from err
     for name in ("library.db", "auth.db"):
@@ -185,6 +199,8 @@ def verify(recovery_set: Path, expected_versions: dict[str, str] | None = None) 
     expected_top = {DATA, MANIFEST, COMPLETION}
     if {path.name for path in root.iterdir()} != expected_top:
         raise ValueError("Recovery set is incomplete or has unexpected entries")
+    if any(path.is_symlink() for path in root.iterdir()):
+        raise ValueError("Recovery set contains a top-level symlink")
     manifest_bytes = (root / MANIFEST).read_bytes()
     expected_digest = hashlib.sha256(manifest_bytes).hexdigest()
     if (root / COMPLETION).read_text(encoding="ascii").strip() != expected_digest:
