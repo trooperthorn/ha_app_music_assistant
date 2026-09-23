@@ -49,7 +49,7 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are seven: four anchor patches that rewrite exact lines in an
+Today there are eight: five anchor patches that rewrite exact lines in an
 already-installed file, and three plugin providers that add a self-contained
 new provider directory instead (see `docs/extension-points.md` for the
 distinction).
@@ -98,6 +98,11 @@ Anchor patches:
   `syncDelay` at launch and after configuration changes, but its provisional
   role does not advertise the generic delay command, hiding the setting while
   idle. Other bridges retain capability-gated delay controls.
+- `sendspin_cast_status.py`: publishes bounded Cast receiver state transitions
+  (`connecting`, `connected`, `playing`, `stopped`, `error`, `disconnected`) on
+  its derived Sendspin player's `extra_attributes.sendspin_cast_state` for
+  HTTP/ingress clients. It suppresses duplicate events and does not expose
+  receiver log text.
 
 Plugin providers:
 

@@ -20,6 +20,7 @@ import library_trash as trash  # noqa: E402
 import play_source_steer as steer  # noqa: E402
 import playlist_bridge as bridge  # noqa: E402
 import sendspin_cast_delay as cast_delay  # noqa: E402
+import sendspin_cast_status as cast_status  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
 
 # streams_audio_2_10_4.py and sendspin_player_2_10_4.py are verbatim pinned
@@ -41,6 +42,68 @@ STREAMS_AUDIO = ROOT / "tests" / "fixtures" / "streams_audio_2_10_4.py"
 AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
+CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
+
+
+@requires_py314
+def test_cast_receiver_states_reach_player_without_log_text() -> None:
+    original = CHROMECAST_SENDSPIN_BRIDGE.read_text(encoding="utf-8")
+    patched = cast_status.apply(original)
+    assert cast_status.apply(patched) == patched
+    assert "sendspin_cast_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Cast status anchor found 0 times"):
+        cast_status.apply("class SendspinCastController: pass")
+
+    tree = ast.parse(patched)
+    controller = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinCastController")
+
+    class BaseController:
+        def __init__(self, namespace):
+            self.namespace = namespace
+
+    class Logger:
+        def error(self, *_args):
+            pass
+
+    namespace = {
+        "BaseController": BaseController,
+        "SENDSPIN_CAST_NAMESPACE": "cast",
+        "_CAST_LOG_LEVEL_MAP": {},
+        "logging": __import__("logging"),
+    }
+    exec("from __future__ import annotations\n" + ast.unparse(controller), namespace)  # noqa: S102
+    seen: list[str] = []
+    receiver = namespace["SendspinCastController"](Logger(), on_cast_status=seen.append)
+    for state in ("connecting", "connected", "playing", "stopped", "error", "unknown"):
+        receiver._handle_status({"state": state, "message": "private receiver diagnostic"})
+    assert seen == ["connecting", "connected", "playing", "stopped", "error"]
+
+    bridge = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinChromecastBridge")
+    method = next(node for node in bridge.body if isinstance(node, ast.FunctionDef) and node.name == "_publish_cast_receiver_status")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+    runtime = {}
+    exec("from __future__ import annotations\nclass Bridge:\n" + method_source, runtime)  # noqa: S102
+    player = type("Player", (), {"extra_attributes": {}, "update_state": lambda self: seen.append("event")})()
+    bridge_instance = runtime["Bridge"]()
+    bridge_instance._bridge_client_id = "cast-id"
+    bridge_instance.mass = type(
+        "Mass",
+        (),
+        {
+            "players": type(
+                "Players",
+                (),
+                {
+                    "get_player": lambda self, _: player,
+                },
+            )()
+        },
+    )()
+    bridge_instance._publish_cast_receiver_status("connecting")
+    bridge_instance._publish_cast_receiver_status("connecting")
+    bridge_instance._publish_cast_receiver_status("error")
+    assert player.extra_attributes == {"sendspin_cast_state": "error"}
+    assert seen[-2:] == ["event", "event"]
 
 
 @requires_py314
