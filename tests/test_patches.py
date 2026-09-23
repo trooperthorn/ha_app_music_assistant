@@ -345,6 +345,8 @@ def test_sendspin_non_audio_roles_never_create_audio_player() -> None:
             self.static_delay_default_ms = None
 
     class Display:
+        is_web_player = False
+
         def __init__(self, *_: object, **__: object) -> None:
             self._attr_supported_features = {"set_members"}
 
@@ -365,8 +367,10 @@ def test_sendspin_non_audio_roles_never_create_audio_player() -> None:
     for attr in ("_bridge_identifiers", "_bridge_player_types", "_bridge_underlying_players", "_bridge_static_delay_defaults"):
         setattr(instance, attr, {})
 
-    def create(*roles: str) -> object:
-        client = type("Client", (), {"negotiated_role_ids": roles})()
+    def create(*roles: str, product_name: str | None = None) -> object:
+        device_info = type("DeviceInfo", (), {"product_name": product_name})() if product_name else None
+        info = type("Info", (), {"device_info": device_info})()
+        client = type("Client", (), {"negotiated_role_ids": roles, "info": info})()
         return instance._create_player("test-client", client, None)
 
     assert isinstance(create("player@v1"), Audio)
@@ -377,6 +381,11 @@ def test_sendspin_non_audio_roles_never_create_audio_player() -> None:
         assert result._attr_type in {"display", "visualizer"}
         if role == "controller@v1":
             assert result._attr_supported_features == set()
+        assert result.is_web_player is False
+    browser_display = create("metadata@v1", product_name="Music Assistant Display")
+    assert isinstance(browser_display, Display)
+    assert browser_display.is_web_player is True
+    assert browser_display._attr_private is True
 
 
 @requires_py314

@@ -39,6 +39,14 @@ BRANCH_REPLACEMENT = (
     "                PlayerType.DISPLAY if has_metadata_role or has_artwork_role else PlayerType.VISUALIZER\n"
     "            )\n"
     "            viz_player = SendspinVisualizerPlayer(self, client_id, initial_hello=initial_hello)\n"
+    "            client_info = initial_hello or sendspin_client.info\n"
+    "            device_info = client_info.device_info\n"
+    "            # The account-bound web pairing endpoint also serves browser displays.\n"
+    "            viz_player.is_web_player = bool(\n"
+    '                device_info and device_info.product_name == "Music Assistant Display"\n'
+    "            )\n"
+    "            if viz_player.is_web_player:\n"
+    "                viz_player._attr_private = True\n"
     "            viz_player._attr_type = bridge_player_type or default_type\n"
     "            player = viz_player\n"
 )
