@@ -76,6 +76,7 @@ def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() 
     assert all(output_delay.apply(source, module) == source for module, source in patched.items())
     assert 'SET_OUTPUT_DELAY = "set_output_delay"' in patched[output_delay.TYPES]
     assert 'output_delay_ms: int | None = None' in patched[output_delay.MODEL]
+    assert 'format: SupportedAudioFormat | None = None' in patched[output_delay.MODEL]
     assert 'supported_commands: list[PlayerCommand] = field(default_factory=list)' in patched[output_delay.MODEL]
     assert 'PlayerCommand.VOLUME, PlayerCommand.MUTE' in patched[output_delay.MODEL]
     assert 'command = PlayerCommand.SET_OUTPUT_DELAY' in patched[output_delay.ROLE]
@@ -124,6 +125,24 @@ def test_current_sendspin_output_delay_wire_is_supported_with_legacy_fallback() 
     role.state_supported_commands = []
     role.set_static_delay(250)
     assert sent == []
+
+    state_method = next(node for node in role_class.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "on_client_state")
+    format_branch = next(node for node in state_method.body if isinstance(node, ast.If)
+                         and ast.unparse(node.test) == "state.format is not None")
+    format_source = "def apply_format(self, state):\n" + "\n".join(
+        "    " + line for line in ast.unparse(format_branch).splitlines()
+    )
+    namespace.update({
+        "StreamRequestFormatPlayer": lambda **kwargs: SimpleNamespace(**kwargs),
+        "StreamRequestFormatPayload": lambda player: SimpleNamespace(player=player),
+    })
+    exec(format_source, namespace)  # noqa: S102
+    requested = []
+    format_role = SimpleNamespace(on_stream_request_format=requested.append)
+    format_state = SimpleNamespace(format=SimpleNamespace(codec="pcm", sample_rate=48000, channels=2, bit_depth=16))
+    namespace["apply_format"](format_role, format_state)
+    assert vars(requested[0].player) == {"codec": "pcm", "sample_rate": 48000, "channels": 2, "bit_depth": 16}
 
     provider_tree = ast.parse(patched[output_delay.PROVIDER])
     player_class = next(node for node in provider_tree.body if isinstance(node, ast.ClassDef)

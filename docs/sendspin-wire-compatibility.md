@@ -22,6 +22,13 @@ for a legacy client. It never sends a delay command to a client that advertises
 neither. The existing `sendspin_static_delay` Music Assistant configuration key
 is retained so saved player settings do not need migration.
 
+The current spec also lets a client report a preferred audio `format` in
+`client/state`. The pinned model ignored that field. The patch parses it and
+routes changes through the pinned role's existing format-request validation and
+transition path, which checks the client's supported formats and the server's
+encoder support before changing streams. Legacy `stream/request-format` remains
+available.
+
 This patch does not make an unsupported client adjustable. It also does not
 change AirPlay or Squeezelite's signed `sync_adjust`, browser-local timing, or
 the Cast receiver's separate saved delay. A real client must acknowledge its

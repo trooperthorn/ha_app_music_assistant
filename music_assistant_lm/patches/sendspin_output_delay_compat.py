@@ -37,6 +37,12 @@ EDITS: dict[str, list[tuple[str, str]]] = {
         ('        VALID_STATE_COMMANDS = {PlayerCommand.SET_STATIC_DELAY}  # noqa: N806\n',
          '        VALID_STATE_COMMANDS = {PlayerCommand.VOLUME, PlayerCommand.MUTE,\n'
          '                                PlayerCommand.SET_STATIC_DELAY, PlayerCommand.SET_OUTPUT_DELAY}  # noqa: N806\n'),
+        ('    supported_commands: list[PlayerCommand] | None = None\n'
+         '    """Subset of: \'set_static_delay\'. Commands this player supports via client/state."""\n',
+         '    supported_commands: list[PlayerCommand] | None = None\n'
+         '    """Commands this player supports via client/state."""\n'
+         '    format: SupportedAudioFormat | None = None\n'
+         '    """Current-spec preferred audio format, if the client selects one."""\n'),
         ('    static_delay_ms: int | None = None\n    """Delay in milliseconds (0-5000), only set if command is set_static_delay."""\n',
          '    output_delay_ms: int | None = None\n    """Current-spec delay, only set if command is set_output_delay."""\n'
          '    static_delay_ms: int | None = None\n    """Delay in milliseconds (0-5000), only set if command is set_static_delay."""\n'),
@@ -49,6 +55,10 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '        if self.command == PlayerCommand.SET_STATIC_DELAY:\n'),
     ],
     ROLE: [
+        ('from aiosendspin.models.player import PlayerCommandPayload, StreamStartPlayer, SupportedAudioFormat\n',
+         'from aiosendspin.models.player import (\n'
+         '    PlayerCommandPayload, StreamRequestFormatPlayer, StreamStartPlayer, SupportedAudioFormat,\n'
+         ')\n'),
         ('        if not support or PlayerCommand.VOLUME not in support.supported_commands:\n            return\n',
          '        commands = set(support.supported_commands if support else []) | set(self.state_supported_commands)\n'
          '        if PlayerCommand.VOLUME not in commands:\n            return\n'),
@@ -111,6 +121,18 @@ EDITS: dict[str, list[tuple[str, str]]] = {
          '        if reported_delay is not None and self.static_delay_ms != reported_delay:\n'
          '            self.static_delay_ms = reported_delay\n'
          '            self.emit_client_event(StaticDelayChangedEvent(static_delay_ms=reported_delay))\n'),
+        ('        if state.min_buffer_ms is not None and self.min_buffer_ms != state.min_buffer_ms:\n'
+         '            self.min_buffer_ms = state.min_buffer_ms\n'
+         '            self.emit_client_event(MinBufferChangedEvent(min_buffer_ms=state.min_buffer_ms))\n',
+         '        if state.min_buffer_ms is not None and self.min_buffer_ms != state.min_buffer_ms:\n'
+         '            self.min_buffer_ms = state.min_buffer_ms\n'
+         '            self.emit_client_event(MinBufferChangedEvent(min_buffer_ms=state.min_buffer_ms))\n'
+         '        if state.format is not None:\n'
+         '            fmt = state.format\n'
+         '            self.on_stream_request_format(StreamRequestFormatPayload(player=StreamRequestFormatPlayer(\n'
+         '                codec=fmt.codec, sample_rate=fmt.sample_rate, channels=fmt.channels,\n'
+         '                bit_depth=fmt.bit_depth,\n'
+         '            )))\n'),
     ],
     PROVIDER: [
         ('            case VolumeChangedEvent(volume=volume, muted=muted):\n'
