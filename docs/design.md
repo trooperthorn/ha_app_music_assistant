@@ -119,6 +119,9 @@ Anchor patches:
   client-discovery, manual-address validity, and connected-client status
   without returning pairing credentials or altering connections. Its
   `api_version: 1` advertises the response shape to newer frontend wheels.
+  The same patch provides `sendspin/display_capabilities` at player-control
+  scope; the frontend checks its `browser_display_pairing` flag before opening
+  a display connection during a frontend-first release.
 - `sendspin_non_audio_clients.py`: classifies artwork, color and controller-only
   clients as non-audio devices, so they cannot be selected as speakers.
   A browser `Music Assistant Display` client is account-paired through the

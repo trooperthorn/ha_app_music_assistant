@@ -395,12 +395,24 @@ def test_sendspin_discovery_status_is_read_only_and_admin_scoped() -> None:
     assert discovery.apply(patched) == patched
     assert "sendspin_discovery_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
     assert '"sendspin/discovery_status"' in patched
+    assert '"sendspin/display_capabilities"' in patched
     assert "required_scope=Scope.CONFIG_PROVIDERS_READ" in patched
+    assert "required_scope=Scope.PLAYERS_CONTROL" in patched
     with pytest.raises(SystemExit, match="Sendspin discovery anchor found 0 times"):
         discovery.apply("class SendspinProvider: pass")
 
     tree = ast.parse(patched)
     provider = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinProvider")
+    capabilities_method = next(
+        node for node in provider.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "display_capabilities"
+    )
+    capabilities_source = "\n".join(f"    {line}" for line in ast.unparse(capabilities_method).splitlines())
+    capabilities_runtime: dict[str, object] = {}
+    exec("from __future__ import annotations\nclass Provider:\n" + capabilities_source, capabilities_runtime)  # noqa: S102
+    assert asyncio.run(capabilities_runtime["Provider"]().display_capabilities()) == {
+        "api_version": 1, "browser_display_pairing": True,
+    }
     method = next(node for node in provider.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "discovery_status")
     method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
 

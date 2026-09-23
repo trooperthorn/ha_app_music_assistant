@@ -16,6 +16,10 @@ MODULE = "music_assistant.providers.sendspin.provider"
 EDITS: list[tuple[str, str]] = [
     (
         '    async def loaded_in_mass(self) -> None:\n        """Call after the provider has been loaded."""\n',
+        "    async def display_capabilities(self) -> dict[str, object]:\n"
+        '        """Advertise support for paired, non-audio browser displays."""\n'
+        '        return {"api_version": 1, "browser_display_pairing": True}\n'
+        "\n"
         "    async def discovery_status(self) -> dict[str, Any]:\n"
         '        """Report listener, both mDNS directions, manual addresses and client counts."""\n'
         "        server = self.server_api\n"
@@ -61,6 +65,13 @@ EDITS: list[tuple[str, str]] = [
         '                "sendspin/discovery_status",\n'
         "                self.discovery_status,\n"
         "                required_scope=Scope.CONFIG_PROVIDERS_READ,\n"
+        "            )\n"
+        "        )\n"
+        "        self.unregister_cbs.append(\n"
+        "            self.mass.register_api_command(\n"
+        '                "sendspin/display_capabilities",\n'
+        "                self.display_capabilities,\n"
+        "                required_scope=Scope.PLAYERS_CONTROL,\n"
         "            )\n"
         "        )\n"
         "        self.unregister_cbs.append(\n"
