@@ -157,6 +157,52 @@ def test_mirror_detach_preserves_identity_until_explicit_new_destination(tmp_pat
     store.close()
 
 
+def test_rebind_applied_mirror_requires_exact_checkpoint_and_unclaimed_destination(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.configure_mirror(sub, True, False, 0)
+    store.prepare_mirror(sub, version, "a" * 64)
+    store.mark_mirror_writing(sub)
+    original = store.commit_mirror(sub, "old-id", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="changed"):
+        store.rebind_destination("mirror", sub, "old-id", "new-id", "builtin", "c" * 64, original["revision"])
+    with pytest.raises(ValueError, match="revision conflict"):
+        store.rebind_destination("mirror", sub, "old-id", "new-id", "builtin", "b" * 64, 99)
+    rebound = store.rebind_destination("mirror", sub, "old-id", "new-id", "builtin", "b" * 64,
+                                       original["revision"])
+    assert rebound["destination_item_id"] == "new-id"
+    assert rebound["revision"] == original["revision"] + 1
+    assert rebound["applied_version_id"] == version
+    with pytest.raises(ValueError, match="changed"):
+        store.rebind_destination("mirror", sub, "old-id", "another-id", "builtin", "b" * 64,
+                                 original["revision"])
+    other = subscribe(store, playlist="other")
+    other_version = capture(store, other)
+    store.configure_mirror(other, True, False, 0)
+    store.prepare_mirror(other, other_version, "a" * 64)
+    store.mark_mirror_writing(other)
+    store.commit_mirror(other, "claimed-id", "builtin", "a" * 64, "b" * 64)
+    with pytest.raises(ValueError, match="claimed"):
+        store.rebind_destination("mirror", sub, "new-id", "claimed-id", "builtin", "b" * 64,
+                                 rebound["revision"])
+    store.close()
+
+
+def test_rebind_applied_playback_projection_preserves_policy_checkpoint(tmp_path):
+    store = ArchiveStore(tmp_path / "archive.db")
+    sub = subscribe(store)
+    version = capture(store, sub)
+    store.prepare_playback_projection(sub, version, 0, "a" * 64, 1, 0, "[]")
+    store.mark_playback_projection_writing(sub)
+    original = store.commit_playback_projection(sub, "old-id", "builtin", "a" * 64, "b" * 64)
+    rebound = store.rebind_destination("playback", sub, "old-id", "new-id", "builtin", "b" * 64, None)
+    assert rebound["destination_item_id"] == "new-id"
+    assert rebound["version_id"] == original["version_id"]
+    assert rebound["policy_revision"] == original["policy_revision"]
+    store.close()
+
+
 def test_mirror_restart_marks_external_write_uncertain_without_retry(tmp_path):
     path = tmp_path / "archive.db"
     store = ArchiveStore(path)

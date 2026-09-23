@@ -542,7 +542,7 @@ def test_scoped_instance_required_and_all_commands_have_scope(plugin):
     with pytest.raises(Exception, match="accessible"):
         asyncio.run(plugin.provider.preview("spotify", "playlist"))
     asyncio.run(plugin.provider.loaded_in_mass())
-    assert len(plugin.registered) == 43
+    assert len(plugin.registered) == 45
     assert all(scope == "config.providers.write" for _, scope in plugin.registered)
 
 
@@ -1833,6 +1833,43 @@ def test_maintained_mirror_updates_changed_source_and_skips_unchanged(plugin, mo
         f"spotify://track/{'T' * 22}", f"spotify://track/{'U' * 22}", f"spotify://track/{'T' * 22}",
     ]
     assert store.get_version(version_a)["occurrences"][0]["source_item_id"] == "T" * 22
+
+
+def test_applied_mirror_rebind_verifies_new_playlist_bytes_and_review_checkpoint(plugin):
+    version_id, builtin, playlists = _apply_fixture(plugin)
+    subscription_id = plugin.provider._store.get_version(version_id)["subscription_id"]
+    builtin._get_playlist_lock = lambda _: asyncio.Lock()
+    builtin._write_m3u_file = AsyncMock()
+    playlists.get_library_item = AsyncMock(return_value=types.SimpleNamespace(
+        item_id="123", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="copy")],
+    ))
+    asyncio.run(plugin.provider.mirror_configure(subscription_id, True, False, 0))
+    preview = asyncio.run(plugin.provider.mirror_preview(subscription_id))
+    applied = asyncio.run(plugin.provider.mirror_apply(subscription_id, version_id, preview["projection_digest"]))
+    original_bytes = builtin._read_m3u_file.return_value
+    playlists.get_library_item.return_value = types.SimpleNamespace(
+        item_id="456", provider_mappings=[types.SimpleNamespace(provider_instance="builtin", item_id="restored")],
+    )
+    review = asyncio.run(plugin.provider.destination_rebind_inspect("mirror", subscription_id, "456"))
+    assert review["classification"] == "exact_content"
+    assert review["old_item_id"] == "123"
+    builtin._read_m3u_file.return_value = original_bytes + "spotify://track/user-edit\n"
+    with pytest.raises(plugin.module.InvalidDataError, match="contents differ"):
+        asyncio.run(plugin.provider.destination_rebind_apply(
+            "mirror", subscription_id, "456", review["old_item_id"],
+            review["expected_content_digest"], review["observed_content_digest"], review["revision"],
+        ))
+    assert plugin.provider._store.get_mirror(subscription_id)["destination_item_id"] == "123"
+    builtin._read_m3u_file.return_value = original_bytes
+    rebound = asyncio.run(plugin.provider.destination_rebind_apply(
+        "mirror", subscription_id, "456", review["old_item_id"],
+        review["expected_content_digest"], review["observed_content_digest"], review["revision"],
+    ))
+    assert rebound["destination"]["destination_item_id"] == "456"
+    assert rebound["destination"]["revision"] == applied["revision"] + 1
+    assert playlists.import_playlist.await_count == 1
+    with pytest.raises(plugin.module.InvalidDataError, match="Choose a different"):
+        asyncio.run(plugin.provider.destination_rebind_inspect("mirror", subscription_id, "456"))
 
 
 def test_uncertain_mirror_creation_can_attach_only_a_verified_candidate(plugin):

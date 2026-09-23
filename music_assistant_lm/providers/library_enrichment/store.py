@@ -2116,6 +2116,40 @@ class ArchiveStore:
                     return True
             return False
 
+    def rebind_destination(
+        self, kind: str, subscription_id: str, old_item_id: str, new_item_id: str,
+        provider_instance: str, expected_content_digest: str, expected_revision: int | None,
+    ) -> dict:
+        """Repoint an applied destination after exact content has been verified externally."""
+        if kind not in ("mirror", "playback"):
+            raise ValueError("Unsupported destination kind")
+        if not all(isinstance(value, str) and value.strip() for value in
+                   (subscription_id, old_item_id, new_item_id, provider_instance)) or old_item_id == new_item_id:
+            raise ValueError("Distinct old and new destination IDs are required")
+        digest = self._sha256(expected_content_digest, "expected_content_digest")
+        if kind == "mirror" and (type(expected_revision) is not int or expected_revision < 0):
+            raise ValueError("Mirror revision is required")
+        with self._transaction():
+            row = (self.get_mirror(subscription_id) if kind == "mirror"
+                   else self.get_playback_projection(subscription_id))
+            if row is None or row["state"] != "applied":
+                raise ValueError("Only an applied destination can be rebound")
+            if row["destination_item_id"] != old_item_id or row["destination_content_digest"] != digest:
+                raise ValueError("Destination changed; inspect again")
+            if kind == "mirror" and row["revision"] != expected_revision:
+                raise ValueError("Mirror revision conflict")
+            if self.mirror_destination_claimed(subscription_id, new_item_id):
+                raise ValueError("Replacement playlist is claimed by another operation")
+            table = "maintained_mirrors" if kind == "mirror" else "playback_projections"
+            revision_update = ",revision=revision+1" if kind == "mirror" else ""
+            self._db.execute(
+                f"UPDATE {table} SET destination_item_id=?,destination_provider_instance=?,"  # noqa: S608
+                f"updated_at=?{revision_update} WHERE subscription_id=?",
+                (new_item_id, provider_instance, _now(), subscription_id),
+            )
+            return (self.get_mirror(subscription_id) if kind == "mirror"
+                    else self.get_playback_projection(subscription_id))
+
     def reconcile_mirror_applied(self, subscription_id: str, expected_revision: int,
                                  expected_target_digest: str, destination_item_id: str,
                                  destination_provider_instance: str, observed_content_digest: str) -> dict:

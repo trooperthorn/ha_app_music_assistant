@@ -122,6 +122,8 @@ class LibraryEnrichmentProvider(PluginProvider):
             ("mirror_reconcile_preview", self.mirror_reconcile_preview),
             ("mirror_reconcile", self.mirror_reconcile),
             ("mirror_abandon_uncertain", self.mirror_abandon_uncertain),
+            ("destination_rebind_inspect", self.destination_rebind_inspect),
+            ("destination_rebind_apply", self.destination_rebind_apply),
         ):
             self._handles.append(
                 self.mass.register_api_command(f"library_enrichment/{command}", handler, required_scope=Scope.CONFIG_PROVIDERS_WRITE)
@@ -225,6 +227,7 @@ class LibraryEnrichmentProvider(PluginProvider):
             "playback_policy": True,
             "playback_policy_api_version": 1,
             "playback_detach": True,
+            "destination_rebind_api_version": 1,
             "playback_policy_modes": ["prefer_local", "local_only", "prefer_spotify"],
             "playback_strict_signal": "#EXTPROV:local_only||<provider-instance>",
             "liked_songs": False,
@@ -2210,6 +2213,94 @@ class LibraryEnrichmentProvider(PluginProvider):
                 )
             except ValueError as err:
                 raise InvalidDataError(str(err)) from None
+
+    async def _destination_rebind(
+        self, kind: str, subscription_id: str, candidate_item_id: str, *,
+        apply: bool = False, expected_old_item_id: str | None = None,
+        expected_content_digest: str | None = None,
+        expected_observed_digest: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        user = self._authorize()
+        if apply and not has_scope(user, Scope.LIBRARY_WRITE):
+            raise InsufficientPermissions("Rebinding a playlist requires library write permission")
+        if kind not in ("mirror", "playback") or not isinstance(candidate_item_id, str) \
+                or not 1 <= len(candidate_item_id) <= 128:
+            raise InvalidDataError("Select a mirror or playback destination and exact playlist ID")
+        read = self._store_operation if apply else self._read_store
+        row = await read(
+            self._store.get_mirror if kind == "mirror" else self._store.get_playback_projection,
+            subscription_id,
+        )
+        if row is None or row["state"] != "applied" or not row.get("destination_item_id") \
+                or not row.get("destination_content_digest"):
+            raise InvalidDataError("Only an applied destination with verified content can be rebound")
+        old_item_id = row["destination_item_id"]
+        if candidate_item_id == old_item_id:
+            raise InvalidDataError("Choose a different playlist ID")
+        if await read(self._store.mirror_destination_claimed, subscription_id, candidate_item_id):
+            raise InvalidDataError("Replacement playlist is claimed by another operation")
+        builtin = next((p for p in self.mass.music.providers if p.domain == "builtin" and p.available), None)
+        if builtin is None or not callable(getattr(builtin, "_read_m3u_file", None)) \
+                or not callable(getattr(builtin, "_get_playlist_lock", None)):
+            raise InvalidDataError("An accessible compatible builtin playlist provider is required")
+        try:
+            destination = await self.mass.music.playlists.get_library_item(candidate_item_id)
+        except Exception:
+            raise InvalidDataError("Candidate playlist is unavailable") from None
+        if str(destination.item_id) != candidate_item_id:
+            raise InvalidDataError("Candidate playlist identity changed")
+        mapping = next((m for m in destination.provider_mappings
+                        if m.provider_instance == builtin.instance_id), None)
+        if mapping is None:
+            raise InvalidDataError("Candidate is not a playlist of the configured builtin provider")
+        async with builtin._get_playlist_lock(mapping.item_id):
+            raw = await builtin._read_m3u_file(mapping.item_id)
+            observed_digest = hashlib.sha256(raw.encode()).hexdigest()
+            matches = observed_digest == row["destination_content_digest"]
+            result = {
+                "kind": kind, "subscription_id": subscription_id,
+                "old_item_id": old_item_id, "candidate_item_id": candidate_item_id,
+                "expected_content_digest": row["destination_content_digest"],
+                "observed_content_digest": observed_digest,
+                "revision": row.get("revision") if kind == "mirror" else None,
+                "classification": "exact_content" if matches else "mismatch",
+            }
+            if apply:
+                if expected_old_item_id != old_item_id or expected_content_digest != row["destination_content_digest"] \
+                        or expected_observed_digest != observed_digest or not matches \
+                        or (kind == "mirror" and expected_revision != row["revision"]):
+                    raise InvalidDataError("Destination changed or contents differ; inspect again")
+                try:
+                    result["destination"] = await self._store_operation(
+                        self._store.rebind_destination, kind, subscription_id,
+                        old_item_id, candidate_item_id, builtin.instance_id,
+                        observed_digest, expected_revision,
+                    )
+                except ValueError as err:
+                    raise InvalidDataError(str(err)) from None
+            return result
+
+    async def destination_rebind_inspect(
+        self, kind: str, subscription_id: str, candidate_item_id: str,
+    ) -> dict[str, Any]:
+        """Compare one replacement playlist against the saved destination bytes."""
+        return await self._destination_rebind(kind, subscription_id, candidate_item_id)
+
+    async def destination_rebind_apply(
+        self, kind: str, subscription_id: str, candidate_item_id: str,
+        expected_old_item_id: str, expected_content_digest: str,
+        expected_observed_digest: str, expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly rebind an exact replacement after previewing its content."""
+        async with self._write_lock:
+            return await self._destination_rebind(
+                kind, subscription_id, candidate_item_id, apply=True,
+                expected_old_item_id=expected_old_item_id,
+                expected_content_digest=expected_content_digest,
+                expected_observed_digest=expected_observed_digest,
+                expected_revision=expected_revision,
+            )
 
     async def mirror_reconcile_preview(self, subscription_id: str,
                                        candidate_item_id: str | None = None) -> dict[str, Any]:
