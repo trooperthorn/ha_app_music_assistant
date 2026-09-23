@@ -45,7 +45,8 @@ schema, and a completion marker bound to the manifest. Creation compares the
 source before and after copying, independently checks the destination, parses
 settings, and checks SQLite integrity. Verification repeats the byte and
 database checks. Staging refuses an existing destination, a version mismatch,
-an older or unsupported archive schema, corruption, missing files, symlinks,
+an older or unsupported archive schema, corruption, missing files, symlinks
+or Windows junctions,
 and an incomplete marker. `create`, `verify`, and `stage` never replace the
 target directory; only the explicitly requested `cutover` command does so.
 The verifier is pinned to server 2.10.4 and library schema 58. It checks the

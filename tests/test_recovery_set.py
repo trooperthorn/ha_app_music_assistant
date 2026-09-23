@@ -181,6 +181,20 @@ def test_missing_required_data_and_bad_database_never_publish(tmp_path: Path) ->
     assert not (tmp_path / "corrupt-set").exists()
 
 
+def test_junction_inside_source_never_publishes(tmp_path: Path, monkeypatch) -> None:
+    source = _data(tmp_path / "quiesced-data")
+    redirected = source / "redirect"
+    redirected.mkdir()
+    (redirected / "outside.txt").write_text("must not be packaged", encoding="utf-8")
+    original = Path.is_junction
+    monkeypatch.setattr(Path, "is_junction", lambda path: path == redirected or original(path))
+
+    destination = tmp_path / "recovery-set"
+    with pytest.raises(ValueError, match="link or junction"):
+        recovery.create(source, destination, VERSIONS)
+    assert not destination.exists()
+
+
 def test_older_archive_is_verifiable_but_not_staged_without_review(tmp_path: Path) -> None:
     source = _data(tmp_path / "quiesced-data")
     with closing(sqlite3.connect(source / recovery.ARCHIVE)) as db:

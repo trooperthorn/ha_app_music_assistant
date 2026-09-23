@@ -29,6 +29,11 @@ PINNED_LIBRARY_SCHEMA = 58
 REQUIRED = {"settings.json", "library.db", "auth.db", ARCHIVE}
 
 
+def _is_link(path: Path) -> bool:
+    """Reject symlinks and Windows junctions before traversing recovery data."""
+    return path.is_symlink() or path.is_junction()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -38,14 +43,14 @@ def _sha256(path: Path) -> str:
 
 
 def _files(root: Path) -> dict[str, dict[str, int | str]]:
-    if not root.is_dir() or root.is_symlink():
+    if not root.is_dir() or _is_link(root):
         raise ValueError("Recovery data root must be a real directory")
     files: dict[str, dict[str, int | str]] = {}
     for current, directories, names in os.walk(root, followlinks=False):
         for name in directories + names:
             path = Path(current) / name
-            if path.is_symlink():
-                raise ValueError(f"Recovery data contains a symlink: {path}")
+            if _is_link(path):
+                raise ValueError(f"Recovery data contains a link or junction: {path}")
         for name in names:
             path = Path(current) / name
             if not path.is_file():
@@ -159,8 +164,8 @@ def _write_exclusive(path: Path, payload: bytes) -> None:
 
 def create(source: Path, destination: Path, versions: dict[str, str]) -> dict:
     """Publish a verified set from an already quiesced data directory."""
-    if source.is_symlink():
-        raise ValueError("Recovery source must not be a symlink")
+    if _is_link(source):
+        raise ValueError("Recovery source must not be a link or junction")
     source = source.resolve(strict=True)
     destination = destination.parent.resolve() / destination.name
     if os.path.lexists(destination) or destination == source or destination.is_relative_to(source):
@@ -206,16 +211,16 @@ def create(source: Path, destination: Path, versions: dict[str, str]) -> dict:
 
 def verify(recovery_set: Path, expected_versions: dict[str, str] | None = None) -> dict:
     """Verify every published byte and the archive database without mutations."""
-    if recovery_set.is_symlink():
-        raise ValueError("Recovery set must not be a symlink")
+    if _is_link(recovery_set):
+        raise ValueError("Recovery set must not be a link or junction")
     root = recovery_set.resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Recovery set must be a real directory")
     expected_top = {DATA, MANIFEST, COMPLETION}
     if {path.name for path in root.iterdir()} != expected_top:
         raise ValueError("Recovery set is incomplete or has unexpected entries")
-    if any(path.is_symlink() for path in root.iterdir()):
-        raise ValueError("Recovery set contains a top-level symlink")
+    if any(_is_link(path) for path in root.iterdir()):
+        raise ValueError("Recovery set contains a top-level link or junction")
     manifest_bytes = (root / MANIFEST).read_bytes()
     expected_digest = hashlib.sha256(manifest_bytes).hexdigest()
     if (root / COMPLETION).read_text(encoding="ascii").strip() != expected_digest:
@@ -288,7 +293,7 @@ def cutover(
     if manifest["archive"]["schema_version"] != MAX_ARCHIVE_SCHEMA:
         raise ValueError("Archive schema needs an explicit migration review before cutover")
     for name, path in (("staged", staged_data), ("current", current_data)):
-        if path.is_symlink() or not path.is_dir():
+        if _is_link(path) or not path.is_dir():
             raise ValueError(f"{name.capitalize()} data must be a real directory")
     staged = staged_data.resolve(strict=True)
     current = current_data.resolve(strict=True)
