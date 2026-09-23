@@ -49,8 +49,8 @@ ambiguous, so a server release that reshapes the edited module fails the
 image build and the sync pull request instead of shipping without the change.
 Each script is a no-op on a module it already edited.
 
-Today there are eight: five anchor patches that rewrite exact lines in an
-already-installed file, and three plugin providers that add a self-contained
+Today there are ten: six anchor patches that rewrite exact lines in an
+already-installed file, and four plugin providers that add a self-contained
 new provider directory instead (see `docs/extension-points.md` for the
 distinction).
 
@@ -106,6 +106,10 @@ Anchor patches:
   `launch_failed`, `receiver_error`, or `audio_unsupported`) and resolves the
   pending play request promptly. It suppresses duplicate events and does not
   expose receiver log text.
+- `sendspin_timing_status.py`: copies only client-reported output delay,
+  startup lead, and minimum buffer values to the Sendspin player's event state.
+  Missing reports remain unknown, and a replacement connection clears old
+  reports rather than treating a saved configuration value as an acknowledgement.
 
 Plugin providers:
 
@@ -150,6 +154,10 @@ Plugin providers:
   `self.logger` and `self.mass.get_provider`, both available on the base
   `Provider` class (see `docs/decisions.md`). This retires the last anchor
   patch on `controllers/music/controller.py`.
+- `library_enrichment.py`: installs the archive and enrichment provider with
+  versioned captures, iTunes import, match review, playback policy, and
+  recovery commands. Its data store and operations remain separate from the
+  bulk playlist migration/export plugin.
 
 `tests/test_patches.py` applies each script to a copy of the upstream modules
 kept under `tests/fixtures/` and pins the copies to the server version in the

@@ -22,6 +22,7 @@ import playlist_bridge as bridge  # noqa: E402
 import sendspin_cast_delay as cast_delay  # noqa: E402
 import sendspin_cast_status as cast_status  # noqa: E402
 import sendspin_opus_bitrate as opus  # noqa: E402
+import sendspin_timing_status as timing  # noqa: E402
 
 # streams_audio_2_10_4.py and sendspin_player_2_10_4.py are verbatim pinned
 # copies of upstream, which deliberately uses PEP 758
@@ -43,6 +44,63 @@ AIOSENDSPIN_CODECS = ROOT / "tests" / "fixtures" / "aiosendspin_codecs_9_1_1.py"
 AIOSENDSPIN_PLAYER_V1 = ROOT / "tests" / "fixtures" / "aiosendspin_player_v1_9_1_1.py"
 SENDSPIN_PLAYER = ROOT / "tests" / "fixtures" / "sendspin_player_2_10_4.py"
 CHROMECAST_SENDSPIN_BRIDGE = ROOT / "tests" / "fixtures" / "chromecast_sendspin_bridge_2_10_4.py"
+
+
+@requires_py314
+def test_sendspin_timing_reports_are_observed_not_inferred_from_config() -> None:
+    original = SENDSPIN_PLAYER.read_text(encoding="utf-8")
+    patched = timing.apply(cast_delay.apply(opus.apply(original, opus.EDITS[opus.PROVIDER])))
+    assert timing.apply(patched) == patched
+    assert "sendspin_timing_status.py" in (ROOT / "music_assistant_lm" / "Dockerfile").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="Sendspin timing anchor found 0 times"):
+        timing.apply("class SendspinPlayer: pass")
+    assert "self.extra_attributes.pop(key, None)" in patched
+
+    tree = ast.parse(patched)
+    player = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SendspinPlayer")
+    method = next(node for node in player.body if isinstance(node, ast.FunctionDef) and node.name == "event_cb")
+    method_source = "\n".join(f"    {line}" for line in ast.unparse(method).splitlines())
+
+    class Event:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class VolumeChangedEvent(Event):
+        pass
+
+    class StaticDelayChangedEvent(Event):
+        pass
+
+    class RequiredLeadTimeChangedEvent(Event):
+        pass
+
+    class MinBufferChangedEvent(Event):
+        pass
+
+    namespace = {
+        "VolumeChangedEvent": VolumeChangedEvent,
+        "StaticDelayChangedEvent": StaticDelayChangedEvent,
+        "RequiredLeadTimeChangedEvent": RequiredLeadTimeChangedEvent,
+        "MinBufferChangedEvent": MinBufferChangedEvent,
+        "time": __import__("time"),
+        "CONF_SENDSPIN_STATIC_DELAY": "sendspin_static_delay",
+    }
+    exec("from __future__ import annotations\nclass Player:\n" + method_source, namespace)  # noqa: S102
+    instance = namespace["Player"]()
+    instance.extra_attributes = {}
+    instance.logger = type("Logger", (), {"debug": lambda self, *_: None})()
+    instance.config = type("Config", (), {"get_value": lambda self, *_: 260})()
+    instance.static_delay_default_ms = 0
+    changes: list[str] = []
+    instance.update_state = lambda: changes.append("event")
+    instance.event_cb(None, StaticDelayChangedEvent(static_delay_ms=260))
+    instance.event_cb(None, RequiredLeadTimeChangedEvent(required_lead_time_ms=125))
+    instance.event_cb(None, MinBufferChangedEvent(min_buffer_ms=80))
+    assert instance.extra_attributes["sendspin_output_delay_ms"] == 260
+    assert instance.extra_attributes["sendspin_startup_lead_ms"] == 125
+    assert instance.extra_attributes["sendspin_min_buffer_ms"] == 80
+    assert instance.extra_attributes["sendspin_timing_reported_at"] > 0
+    assert changes == ["event", "event", "event"]
 
 
 @requires_py314
