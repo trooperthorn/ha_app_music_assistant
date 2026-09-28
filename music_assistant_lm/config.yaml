@@ -48,4 +48,3 @@ privileged:
 - SYS_ADMIN
 - DAC_READ_SEARCH
 udev: true
-kernel_modules: true

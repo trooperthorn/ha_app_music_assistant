@@ -22,11 +22,11 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           languages: python
           build-mode: none
-      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "/language:python"
 
@@ -49,7 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the app image
-        run: docker build --tag local/music_assistant_lm:${{ github.sha }} music_assistant_lm
+        run: |
+          VERSION="$(python3 scripts/build_release_artifacts.py --validate-only)"
+          docker build --build-arg "BUILD_VERSION=$VERSION" --build-arg "BUILD_ARCH=amd64" \
+            --tag "local/music_assistant_lm:${{ github.sha }}" music_assistant_lm
       # The OS layer is upstream's Debian server image; findings there are
       # reported, not gated, because this repository cannot fix them. See
       # docs/decisions.md.

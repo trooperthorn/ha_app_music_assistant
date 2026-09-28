@@ -38,7 +38,7 @@ on the host network and announce the same discovery service.
 | --- | --- | --- |
 | Server | latest stable release of `music-assistant/server` | `SERVER_VERSION` in the Dockerfile |
 | Frontend | latest release of `trooperthorn/HA_int_MA-UI` (wheel + SHA256SUMS) | `FRONTEND_*` in the Dockerfile |
-| App definition | `music_assistant/` in `music-assistant/home-assistant-addon` | `config.yaml`, `apparmor.txt`, `translations/` |
+| App definition | `music_assistant/` in `music-assistant/home-assistant-addon` | `config.yaml`, `translations/` (`apparmor.txt` is this app's own) |
 
 `sync-upstream.yml` runs daily, applies `scripts/sync_upstream.py`, and opens
 an auto-merging pull request when anything moved. A merge to `main` releases

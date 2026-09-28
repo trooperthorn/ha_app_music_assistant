@@ -1,10 +1,26 @@
-profile music_assistant_addon flags=(attach_disconnected,mediate_deleted) {
-  capability,
-  file,
+# Owned by this repository; scripts/sync_upstream.py does not overwrite it.
+# Derived from the upstream music_assistant profile with the blanket file,
+# mount and /dev rules replaced by the paths this app uses. Run it with the
+# complain flag and read the audit log (docs/security.md) before widening it.
+profile music_assistant_lm flags=(attach_disconnected,mediate_deleted) {
+  # Capabilities: SYS_ADMIN and DAC_READ_SEARCH are the ones config.yaml
+  # requests (mount, reading the drive); the rest are the defaults the
+  # server, python and the entrypoint wrapper rely on.
+  capability sys_admin,
+  capability dac_read_search,
+  capability dac_override,
+  capability chown,
+  capability fowner,
+  capability fsetid,
+  capability kill,
+  capability setgid,
+  capability setuid,
+  capability net_bind_service,
+  capability net_raw,
+  capability sys_resource,
+
   signal,
-  mount,
-  umount,
-  remount,
+
   network udp,
   network tcp,
   network dgram,
@@ -14,22 +30,72 @@ profile music_assistant_addon flags=(attach_disconnected,mediate_deleted) {
   network inet6,
   network netlink raw,
   network unix dgram,
+  network unix stream,
 
-  capability setgid,
-  capability setuid,
-  capability sys_admin,
-  capability dac_read_search,
+  # Music drive (rootfs/usr/local/bin/mass_with_drive.py): mounted under
+  # /music/<label> with nosuid,nodev,noexec, then unmounted on exit.
+  mount fstype=(exfat,vfat,msdos,ntfs3,ext2,ext3,ext4,btrfs,xfs) /dev/** -> /music/**,
+  umount /music/**,
+  # SMB/NFS network shares mounted by the upstream server's providers
+  mount fstype=(cifs,nfs,nfs4) -> /tmp/**,
+  umount /tmp/**,
 
-  /dev/* mrwkl,
-  /tmp/** mrkwl,
-  /dev/snd/ rw,
+  # Image contents: interpreters, libraries, tools (blkid, fsck.exfat,
+  # mount, rsync, ffmpeg), read and execute only
+  / r,
+  /bin/** rix,
+  /sbin/** rix,
+  /usr/** rix,
+  /lib/** rix,
+  /lib64/** rix,
+  /app/** rix,
+  /etc/** r,
+  /opt/** rix,
+  /usr/local/bin/entrypoint.sh rix,
+  /usr/local/bin/mass_with_drive.py rix,
+
+  # Kernel interfaces
+  /proc/** r,
+  /proc/[0-9]*/** rw,
+  /sys/** r,
+
+  # Devices: audio, the granted music drive partition and its udev data
+  /dev/ r,
+  /dev/null rw,
+  /dev/zero r,
+  /dev/full rw,
+  /dev/random r,
+  /dev/urandom r,
+  /dev/tty rw,
+  /dev/pts/** rw,
+  /dev/shm/** rwkl,
+  /dev/snd/ r,
   /dev/snd/** rw,
+  /dev/sd[a-z]* rwk,
+  /dev/nvme[0-9]*n[0-9]*p[0-9]* rwk,
+  /dev/mmcblk[0-9]*p[0-9]* rwk,
+  /dev/disk/** r,
+  /run/udev/** r,
 
-  # Data access
-  /data/** rw,
-  /media/** rw,
+  # Scratch
+  /tmp/ r,
+  /tmp/** mrwkl,
+  /run/** rwk,
+  /var/tmp/** rwk,
+  /root/** rwk,
 
-  # docker daemon confinement requires explict allow rule for signal
+  # Data: app state, media library, music drive backup, certificates
+  /data/ r,
+  /data/** rwkl,
+  /media/ r,
+  /media/** rwk,
+  /share/ r,
+  /share/** rwk,
+  /music/ rw,
+  /music/** rwk,
+  /ssl/ r,
+  /ssl/** r,
+
+  # docker daemon confinement requires explicit allow rule for signal
   signal (receive) set=(kill,term) peer=/usr/bin/docker,
-
 }
