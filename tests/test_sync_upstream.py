@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import sync_upstream as sync  # noqa: E402
 
+ROOT = Path(__file__).resolve().parents[1]
+
 DOCKERFILE = 'ARG SERVER_VERSION="2.10.3"\nFROM x\nARG FRONTEND_RELEASE=""\nARG FRONTEND_WHEEL=""\nARG FRONTEND_SHA256=""\n'
 
 
@@ -102,10 +104,39 @@ def test_merge_config_keeps_the_drive_option_and_privileges() -> None:
     assert merged["schema"]["music_drive"] == "device(subsystem=block)?"
     assert merged["schema"]["log_level"] == "list(debug|info)"
     assert merged["udev"] is True
-    assert merged["kernel_modules"] is True
+    assert "kernel_modules" not in merged
     # upstream's own value for a key we only default wins
     merged = yaml.safe_load(sync.merge_config(ours, upstream + "udev: false\n"))
     assert merged["udev"] is False
+
+
+def test_merge_translations_keeps_the_drive_entries() -> None:
+    upstream = (
+        "configuration:\n  log_level:\n    name: Log Level\n    description: Upstream text\n"
+        "network:\n  8095/tcp: Web port\n"
+    )
+    merged = yaml.safe_load(sync.merge_translations("", upstream))
+    config = merged["configuration"]
+    assert config["log_level"]["description"] == "Upstream text"
+    assert config["music_drive"]["name"] == "Music drive"
+    assert config["music_drive_task"]["name"] == "Music drive task"
+    assert merged["network"] == {"8095/tcp": "Web port"}
+
+
+def test_translation_extras_match_the_shipped_file() -> None:
+    shipped = yaml.safe_load((ROOT / "music_assistant_lm" / "translations" / "en.yaml").read_text(encoding="utf-8"))
+    for key, entry in sync.EXTRA_TRANSLATIONS.items():
+        assert shipped["configuration"][key] == entry
+
+
+def test_apparmor_profile_is_not_synced_and_named_for_the_slug() -> None:
+    assert "apparmor.txt" not in sync.SYNCED_FILES
+    profile = (ROOT / "music_assistant_lm" / "apparmor.txt").read_text(encoding="utf-8")
+    assert "profile music_assistant_lm " in profile
+    lines = [line.strip() for line in profile.splitlines()]
+    assert "file," not in lines
+    assert "mount," not in lines
+    assert not any(line.startswith("/dev/* ") for line in lines)
 
 
 def test_merge_config_adds_the_key_when_upstream_drops_it() -> None:

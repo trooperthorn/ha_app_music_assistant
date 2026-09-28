@@ -36,7 +36,9 @@ image.
 
 Everything else in `music_assistant_lm/` is the upstream app definition:
 `config.yaml` (with this app's own `name`, `slug`, `description`, `url` and
-`version`), `apparmor.txt` and `translations/en.yaml`.
+`version`) and `translations/en.yaml` (with this app's `music_drive`
+entries kept). `apparmor.txt` is this app's own tightened profile and is
+not synced; see security.md.
 
 ## Build-time edits of the server
 

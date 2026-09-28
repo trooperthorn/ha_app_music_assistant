@@ -101,7 +101,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # The token goes to git as an HTTP header through environment config,
+          # the way actions/checkout supplies it: never in the remote URL,
+          # never written to .git/config.
+          AUTH="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::$AUTH"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH"
           REMOTE_SHA="$(git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}')"
           git switch --force-create "$BRANCH"
           git config user.name "$BOT_NAME"

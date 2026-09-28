@@ -2,20 +2,56 @@
 
 ## Privileges
 
-Identical to the official Music Assistant app, because `config.yaml` is
-synced from it: `host_network`, `SYS_ADMIN` and `DAC_READ_SEARCH`
-capabilities, audio, `media:rw`, `ssl:ro`, the Home Assistant and auth
-APIs, ingress on 8094, the upstream AppArmor profile. This repository adds
-`share:rw` (the drive backup task writes there), `udev` (read-only access
-to the host's device database, for the drive's label and type) and
-`kernel_modules` (the host's modules read-only plus `SYS_MODULE`, so the
-drive's filesystem driver can be loaded by name), and an optional
-`music_drive` device option through which Supervisor grants one partition
-to the container. Mounting itself needs nothing new: the upstream profile
-already permits `mount` and `umount` for the SMB provider. Protection mode
-stays on; `full_access` is not used. See "The music drive" in design.md
-for what the wrapper does and does not do with the drive, in particular
-that it never writes without an explicit one-off task.
+Most keys are synced from the official Music Assistant app's `config.yaml`,
+so `host_network`, `homeassistant_api`, `auth_api`, the `SYS_ADMIN` and
+`DAC_READ_SEARCH` capabilities, audio, `media:rw`, `ssl:ro` and ingress on
+8094 are inherited from upstream rather than chosen here. This repository
+adds `share:rw` (the drive backup task writes there), `udev` (read-only
+access to the host's device database, for the drive's label and type) and
+an optional `music_drive` device option through which Supervisor grants one
+partition to the container. Protection mode stays on; `full_access` is not
+used. See "The music drive" in design.md for what the wrapper does and does
+not do with the drive, in particular that it never writes without an
+explicit one-off task.
+
+`kernel_modules` was dropped. Nothing in the image calls `modprobe` or
+`insmod` (the wrapper runs only `blkid`, `fsck.exfat`, `mount`, `umount`
+and `rsync`), and a `mount -t exfat|ntfs3|...` of a filesystem type the
+host has not loaded yet is resolved by the host kernel's own module
+request, not by the container, so the module mapping and `SYS_MODULE`
+bought nothing.
+
+### AppArmor
+
+`apparmor.txt` is this app's own profile, `music_assistant_lm`, and
+`sync_upstream.py` no longer overwrites it. It replaces upstream's blanket
+`file`, `mount` and `/dev/* mrwkl` rules with explicit paths: read and
+execute on the image (`/usr`, `/bin`, `/lib`, `/app`, ...), read-write on
+`/data`, `/media`, `/share`, `/music` and scratch space, read-only on
+`/ssl`, the audio nodes under `/dev/snd`, and the block device nodes a
+granted partition can appear as (`/dev/sd*`, `/dev/nvme*n*p*`,
+`/dev/mmcblk*p*`). Mounting is scoped to local filesystem types onto
+`/music/**` (the drive) and `cifs`/`nfs` onto `/tmp/**` (upstream's network
+share providers). If the server logs a permission error after an update,
+add `complain` to the profile flags, reproduce, and read
+`journalctl _TRANSPORT="audit" -g 'apparmor="ALLOWED"'` for the missing rule.
+
+### Rating
+
+Supervisor starts every app at 5 (docs/apps/security.md):
+
+| Factor | Change | Running |
+| --- | --- | --- |
+| Base | | 5 |
+| `ingress: true` (supersedes `auth_api`) | +2 | 7 |
+| Custom `apparmor.txt` | +1 | 8 |
+| `privileged: SYS_ADMIN, DAC_READ_SEARCH` (counted once) | -1 | 7 |
+| `host_network: true` (inherited) | -1 | 6 |
+
+Clamped to the 1 to 6 scale, the rating is 6. `kernel_modules` falls in the
+same once-only bucket as the privileged capabilities, so dropping it does
+not move the number; it removes `SYS_MODULE` and the host module mapping.
+`homeassistant_api` carries no rating factor.
 
 ## What is verified
 

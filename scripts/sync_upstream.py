@@ -11,7 +11,10 @@ music-assistant/home-assistant-addon, then rewrites:
 - music_assistant_lm/config.yaml: every key from the upstream config except
   the ones this app owns (name, version, slug, description, url) and the
   registry image key
-- music_assistant_lm/apparmor.txt and translations/en.yaml: verbatim
+- music_assistant_lm/translations/en.yaml: upstream's entries, with this
+  app's own configuration entries (EXTRA_TRANSLATIONS) kept
+- music_assistant_lm/apparmor.txt is not synced: the profile is this app's
+  own (profile name music_assistant_lm, paths for the music drive)
 - music_assistant_lm/CHANGELOG.md: one entry per change
 
 The app version itself is not touched; the release automation bumps it
@@ -74,10 +77,34 @@ EXTRA_DICT_ITEMS: dict[str, dict[str, object]] = {
         "music_drive_task": "list(none|backup|verify|restore|repair)",
     },
 }
+# translations/en.yaml configuration entries for the options above; upstream's
+# own entries follow upstream, these are added when upstream lacks them.
+EXTRA_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "music_drive": {
+        "name": "Music drive",
+        "description": (
+            "A partition of the Home Assistant server that holds music. The app mounts it at "
+            "/music/<label> for itself only; an exFAT volume that was not cleanly ejected is "
+            "mounted read-only."
+        ),
+    },
+    "music_drive_task": {
+        "name": "Music drive task",
+        "description": (
+            "A one-off job at the next start: backup, verify, restore or repair. "
+            "Set it back to none afterwards."
+        ),
+    },
+}
+# Upstream app files refreshed on every sync. apparmor.txt is deliberately not
+# here: upstream's profile is named for its slug and grants blanket file and
+# mount access, and this app ships a tightened profile of its own.
+SYNCED_FILES = ("config.yaml", "translations/en.yaml")
 # Keys this app sets when upstream has no opinion; upstream's value wins when
-# it appears. udev lets the wrapper read the drive's label and type, and
-# kernel_modules loads its filesystem driver by name.
-EXTRA_KEYS: dict[str, object] = {"udev": True, "kernel_modules": True}
+# it appears. udev lets the wrapper read the drive's label and type.
+# kernel_modules is not needed: nothing in the image calls modprobe, and a
+# mount of an unloaded filesystem type is resolved by the host kernel.
+EXTRA_KEYS: dict[str, object] = {"udev": True}
 
 # Accept header that asks a registry for the multi-arch index rather than one
 # platform's manifest, so the digest pinned below covers amd64 and aarch64.
@@ -258,6 +285,17 @@ def merge_config(ours: str, upstream: str) -> str:
     return (header + "\n" if header else "") + body
 
 
+def merge_translations(ours: str, upstream: str) -> str:
+    """Upstream's translations, plus this app's configuration entries when missing."""
+    del ours  # this app's entries come from EXTRA_TRANSLATIONS, not the old file
+    theirs = yaml.safe_load(upstream) or {}
+    configuration = dict(theirs.get("configuration") or {})
+    for key, entry in EXTRA_TRANSLATIONS.items():
+        configuration.setdefault(key, dict(entry))
+    merged = {**theirs, "configuration": configuration}
+    return yaml.safe_dump(merged, sort_keys=False, allow_unicode=True, width=100)
+
+
 def changelog_entry(lines: list[str]) -> str:
     items = "".join(f"- {line}\n" for line in lines)
     return f"## {date.today():%Y-%m-%d}\n\n{items}\n"
@@ -340,11 +378,12 @@ def main() -> int:
     if wanted:
         writes[dockerfile_path] = set_args(dockerfile, wanted)
 
-    for name in ("config.yaml", "apparmor.txt", "translations/en.yaml"):
+    mergers = {"config.yaml": merge_config, "translations/en.yaml": merge_translations}
+    for name in SYNCED_FILES:
         upstream = str(fetch(f"{RAW}/{ADDON_REPO}/main/{ADDON_DIR}/{name}"))
         target = app / name
         ours = target.read_text(encoding="utf-8")
-        new = merge_config(ours, upstream) if name == "config.yaml" else upstream
+        new = mergers[name](ours, upstream)
         if new != ours:
             writes[target] = new
             changes.append(f"Upstream app {name} refreshed")
