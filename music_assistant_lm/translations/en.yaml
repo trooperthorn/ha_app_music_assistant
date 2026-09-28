@@ -1,13 +1,16 @@
 configuration:
   log_level:
     name: Log Level
-    description: "Set the (global) log level (NOTE: only enable debug when needed)."
+    description: 'Set the (global) log level (NOTE: only enable debug when needed).'
   safe_mode:
     name: Safe mode
-    description: "Start the Music Assistant server in safe mode where only the core controllers are started without any providers, to troubleshoot issues"
+    description: Start the Music Assistant server in safe mode where only the core controllers are started
+      without any providers, to troubleshoot issues
   music_drive:
     name: Music drive
-    description: "A partition of the Home Assistant server that holds music. The app mounts it at /music/<label> for itself only; an exFAT volume that was not cleanly ejected is mounted read-only."
+    description: A partition of the Home Assistant server that holds music. The app mounts it at /music/<label>
+      for itself only; an exFAT volume that was not cleanly ejected is mounted read-only.
   music_drive_task:
     name: Music drive task
-    description: "A one-off job at the next start: backup, verify, restore or repair. Set it back to none afterwards."
+    description: 'A one-off job at the next start: backup, verify, restore or repair. Set it back to none
+      afterwards.'
