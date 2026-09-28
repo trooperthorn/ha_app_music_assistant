@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-28
+
+- Upstream app translations/en.yaml refreshed
+
 ## 2026-09-23
 
 - Fork frontend v2026.09.23.1 -> v2026.09.23.2
