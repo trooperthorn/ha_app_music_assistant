@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-29
+
+- Upstream app config.yaml refreshed
+
 ## 2026-09-28
 
 - Upstream app translations/en.yaml refreshed
