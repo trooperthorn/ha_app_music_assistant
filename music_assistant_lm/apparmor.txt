@@ -35,6 +35,10 @@ profile music_assistant_lm flags=(attach_disconnected,mediate_deleted) {
   # Music drive (rootfs/usr/local/bin/mass_with_drive.py): mounted under
   # /music/<label> with nosuid,nodev,noexec, then unmounted on exit.
   mount fstype=(exfat,vfat,msdos,ntfs3,ext2,ext3,ext4,btrfs,xfs) /dev/** -> /music/**,
+  # Kernel 6.x mount(8) uses the new mount API: the rule above covers building
+  # the filesystem, then a second "move" step attaches it and carries no
+  # source or type (audit: flags="rw, move", info="failed srcname match").
+  mount options=(move) -> /music/**,
   umount /music/**,
   # SMB/NFS network shares mounted by the upstream server's providers
   mount fstype=(cifs,nfs,nfs4) -> /tmp/**,
