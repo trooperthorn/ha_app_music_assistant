@@ -91,6 +91,11 @@ profile music_assistant_lm flags=(attach_disconnected,mediate_deleted) {
   # Data: app state, media library, music drive backup, certificates
   /data/ r,
   /data/** rwkl,
+  # Spotify's Soloist engine: the Spotify provider downloads this binary at
+  # runtime and runs it (also "--version" to validate each renewal, builds
+  # expire after 90 days). Execute only this one path; the rest of /data stays
+  # non-executable. Runs under this profile (ix), not unconfined.
+  /data/soloist/soloist rix,
   /media/ r,
   /media/** rwk,
   /share/ r,
